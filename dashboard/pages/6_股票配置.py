@@ -46,8 +46,6 @@ ENV_KEYS = {
 
 
 def _format_env_value(value: Any) -> str:
-    if value is None:
-        return ""
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
@@ -57,7 +55,15 @@ def update_env_file(values: dict[str, Any]) -> None:
     """Upsert selected config keys into project .env without touching secrets."""
     env_path = settings.project_root / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    wanted = {ENV_KEYS[k]: _format_env_value(v) for k, v in values.items() if k in ENV_KEYS}
+
+    # Optional fields set to None mean "unset". Do not write KEY=, because
+    # pydantic-settings reads that as an empty string and float parsing fails.
+    unset_keys = {ENV_KEYS[k] for k, v in values.items() if k in ENV_KEYS and v is None}
+    wanted = {
+        ENV_KEYS[k]: _format_env_value(v)
+        for k, v in values.items()
+        if k in ENV_KEYS and ENV_KEYS[k] not in unset_keys
+    }
 
     seen: set[str] = set()
     out: list[str] = []
@@ -72,6 +78,9 @@ def update_env_file(values: dict[str, Any]) -> None:
             seen.add(key)
         else:
             out.append(line)
+
+    # Remove existing optional keys that are now unset.
+    out = [line for line in out if line.split("=", 1)[0].strip() not in unset_keys]
 
     missing = [k for k in wanted if k not in seen]
     if missing:
