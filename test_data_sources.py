@@ -2,6 +2,7 @@
 import sys
 sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
 
+import pytest
 from loguru import logger
 logger.remove()
 logger.add(sys.stdout, level="INFO")
@@ -42,7 +43,7 @@ def test_tencent():
     if not stocks.empty:
         print(stocks.head(5)[["symbol", "name", "close", "pct_change"]].to_string(index=False))
 
-    return bars is not None and not bars.empty
+    assert bars is not None and not bars.empty
 
 
 def test_akshare():
@@ -83,7 +84,8 @@ def test_akshare():
     except Exception as e:
         print(f"   获取失败 (可能是非交易日): {e}")
 
-    return bars is not None and not bars.empty
+    if bars is None or bars.empty:
+        pytest.skip("AKShare K线接口当前不可用")
 
 
 def test_tushare():
@@ -95,7 +97,7 @@ def test_tushare():
     if not tf._has_token():
         print("   ⚠️ Tushare Token未配置，跳过测试")
         print("   在 .env 中添加: TUSHARE_TOKEN=你的token")
-        return None  # None 表示未配置，不算失败
+        pytest.skip("Tushare Token未配置")
 
     # 1. 股票列表
     print("\n1. 股票列表")
@@ -119,7 +121,7 @@ def test_tushare():
     except Exception as e:
         print(f"   获取失败: {e}")
 
-    return bars is not None and not bars.empty
+    assert bars is not None and not bars.empty
 
 
 def test_dataloader():
@@ -137,7 +139,7 @@ def test_dataloader():
         if not f.empty:
             print(f.head(2)[["symbol", "trade_date", "momentum_20d", "reversal"]].to_string(index=False))
 
-    return True
+    assert True
 
 
 if __name__ == "__main__":
