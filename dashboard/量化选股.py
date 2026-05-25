@@ -129,7 +129,7 @@ if not hotspot_summary["hot_sectors"].empty or not hotspot_summary["hot_stocks"]
         st.markdown(hot_html, unsafe_allow_html=True)
 
 # ========== 顶部导航 ==========
-nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns(5)
+nav_col1, nav_col2, nav_col3, nav_col4, nav_col5, nav_col6 = st.columns(6)
 with nav_col1:
     if st.button("🎯 信号", use_container_width=True, type="primary" if st.session_state.get('page', '信号') == '信号' else "secondary"):
         st.session_state.page = '信号'
@@ -148,6 +148,9 @@ with nav_col4:
 with nav_col5:
     if st.button("🩺 状态", use_container_width=True):
         st.switch_page("pages/5_数据状态.py")
+with nav_col6:
+    if st.button("⚙️ 配置", use_container_width=True):
+        st.switch_page("pages/6_股票配置.py")
 
 if 'page' not in st.session_state:
     st.session_state.page = '信号'
