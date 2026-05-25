@@ -1,0 +1,15 @@
+[Unit]
+Description=Quant Stock Picker Daily Scanner
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/quant-stock-picker
+ExecStart=/root/.openclaw/workspace/quant-stock-picker/venv/bin/python -m data.scheduler
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

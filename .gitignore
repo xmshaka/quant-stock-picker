@@ -1,0 +1,36 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+venv/
+.venv/
+
+# Runtime data / logs
+logs/
+data_storage/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Generated market data cache
+/data/cache/
+/data/parquet/
+/data/portfolio/*.json
