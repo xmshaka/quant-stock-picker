@@ -193,9 +193,11 @@ st.divider()
 if st.button("💾 保存到 .env", type="primary", use_container_width=True):
     try:
         update_env_file({**stock_overrides, **scan_values})
-        st.success("已保存到 .env。请重启看板和调度服务后生效。")
+        st.success("已保存到 .env")
+        st.warning("⚠️ 配置修改后不会立刻影响已运行进程，需要重启看板和调度服务后才会完全生效。")
         st.code("systemctl restart quant-stock-picker.service quant-scheduler.service", language="bash")
+        st.caption("重启后：看板会读取新的股票选择配置；每日扫描调度器会按新的股票池/时间/数据源顺序运行。")
     except Exception as e:
         st.error(f"保存失败：{e}")
 
-st.info("提示：如果只是临时验证筛选结果，点“预览股票池”即可；只有点“保存到 .env”才会修改持久配置。")
+st.info("提示：如果只是临时验证筛选结果，点“预览股票池”即可；只有点“保存到 .env”才会修改持久配置。保存后记得重启服务。")
