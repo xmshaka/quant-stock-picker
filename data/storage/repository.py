@@ -107,6 +107,33 @@ class StockRepository(BaseRepository):
             out[sym] = dt
         return out
 
+    def get_latest_dates_with_created_at(self, symbols: List[str]) -> dict:
+        """批量获取多只股票的最新交易日及该记录的创建时间（用于判断盘中临时数据）
+
+        Returns: {symbol: (trade_date, created_at) or (None, None)}
+        """
+        if not symbols:
+            return {}
+        with self.session() as s:
+            # 子查询：每只股票的最新 trade_date
+            sub = (
+                s.query(StockBar.symbol, func.max(StockBar.trade_date).label("md"))
+                .filter(StockBar.symbol.in_(symbols))
+                .group_by(StockBar.symbol)
+                .subquery()
+            )
+            # 联表取 created_at（取最新日期对应记录中 created_at 最大的那条，防止重复）
+            rows = (
+                s.query(StockBar.symbol, StockBar.trade_date, func.max(StockBar.created_at))
+                .join(sub, and_(StockBar.symbol == sub.c.symbol, StockBar.trade_date == sub.c.md))
+                .group_by(StockBar.symbol, StockBar.trade_date)
+                .all()
+            )
+        out = {sym: (None, None) for sym in symbols}
+        for sym, dt, ca in rows:
+            out[sym] = (dt, ca)
+        return out
+
     def count_bars(self, symbol: Optional[str] = None) -> int:
         with self.session() as s:
             q = s.query(func.count(StockBar.id))

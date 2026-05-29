@@ -114,6 +114,41 @@ class PortfolioManager:
     def is_in_hold(self, symbol: str) -> bool:
         return symbol in self._hold_pool
     
+    def refresh_signals(self, engine, factor_df, price_df, factor_names, factor_weights=None):
+        """用最新数据刷新池子里所有股票的信号状态（只计算 portfolio 中的股票）"""
+        from typing import TYPE_CHECKING
+        if TYPE_CHECKING:
+            from signals.engine import SignalEngine
+
+        portfolio_symbols = list(self._watch_pool.keys()) + list(self._hold_pool.keys())
+        if not portfolio_symbols:
+            return []
+
+        buy_signals, sell_signals = engine.generate_signals(
+            factor_df, price_df, factor_names, factor_weights,
+            top_n=9999, include_symbols=portfolio_symbols,
+        )
+        signal_map = {s.symbol: s for s in (buy_signals + sell_signals)}
+
+        changed = []
+        for pool in (self._watch_pool, self._hold_pool):
+            for symbol, item in pool.items():
+                old_strength = item.signal_strength
+                if symbol in signal_map:
+                    s = signal_map[symbol]
+                    item.signal_strength = s.strength
+                    item.signal_score = s.score
+                    item.add_reason = s.strategy_name
+                else:
+                    item.signal_strength = 0.0
+                    item.signal_score = 0.0
+                if abs(item.signal_strength - old_strength) >= 1.0:
+                    changed.append(symbol)
+
+        if changed:
+            self._save()
+        return changed
+
     def clear_all(self):
         """清空所有"""
         self._watch_pool.clear()

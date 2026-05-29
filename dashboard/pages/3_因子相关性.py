@@ -143,40 +143,43 @@ if len(ic_series_dict) >= 2:
     
     # 散点矩阵
     st.subheader("🔍 IC序列散点矩阵")
-    
-    if len(factor_names) <= 4:
-        ic_df_display = ic_df_combined.rename(columns=cn_map)
-        fig_scatter = px.scatter_matrix(
-            ic_df_display.reset_index(),
-            dimensions=list(ic_df_display.columns),
-            title="IC序列散点矩阵"
-        )
-        fig_scatter.update_layout(height=600, template="plotly_white")
-        st.plotly_chart(fig_scatter, use_container_width=True)
-    else:
-        st.info("因子数量超过4个，散点矩阵暂略。请选择2-4个因子查看。")
-        
-        factor_options = {FACTOR_NAME_MAP.get(f, f): f for f in factor_names}
-        selected_pair_cn = st.multiselect(
-            "选择两个因子查看IC散点图",
-            list(factor_options.keys()),
-            default=list(factor_options.keys())[:2],
-            max_selections=2
-        )
-        selected_pair = [factor_options[f] for f in selected_pair_cn]
-        
+
+    factor_options = {FACTOR_NAME_MAP.get(f, f): f for f in factor_names}
+    selected_pair_cn = st.multiselect(
+        "选择因子查看IC散点（2-4个）",
+        list(factor_options.keys()),
+        default=list(factor_options.keys())[:2] if len(factor_names) >= 2 else [],
+        max_selections=4,
+        help="选择2-4个因子查看IC序列散点图"
+    )
+    selected_pair = [factor_options[f] for f in selected_pair_cn]
+
+    if len(selected_pair) < 2:
+        st.info("👆 请在上方选择至少2个因子查看散点图")
+    elif len(selected_pair) <= 4:
         if len(selected_pair) == 2:
             fig_pair = px.scatter(
                 ic_df_combined.reset_index(),
                 x=selected_pair[0],
                 y=selected_pair[1],
-                title=f"{factor_options.get(selected_pair[0], selected_pair[0])} vs {factor_options.get(selected_pair[1], selected_pair[1])} IC散点",
+                title=f"{selected_pair_cn[0]} vs {selected_pair_cn[1]} IC散点",
                 trendline="ols"
             )
             fig_pair.update_layout(height=450, template="plotly_white")
             fig_pair.add_hline(y=0, line_dash="dash", line_color="gray")
             fig_pair.add_vline(x=0, line_dash="dash", line_color="gray")
             st.plotly_chart(fig_pair, use_container_width=True)
+        else:
+            ic_df_display = ic_df_combined[selected_pair].rename(columns=cn_map)
+            fig_scatter = px.scatter_matrix(
+                ic_df_display.reset_index(),
+                dimensions=list(ic_df_display.columns),
+                title="IC序列散点矩阵"
+            )
+            fig_scatter.update_layout(height=600, template="plotly_white")
+            st.plotly_chart(fig_scatter, use_container_width=True)
+    else:
+        st.warning("请选择不超过4个因子")
 else:
     st.warning("IC序列数据不足，无法计算相关性")
 

@@ -16,12 +16,12 @@ FACTOR_CN = {
     'rsi14': 'RSI14',
     'macd_hist': 'MACD柱状线',
     'boll_position': '布林带位置',
-    'boll_width': '布林带宽度',
+    'momentum_5d': '5日动量',
     'volatility_20d': '20日波动率',
     'max_dd_60d': '60日最大回撤',
     # 情绪因子
     'north_hold_change': '北向资金20日变化',
-    'margin_change': '融资融券20日变化',
+    # 'margin_change': '融资融券20日变化',  # 数据缺失99.2%，已移除
     'turnover_ratio': '换手率比率',
     'volume_ratio': '量比',
     # 估值因子

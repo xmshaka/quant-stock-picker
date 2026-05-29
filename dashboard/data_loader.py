@@ -17,8 +17,11 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-def _cache_key(source: str, n_stocks: int, n_days: int) -> str:
+def _cache_key(source: str, n_stocks: int, n_days: int, include_symbols: Optional[List[str]] = None) -> str:
     today = datetime.now().strftime("%Y%m%d")
+    if include_symbols:
+        h = hash(tuple(sorted(include_symbols))) % 10000
+        return f"{source}_{n_stocks}_{n_days}_inc{h}_{today}"
     return f"{source}_{n_stocks}_{n_days}_{today}"
 
 
@@ -55,6 +58,37 @@ def _save_cache(key: str, data: dict) -> None:
     except Exception as e:
         logger.warning(f"[Cache] 保存缓存失败: {e}")
 
+
+# ── 名称映射缓存 ──
+_NAME_MAP_CACHE_PATH = os.path.join(CACHE_DIR, "name_map_cache.pkl")
+_NAME_MAP_CACHE_TTL_HOURS = 24
+
+
+def _load_name_map_cache() -> Optional[Dict[str, str]]:
+    """加载名称映射本地缓存"""
+    if not os.path.exists(_NAME_MAP_CACHE_PATH):
+        return None
+    age_hours = (datetime.now().timestamp() - os.path.getmtime(_NAME_MAP_CACHE_PATH)) / 3600
+    if age_hours > _NAME_MAP_CACHE_TTL_HOURS:
+        return None
+    try:
+        with open(_NAME_MAP_CACHE_PATH, 'rb') as f:
+            data = pickle.load(f)
+        logger.info(f"[Cache] 命中名称映射缓存 ({len(data)} 条, age={age_hours:.1f}h)")
+        return data
+    except Exception:
+        return None
+
+
+def _save_name_map_cache(name_map: Dict[str, str]) -> None:
+    """保存名称映射到本地缓存"""
+    try:
+        with open(_NAME_MAP_CACHE_PATH, 'wb') as f:
+            pickle.dump(name_map, f)
+        logger.info(f"[Cache] 已保存名称映射缓存: {len(name_map)} 条")
+    except Exception:
+        pass
+
 # ── 全局股票名称映射（由 load_data 自动填充） ──
 NAME_MAP: Dict[str, str] = {}
 
@@ -64,7 +98,6 @@ FACTOR_NAME_MAP = {
     'rsi14': 'RSI14',
     'macd_hist': 'MACD柱状线',
     'boll_position': '布林带位置',
-    'boll_width': '布林带宽度',
     'volatility_20d': '20日波动率',
     'max_dd_60d': '60日最大回撤',
     # 情绪因子
@@ -82,6 +115,7 @@ FACTOR_NAME_MAP = {
     'revenue_growth': '营收增长率',
     'profit_growth': '利润增长率',
     # 动量/流动性
+    'momentum_5d': '5日动量',
     'momentum_20d': '20日动量',
     'momentum_60d': '60日动量',
     'liquidity': '流动性综合',
@@ -161,10 +195,8 @@ def generate_mock_data(
                 ma20 = np.mean(p_window[-20:])
                 std20 = np.std(p_window[-20:])
                 row['boll_position'] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100 + np.random.randn() * 5
-                row['boll_width'] = (std20 / ma20 * 100) if ma20 > 0 else 0
             else:
                 row['boll_position'] = 50 + np.random.randn() * 10
-                row['boll_width'] = np.random.uniform(5, 20)
 
             rets = np.diff(p_window[-20:]) / p_window[-20:-1]
             row['volatility_20d'] = np.std(rets) * np.sqrt(252) * 100
@@ -193,6 +225,7 @@ def generate_mock_data(
             row['profit_growth'] = np.random.uniform(-30, 60) + np.random.randn() * 8
 
             # 动量/流动性
+            row['momentum_5d'] = (prices[i] / prices[max(0, i-5)] - 1) * 100 + np.random.randn() * 0.5 if i >= 5 else np.random.randn() * 2
             if len(p_window) >= 20:
                 row['momentum_20d'] = (prices[i] / p_window[-20] - 1) * 100
             else:
@@ -211,11 +244,11 @@ def generate_mock_data(
     factor_df = pd.DataFrame(factor_data)
 
     factor_names = [
-        'rsi14', 'macd_hist', 'boll_position', 'boll_width', 'volatility_20d', 'max_dd_60d',
+        'rsi14', 'macd_hist', 'boll_position', 'volatility_20d', 'max_dd_60d',
         'north_hold_change', 'margin_change', 'turnover_ratio',
         'pe_ttm', 'pb', 'ep',
         'roe', 'gross_margin', 'revenue_growth', 'profit_growth',
-        'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'
+        'momentum_5d', 'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'
     ]
     factor_names = [f for f in factor_names if f in factor_df.columns]
 
@@ -236,11 +269,12 @@ class DataLoader:
         loader = DataLoader(sources=["tencent", "akshare", "tushare", "mock"])
     """
 
-    def __init__(self, sources: Optional[List[str]] = None, preferred: Optional[str] = None):
+    def __init__(self, sources: Optional[List[str]] = None, preferred: Optional[str] = None, include_symbols: Optional[List[str]] = None):
         """
         Args:
             sources: 数据源优先级列表，如 ["tencent", "akshare", "tushare", "mock"]
             preferred: 优先使用的单个数据源（简写，自动补全回退链）
+            include_symbols: 必须包含的股票代码列表（优先加载）
         """
         if preferred:
             chain = {
@@ -255,6 +289,7 @@ class DataLoader:
         else:
             self.sources = ["tencent", "akshare", "tushare", "mock"]
 
+        self.include_symbols: List[str] = list(include_symbols) if include_symbols else []
         self._fetchers: Dict[str, Any] = {}
         self._init_fetchers()
 
@@ -330,6 +365,7 @@ class DataLoader:
             frow = {
                 "symbol": symbol,
                 "trade_date": row["trade_date"],
+                "momentum_5d": (prices[i] / prices[max(0, i-5)] - 1) * 100,
                 "momentum_20d": (prices[i] / prices[max(0, i-20)] - 1) * 100,
                 "momentum_60d": (prices[i] / prices[max(0, i-60)] - 1) * 100 if len(p_window) >= 60 else np.nan,
                 "reversal": -(prices[i] / prices[max(0, i-5)] - 1) * 100,
@@ -352,7 +388,6 @@ class DataLoader:
             ma20 = np.mean(p_window[-20:])
             std20 = np.std(p_window[-20:])
             frow["boll_position"] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100
-            frow["boll_width"] = std20 / ma20 * 100 if ma20 > 0 else 0
 
             # ── 估值因子 (从 extra 传入) ──
             if extra:
@@ -390,6 +425,10 @@ class DataLoader:
             raise ValueError("腾讯数据源返回股票列表为空或过少")
 
         symbols = stock_list["symbol"].head(n_stocks).tolist()
+        if self.include_symbols:
+            extra = [s for s in self.include_symbols if s in stock_list["symbol"].values]
+            base = [s for s in symbols if s not in extra]
+            symbols = extra + base
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=n_days + 30)
@@ -516,6 +555,10 @@ class DataLoader:
             raise ValueError("AKShare数据源返回指数成分为空")
 
         symbols = hs300["symbol"].head(n_stocks).tolist()
+        if self.include_symbols:
+            extra = [s for s in self.include_symbols if s in hs300["symbol"].values]
+            base = [s for s in symbols if s not in extra]
+            symbols = extra + base
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=n_days + 30)
@@ -559,6 +602,10 @@ class DataLoader:
             raise ValueError("Tushare返回股票列表为空或过少")
 
         symbols = stock_list["symbol"].head(n_stocks).tolist()
+        if self.include_symbols:
+            extra = [s for s in self.include_symbols if s in stock_list["symbol"].values]
+            base = [s for s in symbols if s not in extra]
+            symbols = extra + base
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=n_days + 30)
@@ -593,14 +640,18 @@ class DataLoader:
         return factor_df, price_df, factor_names
 
     def load(self, n_stocks: int = 100, n_days: int = 60,
-             use_cache: bool = True, cache_ttl_hours: int = 6
+             use_cache: bool = True, cache_ttl_hours: int = 6,
+             include_symbols: Optional[List[str]] = None
              ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
         """按优先级加载数据，自动回退，支持本地文件缓存"""
         global NAME_MAP
 
+        if include_symbols is not None:
+            self.include_symbols = list(include_symbols)
+
         # ── 尝试读取本地缓存 ──
         if use_cache and self.sources[0] != "mock":
-            cache_key = _cache_key(self.sources[0], n_stocks, n_days)
+            cache_key = _cache_key(self.sources[0], n_stocks, n_days, self.include_symbols)
             cached = _load_cache(cache_key, ttl_hours=cache_ttl_hours)
             if cached is not None:
                 factor_df = cached["factor_df"]
@@ -632,7 +683,7 @@ class DataLoader:
                     pass
                 # 保存缓存
                 if use_cache and source != "mock":
-                    cache_key = _cache_key(source, n_stocks, n_days)
+                    cache_key = _cache_key(source, n_stocks, n_days, self.include_symbols)
                     _save_cache(cache_key, {
                         "factor_df": result[0],
                         "price_df": result[1],
@@ -659,12 +710,46 @@ class DataLoader:
 # ──────────────────────────────────────────
 # 兼容旧接口
 # ──────────────────────────────────────────
-def load_data(data_source: str = "real", **kwargs):
+def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs):
     """统一数据加载接口 (兼容旧版)
 
     Args:
         data_source: "mock" | "real" | "tencent" | "akshare" | "tushare"
+        prefer_snapshot: True 时，若当日全池快照存在则优先读取（秒开）
     """
+    # ── 优先读取每日全池因子快照 ──
+    if data_source != "mock" and prefer_snapshot:
+        try:
+            from data.daily_factors import has_daily_factors, load_daily_factors, latest_snapshot_date
+            snap_date = latest_snapshot_date()
+            if snap_date and has_daily_factors(snap_date):
+                factor_df, price_df, factor_names = load_daily_factors(snap_date)
+                logger.info(f"[DataLoader] 命中每日全池快照 {snap_date}: {len(factor_df)} 只")
+                # 补名称映射（快照无 name 列）— 优先读本地缓存，不足再从 Universe 加载
+                if not NAME_MAP:
+                    cached_map = _load_name_map_cache()
+                    if cached_map:
+                        NAME_MAP.update(cached_map)
+                if len(NAME_MAP) < 4000:
+                    try:
+                        from data.universe import Universe
+                        uni = Universe().load(use_cache=True)
+                        if not uni.empty and "name" in uni.columns:
+                            NAME_MAP.update({
+                                str(row["symbol"]): str(row["name"])
+                                for _, row in uni.iterrows()
+                                if pd.notna(row.get("name"))
+                            })
+                            logger.info(f"[DataLoader] 已加载 {len(NAME_MAP)} 只股票名称")
+                            _save_name_map_cache(dict(NAME_MAP))
+                    except Exception:
+                        pass
+                factor_df['trade_date'] = pd.to_datetime(factor_df['trade_date'])
+                price_df['trade_date'] = pd.to_datetime(price_df['trade_date'])
+                return factor_df, price_df, factor_names
+        except Exception as e:
+            logger.warning(f"[DataLoader] 读取每日快照失败，回退实时计算: {e}")
+
     if data_source == "mock":
         factor_df, price_df, factor_names = generate_mock_data(**kwargs)
     else:

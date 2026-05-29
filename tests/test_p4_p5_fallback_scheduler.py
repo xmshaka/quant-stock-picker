@@ -110,5 +110,7 @@ def test_scheduler_builds_job():
 
     sched = build_scheduler()
     jobs = sched.get_jobs()
-    assert len(jobs) == 1
-    assert jobs[0].id == "daily_incremental_scan"
+    assert len(jobs) == 2
+    job_ids = {j.id for j in jobs}
+    assert "daily_incremental_scan" in job_ids
+    assert "daily_factor_snapshot" in job_ids

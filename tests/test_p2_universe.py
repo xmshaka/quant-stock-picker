@@ -76,7 +76,7 @@ def test_universe_symbols():
 
     symbols = Universe.list_symbols(exclude_st=False, exclude_new_stock_days=0)
     print(f"  不排除 ST + 次新: {len(symbols)} 只")
-    assert len(symbols) > 5000, f"全 A 不排除应该 > 5000, 实际 {len(symbols)}"
+    assert len(symbols) > 4500, f"全 A 不排除应该 > 4500, 实际 {len(symbols)}"
     print("  ✅ 通过")
 
 

@@ -398,43 +398,47 @@ class TencentFetcher(BaseFetcher):
 
     # ── 腾讯特有接口 ──
     def get_realtime_quotes(self, symbols: List[str]) -> pd.DataFrame:
-        """批量获取实时行情 (腾讯强项，一次支持60-80只)"""
+        """批量获取实时行情 (腾讯一次支持60-80只，内部自动分批)"""
         if not symbols:
             return pd.DataFrame()
 
-        tencent_codes = ",".join([self._symbol_to_tencent(s) for s in symbols])
-        url = f"{self.BASE_QT_URL}{tencent_codes}"
-        resp = self._safe_get(url, source="tencent_qt")
-        if not resp:
-            return pd.DataFrame()
+        batch_size = 60
+        all_rows = []
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            tencent_codes = ",".join([self._symbol_to_tencent(s) for s in batch])
+            url = f"{self.BASE_QT_URL}{tencent_codes}"
+            resp = self._safe_get(url, source="tencent_qt")
+            if not resp:
+                continue
 
-        items = self._parse_qt_items(resp.text)
-        rows = []
-        for item in items:
-            rows.append({
-                "symbol": item.get("code", ""),
-                "name": item.get("name", ""),
-                "close": item.get("close", 0),
-                "open": item.get("open", 0),
-                "high": item.get("high", 0),
-                "low": item.get("low", 0),
-                "pre_close": item.get("pre_close", 0),
-                "change": item.get("change", 0),
-                "pct_change": item.get("pct_change", 0),
-                "volume": item.get("volume", 0),
-                "amount": item.get("amount", 0),
-                "pe_ttm": item.get("pe_ttm"),
-                "pb": item.get("pb"),
-                "turnover": item.get("turnover"),
-                "total_mv": item.get("total_mv"),
-                "float_mv": item.get("float_mv"),
-                "high_limit": item.get("high_limit"),
-                "low_limit": item.get("low_limit"),
-                "amplitude": item.get("amplitude"),
-                "volume_ratio": item.get("volume_ratio"),
-            })
+            items = self._parse_qt_items(resp.text)
+            for item in items:
+                all_rows.append({
+                    "symbol": item.get("code", ""),
+                    "name": item.get("name", ""),
+                    "close": item.get("close", 0),
+                    "open": item.get("open", 0),
+                    "high": item.get("high", 0),
+                    "low": item.get("low", 0),
+                    "pre_close": item.get("pre_close", 0),
+                    "change": item.get("change", 0),
+                    "pct_change": item.get("pct_change", 0),
+                    "volume": item.get("volume", 0),
+                    "amount": item.get("amount", 0),
+                    "pe_ttm": item.get("pe_ttm"),
+                    "pb": item.get("pb"),
+                    "turnover": item.get("turnover"),
+                    "total_mv": item.get("total_mv"),
+                    "float_mv": item.get("float_mv"),
+                    "high_limit": item.get("high_limit"),
+                    "low_limit": item.get("low_limit"),
+                    "amplitude": item.get("amplitude"),
+                    "volume_ratio": item.get("volume_ratio"),
+                })
+            # 限流已由 gateway 处理
 
-        return pd.DataFrame(rows)
+        return pd.DataFrame(all_rows)
 
     def get_hk_stock_list(self, top_n: int = 100) -> pd.DataFrame:
         """获取港股列表 + 实时行情"""

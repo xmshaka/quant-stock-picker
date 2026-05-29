@@ -382,7 +382,10 @@ class CacheManager:
                     self.l2.upsert_bars(symbol, new_df)
                     if use_pg:
                         self._save_to_pg(new_df)
-                    return self.l2.get_bars(symbol, start_date, end_date) or new_df
+                    merged = self.l2.get_bars(symbol, start_date, end_date)
+                    if merged is not None and not merged.empty:
+                        return merged
+                    return new_df
                 return cached[(cached["trade_date"] >= start_ts)].reset_index(drop=True)
 
         # 全量拉取

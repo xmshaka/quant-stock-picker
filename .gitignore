@@ -34,3 +34,5 @@ data_storage/
 /data/cache/
 /data/parquet/
 /data/portfolio/*.json
+/data/daily_factors/
+

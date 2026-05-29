@@ -63,6 +63,17 @@ class Settings(BaseSettings):
     daily_scan_alert_file: str = "logs/daily_scan_alerts.log"
     daily_scan_failure_threshold: int = 20              # 失败只数超过该值时写 ERROR 告警
 
+    # ── 市场时间 ──
+    market_close_hour: int = 15
+    market_close_minute: int = 30                       # 15:30 视为收盘后缓冲，此时间后数据应完整
+
+    # ── 每日全池因子预计算 (数据扫描后运行) ──
+    daily_factor_enabled: bool = True
+    daily_factor_hour: int = 16
+    daily_factor_minute: int = 30
+    daily_factor_max_workers: int = 4
+    daily_factor_keep_days: int = 7
+
     # ── 重试与退避 ──
     retry_max_attempts: int = 4
     retry_base_delay: float = 1.0     # 基础退避秒数

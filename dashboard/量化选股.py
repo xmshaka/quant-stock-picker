@@ -51,9 +51,12 @@ pm = PortfolioManager("main")
 
 # ========== 数据加载 ==========
 @st.cache_data(ttl=300)
-def get_data(_version=3):
-    # _version 用于强制刷新 Streamlit 缓存
-    return load_data(data_source="real", n_stocks=100, n_days=120)
+def get_data(_version=4, _n_stocks=100, _include_symbols=None):
+    # _version / _n_stocks / _include_symbols 用于强制刷新 Streamlit 缓存
+    kwargs = {"n_stocks": _n_stocks, "n_days": 120, "prefer_snapshot": True}
+    if _include_symbols:
+        kwargs["include_symbols"] = _include_symbols
+    return load_data(data_source="real", **kwargs)
 
 @st.cache_data(ttl=300)
 def get_hotspot_summary():
@@ -63,9 +66,19 @@ def get_hotspot_summary():
         "hot_stocks": bridge.get_hot_stocks_list(top_n=5),
     }
 
-factor_df, price_df, factor_names = get_data()
+# 确保 portfolio 里的股票优先被加载
+_portfolio_syms = sorted({item.symbol for item in (pm.watch_list + pm.hold_list)})
+_n_stocks = max(100, len(_portfolio_syms) + 100)
+
+factor_df, price_df, factor_names = get_data(_n_stocks=_n_stocks, _include_symbols=_portfolio_syms)
 hotspot_summary = get_hotspot_summary()
 latest_date = pd.to_datetime(factor_df['trade_date'].max()).strftime('%Y-%m-%d')
+
+# 自动刷新观察池/持仓池的最新信号
+_refresh_engine = SignalEngine(buy_threshold=0.7, sell_threshold=0.3, min_strength=2.0)
+_changed_symbols = pm.refresh_signals(_refresh_engine, factor_df, price_df, factor_names, {})
+if _changed_symbols:
+    st.toast(f"📡 {len(_changed_symbols)} 只股票信号已更新", icon="🔄")
 
 # ========== 辅助函数 ==========
 def fmt_name(symbol: str) -> str:
@@ -74,36 +87,176 @@ def fmt_name(symbol: str) -> str:
     name = NAME_MAP.get(symbol, "")
     return f"{symbol} {name}" if name else symbol
 
-def show_factor_detail(symbol, factor_df, latest_date):
-    """显示个股因子详情"""
+
+# 因子解释方向：1=越高越好，-1=越低越好，0=中性/仅观察。
+# 与默认信号权重保持一致，用于详情页解释“这个值是加分还是扣分”。
+FACTOR_DIRECTIONS = {
+    'rsi14': -1,                 # 当前策略偏反转：RSI低更容易加分
+    'macd_hist': 1,
+    'boll_position': 1,
+    'volatility_20d': -1,
+    'max_dd_60d': -1,
+    'north_hold_change': 1,
+    'margin_change': 1,
+    'turnover_ratio': 1,
+    'volume_ratio': 1,
+    'pe_ttm': -1,
+    'pb': -1,
+    'ep': 1,
+    'roe': 1,
+    'gross_margin': 1,
+    'revenue_growth': 1,
+    'profit_growth': 1,
+    'momentum_5d': -1,           # 5日动量偏反转
+    'momentum_20d': -1,          # 当前策略偏短期反转
+    'momentum_60d': 0,
+    'liquidity': 1,
+    'reversal': 1,
+}
+
+FACTOR_DIRECTION_LABEL = {1: "越高越好", -1: "越低越好", 0: "中性观察"}
+
+
+def _factor_judgement(score: float) -> str:
+    """把方向调整后的截面 z-score 转为直观标签。"""
+    if pd.isna(score):
+        return "—"
+    if score >= 1.0:
+        return "🟢 明显加分"
+    if score >= 0.3:
+        return "🟡 小幅加分"
+    if score <= -1.0:
+        return "🔴 明显扣分"
+    if score <= -0.3:
+        return "🟠 小幅扣分"
+    return "⚪ 接近平均"
+
+
+def _get_rsi_dynamic_direction(day_data: pd.DataFrame, symbol: str) -> tuple[float, str]:
+    """返回 (direction, 模式标签)，和信号引擎逻辑保持一致（浮点方向）"""
+    if 'momentum_20d' not in day_data.columns:
+        return FACTOR_DIRECTIONS.get('rsi14', -1), ""
+    m20 = day_data.set_index('symbol')['momentum_20d']
+    m20_abs = m20.abs()
+    threshold = m20_abs.quantile(0.8)
+    if threshold == 0:
+        return FACTOR_DIRECTIONS.get('rsi14', -1), ""
+    ts = min(m20_abs.get(symbol, 0) / threshold, 1.0)
+    if ts > 0.5:
+        base_dir = FACTOR_DIRECTIONS.get('rsi14', -1)
+        dynamic_dir = base_dir * (1 - 2 * ts)
+        return dynamic_dir, "趋势"
+    return FACTOR_DIRECTIONS.get('rsi14', -1), ""
+
+
+def _get_rsi_regime_label(regime: str, rsi: float) -> tuple[float, str]:
+    """返回 (direction, 标签)，和信号引擎三态逻辑一致"""
+    if regime == '震荡整理':
+        return -1, "反转（低RSI加分）"
+    elif regime == '强势单边上涨':
+        if rsi >= 75:
+            return 0.5, "跟随·追高风险衰减50%"
+        return 1, "跟随（高RSI加分）"
+    elif regime == '弱势单边上涨':
+        return 0, "中性（不参与打分）"
+    elif regime == '强势单边下跌':
+        if rsi <= 25:
+            return 0.5, "跟随·超卖保护衰减50%"
+        return 1, "跟随（高RSI扣分）"
+    elif regime == '弱势单边下跌':
+        return 0, "中性（不参与打分）"
+    return -1, "反转（低RSI加分）"
+
+
+def show_factor_detail(symbol, factor_df, price_df, latest_date):
+    """显示个股因子详情：原始值 + 截面正常区间 + 方向调整后的相对评分（趋势感知）。"""
+    from signals.engine import SignalEngine
+
     detail_data = factor_df[(factor_df['symbol'] == symbol) & (factor_df['trade_date'] == latest_date)]
+    day_data = factor_df[factor_df['trade_date'] == latest_date].copy()
     if detail_data.empty:
         st.warning("无该股票最新数据")
         return
-    
+
     row = detail_data.iloc[0]
     factors = {k: v for k, v in row.items() if k not in ['symbol', 'trade_date'] and pd.notna(v)}
-    
-    st.markdown(f"**📊 因子详情 — {fmt_name(symbol)}**")
-    
+
+    # 行情分类（和信号引擎一致）
+    engine = SignalEngine()
+    regime = engine._detect_regime(symbol, price_df, day_data)
+    regime_badge = f" <span style='background:#e3f2fd;color:#1565c0;padding:2px 6px;border-radius:6px;font-size:0.75rem;'>📊 {regime}</span>"
+
+    st.markdown(f"**📊 因子详情 — {fmt_name(symbol)}{regime_badge}**", unsafe_allow_html=True)
+    st.caption("说明：RSI根据行情分类动态调整方向——震荡市反转、强趋势跟随、极端值衰减。")
+
     groups = {
-        '技术因子': ['rsi14', 'macd_hist', 'boll_position', 'boll_width', 'volatility_20d', 'max_dd_60d'],
-        '情绪因子': ['north_hold_change', 'margin_change', 'turnover_ratio'],
+        '技术因子': ['rsi14', 'macd_hist', 'boll_position', 'volatility_20d', 'max_dd_60d'],
+        '情绪因子': ['north_hold_change', 'turnover_ratio', 'volume_ratio'],
         '估值因子': ['pe_ttm', 'pb', 'ep'],
         '质量因子': ['roe', 'gross_margin', 'revenue_growth', 'profit_growth'],
-        '动量/流动性': ['momentum_20d', 'momentum_60d', 'liquidity', 'reversal'],
+        '动量/流动性': ['momentum_5d', 'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'],
     }
-    
+
     for group_name, group_factors in groups.items():
-        group_data = {FACTOR_NAME_MAP.get(f, f): round(factors.get(f, np.nan), 3) 
-                     for f in group_factors if f in factors}
-        if group_data:
+        rows = []
+        for f in group_factors:
+            if f not in factors or f not in day_data.columns:
+                continue
+            vals = pd.to_numeric(day_data[f], errors='coerce').dropna()
+            raw = pd.to_numeric(pd.Series([factors.get(f)]), errors='coerce').iloc[0]
+            if vals.empty or pd.isna(raw):
+                continue
+
+            mean = vals.mean()
+            std = vals.std()
+            p25 = vals.quantile(0.25)
+            p75 = vals.quantile(0.75)
+            raw_pct = float((vals <= raw).mean() * 100)
+
+            # RSI 三态标签（和信号引擎保持一致）
+            if f == 'rsi14':
+                direction, dir_label = _get_rsi_regime_label(regime, raw)
+            else:
+                direction = FACTOR_DIRECTIONS.get(f, 1)
+                dir_label = FACTOR_DIRECTION_LABEL.get(direction, "越高越好")
+
+            z = 0.0 if std == 0 or pd.isna(std) else (raw - mean) / std
+            directional_score = z * direction if direction != 0 else np.nan
+
+            if direction == 1:
+                relative_pos = f"高于 {raw_pct:.0f}%"
+            elif direction == -1:
+                relative_pos = f"低于 {100 - raw_pct:.0f}%"
+            else:
+                relative_pos = f"百分位 {raw_pct:.0f}%"
+
+            rows.append({
+                '因子': FACTOR_NAME_MAP.get(f, f),
+                '原值': raw,
+                '判断': _factor_judgement(directional_score),
+                '相对评分': directional_score,
+                '相对位置': relative_pos,
+                '正常区间(P25~P75)': f"{p25:.3f} ~ {p75:.3f}",
+                '方向': dir_label,
+            })
+
+        if rows:
             with st.expander(f"**{group_name}**", expanded=False):
-                df = pd.DataFrame([group_data]).T.reset_index()
-                df.columns = ['因子', '值']
-                st.dataframe(df, use_container_width=True, hide_index=True,
-                            column_config={"因子": st.column_config.TextColumn(width="medium"),
-                                         "值": st.column_config.NumberColumn(width="small", format="%.3f")})
+                df = pd.DataFrame(rows)
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "因子": st.column_config.TextColumn(width="medium"),
+                        "原值": st.column_config.NumberColumn(width="small", format="%.3f"),
+                        "正常区间(P25~P75)": st.column_config.TextColumn(width="medium"),
+                        "方向": st.column_config.TextColumn(width="small"),
+                        "相对位置": st.column_config.TextColumn(width="small"),
+                        "相对评分": st.column_config.NumberColumn(width="small", format="%.2f"),
+                        "判断": st.column_config.TextColumn(width="medium"),
+                    },
+                )
     
     if st.button("关闭详情", key=f"close_{symbol}"):
         st.session_state.detail_symbol = None
@@ -161,19 +314,19 @@ page = st.session_state.page
 if page == '信号':
     with st.expander("⚙️ 因子权重", expanded=False):
         FACTOR_GROUPS = {
-            '技术': ['rsi14', 'macd_hist', 'boll_position', 'boll_width', 'volatility_20d', 'max_dd_60d'],
-            '情绪': ['north_hold_change', 'margin_change', 'turnover_ratio', 'volume_ratio'],
+            '技术': ['rsi14', 'macd_hist', 'boll_position', 'volatility_20d', 'max_dd_60d'],
+            '情绪': ['north_hold_change', 'turnover_ratio', 'volume_ratio'],
             '估值': ['pe_ttm', 'pb', 'ep'],
             '质量': ['roe', 'gross_margin', 'revenue_growth', 'profit_growth'],
-            '动量': ['momentum_20d', 'momentum_60d', 'liquidity', 'reversal'],
+            '动量': ['momentum_5d', 'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'],
         }
         DEFAULT_WEIGHTS = {
-            'rsi14': -0.1, 'macd_hist': 0.2, 'boll_position': 0.1, 'boll_width': 0.0,
+            'rsi14': -0.1, 'macd_hist': 0.2, 'boll_position': 0.1,
             'volatility_20d': -0.1, 'max_dd_60d': -0.1,
-            'north_hold_change': 0.3, 'margin_change': 0.2, 'turnover_ratio': 0.1, 'volume_ratio': 0.1,
+            'north_hold_change': 0.4, 'turnover_ratio': 0.15, 'volume_ratio': 0.15,
             'pe_ttm': -0.2, 'pb': -0.1, 'ep': 0.1,
             'roe': 0.3, 'gross_margin': 0.2, 'revenue_growth': 0.2, 'profit_growth': 0.2,
-            'momentum_20d': -0.1, 'momentum_60d': 0.0, 'liquidity': 0.1, 'reversal': 0.3,
+            'momentum_5d': -0.15, 'momentum_20d': -0.1, 'momentum_60d': 0.0, 'liquidity': 0.1, 'reversal': 0.3,
         }
         factor_weights = {}
         for group_name, group_factors in FACTOR_GROUPS.items():
@@ -218,7 +371,7 @@ if page == '信号':
     st.subheader(f"🟢 买入 ({len(buy_signals)})")
     if buy_signals:
         bridge = get_bridge()
-        for s in sorted(buy_signals, key=lambda x: x.strength, reverse=True)[:10]:
+        for s in sorted(buy_signals, key=lambda x: x.strength, reverse=True)[:20]:
             in_watch = pm.is_in_watch(s.symbol)
             in_hold = pm.is_in_hold(s.symbol)
             hot_badge = bridge.get_hot_badge(s.symbol)
@@ -227,8 +380,12 @@ if page == '信号':
                 col_info, col_btn = st.columns([3, 1])
                 with col_info:
                     hot_tag = f" <span style='background:#ff9800;color:white;padding:1px 5px;border-radius:8px;font-size:0.65rem;'>热点</span>" if is_hot else ""
-                    st.markdown(f"**{fmt_name(s.symbol)}** {s.emoji}{hot_badge} | {s.strategy_name}{hot_tag}", unsafe_allow_html=True)
+                    regime_tag = f" <span style='background:#e3f2fd;color:#1565c0;padding:1px 5px;border-radius:8px;font-size:0.65rem;'>{s.regime[:4]}</span>" if s.regime != '震荡整理' else ""
+                    risk_tag = s.risk_badge if hasattr(s, 'risk_badge') else ""
+                    st.markdown(f"**{fmt_name(s.symbol)}** {s.emoji}{hot_badge}{regime_tag}{risk_tag} | {s.strategy_name}{hot_tag}", unsafe_allow_html=True)
                     caption = f"强度:{s.strength} 得分:{s.score:.2f}"
+                    if s.risk_tags:
+                        caption += f" | ⚠️{','.join(s.risk_tags)}"
                     if is_hot:
                         hot_news = bridge.get_stock_hot_summary(s.symbol)
                         if hot_news["has_hot"]:
@@ -254,13 +411,18 @@ if page == '信号':
 
     st.subheader(f"🔴 卖出 ({len(sell_signals)})")
     if sell_signals:
-        for s in sorted(sell_signals, key=lambda x: x.strength, reverse=True)[:10]:
+        for s in sorted(sell_signals, key=lambda x: x.strength, reverse=True)[:20]:
             in_hold = pm.is_in_hold(s.symbol)
             with st.container():
                 col_info, col_btn = st.columns([3, 1])
                 with col_info:
-                    st.markdown(f"**{fmt_name(s.symbol)}** {s.emoji} | {s.strategy_name}")
-                    st.caption(f"强度:{s.strength}")
+                    regime_tag = f" <span style='background:#e3f2fd;color:#1565c0;padding:1px 5px;border-radius:8px;font-size:0.65rem;'>{s.regime[:4]}</span>" if s.regime != '震荡整理' else ""
+                    risk_tag = s.risk_badge if hasattr(s, 'risk_badge') else ""
+                    st.markdown(f"**{fmt_name(s.symbol)}** {s.emoji}{regime_tag}{risk_tag} | {s.strategy_name}")
+                    caption = f"强度:{s.strength}"
+                    if s.risk_tags:
+                        caption += f" | ⚠️{','.join(s.risk_tags)}"
+                    st.caption(caption)
                 with col_btn:
                     if in_hold:
                         if st.button("卖出", key=f"sell_{s.symbol}", type="primary", use_container_width=True):
@@ -305,7 +467,7 @@ elif page == '观察':
                     st.rerun()
                 
                 if st.session_state.get('detail_symbol') == item.symbol and st.session_state.get('detail_page') == '观察':
-                    show_factor_detail(item.symbol, factor_df, latest_date)
+                    show_factor_detail(item.symbol, factor_df, price_df, latest_date)
                 
                 st.divider()
     else:
@@ -350,7 +512,7 @@ elif page == '持仓':
                     st.rerun()
                 
                 if st.session_state.get('detail_symbol') == item.symbol and st.session_state.get('detail_page') == '持仓':
-                    show_factor_detail(item.symbol, factor_df, latest_date)
+                    show_factor_detail(item.symbol, factor_df, price_df, latest_date)
                 
                 st.divider()
     else:

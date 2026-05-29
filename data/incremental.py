@@ -46,6 +46,7 @@ class ScanReport:
     start_ts: float = field(default_factory=time.monotonic)
     total_symbols: int = 0
     skipped_up_to_date: int = 0     # 已经是最新, 无需更新
+    skipped_intraday_refresh: int = 0  # 盘中临时数据被收盘后重刷
     updated_count: int = 0          # 实际成功更新
     failed_count: int = 0           # 失败
     new_rows: int = 0               # 总写入行数
@@ -57,6 +58,7 @@ class ScanReport:
             f"\n══ 增量扫描报告 ══\n"
             f"  股票池规模:    {self.total_symbols}\n"
             f"  已是最新:      {self.skipped_up_to_date}\n"
+            f"  盘中重刷:      {self.skipped_intraday_refresh}\n"
             f"  成功更新:      {self.updated_count}\n"
             f"  失败:          {self.failed_count}\n"
             f"  新增行数:      {self.new_rows}\n"
@@ -108,7 +110,7 @@ class IncrementalUpdater:
 
         logger.info(f"[Updater] 待扫描股票: {len(symbols)} 只")
 
-        # 2. 批量查 PG 最新日期
+        # 2. 批量查 PG 最新日期及 created_at（用于检测盘中临时数据）
         logger.info("[Updater] 批量查询 PG 本地最新日期...")
         latest_map = self._safe_get_latest(symbols)
 
@@ -116,13 +118,23 @@ class IncrementalUpdater:
         end_dt = (datetime.now() if end_date is None
                   else datetime.strptime(end_date, "%Y%m%d"))
         end_str = end_dt.strftime("%Y%m%d")
+        is_after_close = (
+            end_dt.hour > settings.market_close_hour
+            or (end_dt.hour == settings.market_close_hour and end_dt.minute >= settings.market_close_minute)
+        )
         tasks = []
         for sym in symbols:
-            last = latest_map.get(sym)
+            last, created_at = latest_map.get(sym, (None, None))
             if last is not None:
                 # 已有数据 -> 从 last+1 开始补
                 start_dt = pd.Timestamp(last) + pd.Timedelta(days=1)
                 if start_dt.date() > end_dt.date():
+                    # 日期已是最新，但收盘后需检查是否为盘中临时数据
+                    if is_after_close and created_at is not None and self._is_intraday_data(created_at, last):
+                        # 盘中写入的临时数据，收盘后强制重拉
+                        tasks.append((sym, end_str, end_str))
+                        report.skipped_intraday_refresh += 1
+                        continue
                     report.skipped_up_to_date += 1
                     continue
                 start_str = start_dt.strftime("%Y%m%d")
@@ -179,15 +191,27 @@ class IncrementalUpdater:
 
     # ── 内部方法 ──
     def _safe_get_latest(self, symbols: List[str]) -> dict:
-        """批量查询 PG, 失败时静默"""
+        """批量查询 PG 最新日期及 created_at，失败时静默"""
         out = {}
         try:
             for i in range(0, len(symbols), 500):
                 chunk = symbols[i:i + 500]
-                out.update(self.repo.get_latest_dates_bulk(chunk))
+                out.update(self.repo.get_latest_dates_with_created_at(chunk))
         except Exception as e:
             logger.warning(f"[Updater] PG 查询最新日期失败 (按全量处理): {e}")
         return out
+
+    def _is_intraday_data(self, created_at, trade_date) -> bool:
+        """判断是否为盘中临时数据（created_at 早于收盘时间）"""
+        if created_at is None or trade_date is None:
+            return False
+        # 如果记录创建日期等于交易日，且时间早于收盘时间
+        return (
+            created_at.date() == trade_date
+            and (created_at.hour < settings.market_close_hour
+                 or (created_at.hour == settings.market_close_hour
+                     and created_at.minute < settings.market_close_minute))
+        )
 
     def _fetch_one(self, symbol: str, start_str: str, end_str: str) -> int:
         """拉单只股票, 双写 L2+L3, 返回写入行数"""
