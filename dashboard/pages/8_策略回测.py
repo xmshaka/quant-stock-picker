@@ -10,6 +10,7 @@ from strategy.registry import SchemeRegistry
 from strategy.schemes import StrategyScheme
 from backtest.scheme_backtest import SchemeBacktester, run_multi_scheme_backtest
 from backtest.records import BacktestRunConfig, load_backtest_run, summarize_liquidity_slippage
+from dashboard.backtest_state import backtest_context_signature, clear_stale_compare
 from dashboard.components.kline_chart import plot_kline_with_signals, plot_equity_curve
 from signals.rules import TradePoint
 from theme import inject_theme, metric_row, section_header, badge, empty_state, C
@@ -37,28 +38,6 @@ def _restore_widget_state(widget_key: str, durable_key: str, default):
 
 def _save_widget_state(widget_key: str, durable_key: str):
     st.session_state[durable_key] = st.session_state.get(widget_key)
-
-
-def _normalize_symbols(symbols):
-    return tuple(sorted(str(s).strip() for s in (symbols or []) if str(s).strip()))
-
-
-def _backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital):
-    """当前回测上下文签名，用于避免股票/参数切换后展示旧方案对比结果。"""
-    return {
-        "pool_mode": str(pool_mode or ""),
-        "symbols": _normalize_symbols(custom_symbols),
-        "lookback_days": int(lookback),
-        "top_n": int(top_n),
-        "initial_capital": float(capital),
-    }
-
-
-def _clear_stale_compare(current_signature):
-    old_signature = st.session_state.get("bt_compare_signature")
-    if "bt_compare" in st.session_state and old_signature != current_signature:
-        st.session_state.pop("bt_compare", None)
-        st.session_state.pop("bt_compare_signature", None)
 
 
 _restore_widget_state("bt_scheme_name", "bt_pref_scheme_name", list(scheme_names.keys())[0])
@@ -116,8 +95,8 @@ elif pool_mode == "持仓池":
     if not custom_symbols:
         st.warning("持仓池为空")
 
-current_context_signature = _backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital)
-_clear_stale_compare(current_context_signature)
+current_context_signature = backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital)
+clear_stale_compare(st.session_state, current_context_signature)
 
 # ========== 执行回测 ==========
 if st.button("▶ 运行回测", type="primary", use_container_width=True):
