@@ -337,7 +337,8 @@ class TencentFetcher(BaseFetcher):
             if end_date:
                 df = df[df["trade_date"] <= pd.to_datetime(end_date)]
 
-            df["amount"] = 0.0
+            # 腾讯 K 线接口当前未稳定返回成交额；volume 单位为“手”，用于滑点分层时必须估算成交额。
+            df["amount"] = df["volume"].astype(float) * df["close"].astype(float) * 100.0
             df["pct_change"] = df["close"].pct_change() * 100
             df["change"] = df["close"].diff()
 
