@@ -21,6 +21,17 @@ from theme import inject_theme, metric_row, section_header, empty_state, C
 st.set_page_config(page_title="回测记录", page_icon="🧾", layout="wide")
 inject_theme()
 
+
+def _record_table_height(row_count: int) -> int:
+    """历史列表高度自适应：少量记录全展开，过多记录保留内部滚动条。"""
+    header_height = 38
+    row_height = 35
+    padding = 8
+    min_height = 180
+    max_height = 620
+    height = header_height + max(int(row_count), 1) * row_height + padding
+    return min(max(height, min_height), max_height)
+
 section_header("历史回测记录")
 st.caption("读取 data/backtest_runs/*：metrics/config/trades/equity/signals，用于复盘和审计。")
 
@@ -53,7 +64,13 @@ show_cols = {
     "一致性": "一致性",
     "created_at": "保存时间",
 }
-st.dataframe(display[list(show_cols.keys())].rename(columns=show_cols), use_container_width=True, hide_index=True)
+st.dataframe(
+    display[list(show_cols.keys())].rename(columns=show_cols),
+    use_container_width=True,
+    hide_index=True,
+    height=_record_table_height(len(display)),
+)
+st.caption(f"共 {len(display)} 条回测记录；列表高度随记录数自适应，超过可视上限后可在表格内滚动。")
 
 c1, c2, c3 = st.columns([3, 1, 1])
 with c1:
