@@ -39,6 +39,28 @@ def _save_widget_state(widget_key: str, durable_key: str):
     st.session_state[durable_key] = st.session_state.get(widget_key)
 
 
+def _normalize_symbols(symbols):
+    return tuple(sorted(str(s).strip() for s in (symbols or []) if str(s).strip()))
+
+
+def _backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital):
+    """当前回测上下文签名，用于避免股票/参数切换后展示旧方案对比结果。"""
+    return {
+        "pool_mode": str(pool_mode or ""),
+        "symbols": _normalize_symbols(custom_symbols),
+        "lookback_days": int(lookback),
+        "top_n": int(top_n),
+        "initial_capital": float(capital),
+    }
+
+
+def _clear_stale_compare(current_signature):
+    old_signature = st.session_state.get("bt_compare_signature")
+    if "bt_compare" in st.session_state and old_signature != current_signature:
+        st.session_state.pop("bt_compare", None)
+        st.session_state.pop("bt_compare_signature", None)
+
+
 _restore_widget_state("bt_scheme_name", "bt_pref_scheme_name", list(scheme_names.keys())[0])
 _restore_widget_state("bt_top_n", "bt_pref_top_n", 10)
 _restore_widget_state("bt_lookback", "bt_pref_lookback", 60)
@@ -94,6 +116,9 @@ elif pool_mode == "持仓池":
     if not custom_symbols:
         st.warning("持仓池为空")
 
+current_context_signature = _backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital)
+_clear_stale_compare(current_context_signature)
+
 # ========== 执行回测 ==========
 if st.button("▶ 运行回测", type="primary", use_container_width=True):
     factor_df, price_df, factor_names = get_data(n_stocks=300)
@@ -122,6 +147,10 @@ if st.button("▶ 运行回测", type="primary", use_container_width=True):
     progress_bar.progress(1.0)
     status_text.caption("✅ 回测完成")
     st.session_state.bt_result = result
+    st.session_state.bt_result_signature = current_context_signature
+    # FIX: 股票池/参数已发生新回测时，旧“方案对比”结果不再可信，必须清空。
+    st.session_state.pop("bt_compare", None)
+    st.session_state.pop("bt_compare_signature", None)
     st.session_state.bt_run_config = BacktestRunConfig(
         run_id=result.run_id,
         scheme_id=selected_scheme.scheme_id,
@@ -341,9 +370,16 @@ if "bt_result" in st.session_state:
         compare_status.caption("✅ 对比完成")
         all_results.sort(key=lambda r: r.total_return, reverse=True)
         st.session_state.bt_compare = all_results
+        st.session_state.bt_compare_signature = current_context_signature
 
-    if "bt_compare" in st.session_state:
+    if "bt_compare" in st.session_state and st.session_state.get("bt_compare_signature") == current_context_signature:
         section_header("方案对比")
+        compare_symbols = current_context_signature["symbols"]
+        symbol_label = ",".join(compare_symbols) if compare_symbols else current_context_signature["pool_mode"]
+        st.caption(
+            f"对比上下文：股票池={symbol_label}，回测天数={current_context_signature['lookback_days']}，"
+            f"选股数={current_context_signature['top_n']}，资金=¥{current_context_signature['initial_capital']:,.0f}"
+        )
         compare_data = []
         for r in st.session_state.bt_compare:
             compare_data.append({
