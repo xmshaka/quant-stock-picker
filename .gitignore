@@ -21,6 +21,7 @@ venv/
 logs/
 data_storage/
 *.log
+data/backtest_runs/
 
 # OS / editor
 .DS_Store
@@ -29,10 +30,10 @@ data_storage/
 
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/config.toml
 
 # Generated market data cache
 /data/cache/
 /data/parquet/
 /data/portfolio/*.json
 /data/daily_factors/
-
