@@ -1,178 +1,94 @@
-"""热点追踪页面 - 实时新闻 + NLP分析"""
+"""热点追踪页面"""
 import sys
 sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
 
 import streamlit as st
 import pandas as pd
-
-from hotspot.aggregator import HotspotAggregator
-from data_loader import NAME_MAP
 from datetime import datetime
 
-# ========== 页面配置 ==========
-st.set_page_config(page_title="热点追踪", page_icon="🔥", layout="centered")
+from hotspot.aggregator import HotspotAggregator
+from hotspot.nlp import SentimentAnalyzer
+from theme import inject_theme, metric_row, section_header, badge, empty_state, progress_bar, C
 
-# ========== 移动端适配CSS ==========
-st.markdown("""
-<style>
-    .block-container { padding-top: 3.5rem !important; padding-left: 0.8rem; padding-right: 0.8rem; }
-    h1 { font-size: 1.3rem !important; margin-top: 0.5rem !important; }
-    h2 { font-size: 1.1rem !important; margin-top: 0.6rem !important; }
-    h3 { font-size: 1rem !important; margin-top: 0.4rem !important; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="热点追踪", page_icon="🔥", layout="wide")
+inject_theme()
 
+section_header("热点追踪")
 
-def fmt_name(symbol: str) -> str:
-    """返回 '代码 名称' 格式"""
-    name = NAME_MAP.get(symbol, "")
-    return f"{symbol} {name}" if name else symbol
-
-# 移动端CSS
-st.markdown("""
-<style>
-    html { font-size: 14px; }
-    h1 { font-size: 1.3rem !important; }
-    .news-item { background: #f8f9fa; padding: 8px 10px; border-radius: 6px; margin: 4px 0; }
-    .news-item .title { font-size: 0.85rem; font-weight: 500; }
-    .news-item .meta { font-size: 0.7rem; color: #666; margin-top: 2px; }
-    .news-item .tags { margin-top: 4px; }
-    .tag-stock { background: #e3f2fd; color: #1565c0; padding: 1px 6px; border-radius: 10px; font-size: 0.65rem; }
-    .tag-industry { background: #e8f5e9; color: #2e7d32; padding: 1px 6px; border-radius: 10px; font-size: 0.65rem; }
-    .tag-sentiment-pos { background: #c8e6c9; color: #1b5e20; }
-    .tag-sentiment-neg { background: #ffcdd2; color: #b71c1c; }
-    .tag-sentiment-neu { background: #f5f5f5; color: #616161; }
-    .stMetric { background: #f8f9fa; border-radius: 6px; padding: 6px 4px; }
-    .stMetric label { font-size: 0.7rem !important; }
-    .stMetric div[data-testid="stMetricValue"] { font-size: 1rem !important; }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🔥 热点追踪")
-
-# ========== 数据加载（带缓存） ==========
-@st.cache_data(ttl=300)
-def get_hotspot_data():
-    """获取热点数据，缓存5分钟"""
+# ========== 加载 ==========
+@st.cache_data(ttl=600, show_spinner=False)
+def load_hotspot():
     agg = HotspotAggregator(max_news=80)
     return agg.run()
 
-# 刷新按钮
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.caption(f"最后更新: {datetime.now().strftime('%H:%M:%S')}")
-with col2:
-    if st.button("🔄 刷新", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+with st.spinner("抓取热点新闻..."):
+    result = load_hotspot()
 
-with st.spinner("正在抓取新闻..."):
-    result = get_hotspot_data()
-
-if result["news"].empty:
-    st.warning("暂无新闻数据，请检查网络或稍后刷新")
+if not result or result.get("news", pd.DataFrame()).empty:
+    empty_state("🔥", "暂未抓取到热点新闻")
     st.stop()
 
-# ========== 情感统计卡片 ==========
-ss = result["sentiment_summary"]
-st.subheader("📊 市场情绪")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("总新闻", ss["total"])
-c2.metric("🟢 利好", ss["positive"], delta=f"{ss['positive']/max(ss['total'],1)*100:.0f}%")
-c3.metric("🔴 利空", ss["negative"], delta=f"{ss['negative']/max(ss['total'],1)*100:.0f}%")
-c4.metric("平均情感", f"{ss['avg_score']:+.2f}")
+news_df = result["news"]
+scored_df = result["scored"]
+hot_sectors = result["hot_sectors"]
+hot_stocks = result["hot_stocks"]
+sentiment = result["sentiment_summary"]
+
+# ========== 概览 ==========
+metric_row([
+    {"label": "新闻总数", "value": str(sentiment['total'])},
+    {"label": "利好", "value": str(sentiment['positive']), "color": "green"},
+    {"label": "利空", "value": str(sentiment['negative']), "color": "red"},
+    {"label": "中性", "value": str(sentiment['neutral'])},
+    {"label": "均分", "value": f"{sentiment['avg_score']:+.3f}", "color": "green" if sentiment['avg_score'] > 0 else "red"},
+], cols=5)
 
 # ========== 热门行业 ==========
-st.subheader("🏭 热门行业")
-sectors = result["hot_sectors"]
-if not sectors.empty:
-    # 柱状图
-    chart_data = sectors.head(10).copy()
-    chart_data["行业"] = chart_data["industry"]
-    chart_data["热度"] = chart_data["heat_score"]
-    st.bar_chart(chart_data.set_index("行业")["热度"], use_container_width=True, height=200)
-
-    # 表格
-    display_sectors = sectors.head(15).copy()
-    display_sectors.columns = ["行业", "热度", "平均情感", "新闻数"]
-    st.dataframe(display_sectors, use_container_width=True, hide_index=True,
-                column_config={
-                    "热度": st.column_config.NumberColumn(format="%.1f"),
-                    "平均情感": st.column_config.NumberColumn(format="%.2f"),
-                })
-else:
-    st.info("暂无行业热点数据")
-
-# ========== 热门股票 ==========
-st.subheader("📈 热门股票")
-hot_stocks = result["hot_stocks"]
-if not hot_stocks.empty:
-    display_stocks = hot_stocks.head(15).copy()
-    display_stocks.columns = ["股票代码", "热度", "平均情感", "提及次数"]
-    st.dataframe(display_stocks, use_container_width=True, hide_index=True,
-                column_config={
-                    "热度": st.column_config.NumberColumn(format="%.1f"),
-                    "平均情感": st.column_config.NumberColumn(format="%.2f"),
-                })
-else:
-    st.info("暂无股票热点数据")
-
-# ========== 热门新闻列表 ==========
-st.subheader("📰 热门新闻")
-scored = result["scored"]
-if not scored.empty:
-    # 筛选器
-    filter_col1, filter_col2 = st.columns(2)
-    with filter_col1:
-        sentiment_filter = st.multiselect("情感筛选", ["positive", "negative", "neutral"],
-                                           default=["positive", "negative", "neutral"])
-    with filter_col2:
-        stock_filter = st.text_input("股票筛选", placeholder="输入股票名称或代码")
-
-    filtered = scored[scored["sentiment_label"].isin(sentiment_filter)]
-    if stock_filter:
-        filtered = filtered[filtered["stocks"].str.contains(stock_filter, na=False) |
-                            filtered["title"].str.contains(stock_filter, na=False)]
-
-    for _, row in filtered.head(30).iterrows():
-        # 情感标签样式
-        if row["sentiment_label"] == "positive":
-            sentiment_class = "tag-sentiment-pos"
-            sentiment_text = "利好"
-        elif row["sentiment_label"] == "negative":
-            sentiment_class = "tag-sentiment-neg"
-            sentiment_text = "利空"
-        else:
-            sentiment_class = "tag-sentiment-neu"
-            sentiment_text = "中性"
-
-        # 股票标签
-        stock_tags = ""
-        if row["stocks"]:
-            for s in row["stocks"].split(",")[:3]:
-                stock_tags += f'<span class="tag-stock">{fmt_name(s)}</span> '
-
-        # 行业标签
-        industry_tags = ""
-        if row["industries"]:
-            for i in row["industries"].split(",")[:2]:
-                industry_tags += f'<span class="tag-industry">{i}</span> '
-
+if not hot_sectors.empty:
+    section_header("热门行业")
+    for _, row in hot_sectors.head(10).iterrows():
+        heat = row.get("heat_score", 0)
+        bar_w = min(100, heat * 20)
         st.markdown(f"""
-        <div class="news-item">
-            <div class="title">{row['title']}</div>
-            <div class="meta">{row['source']} | 热度:{row['heat_score']:.1f} | 强度:{row['intensity']:.2f}</div>
-            <div class="tags">
-                <span class="{sentiment_class}" style="padding:1px 6px;border-radius:10px;font-size:0.65rem;">{sentiment_text}</span>
-                {stock_tags}{industry_tags}
-            </div>
+        <div style="display:flex;align-items:center;gap:12px;padding:7px 0;">
+            <span style="font-size:0.82rem;font-weight:600;width:140px;">{row.get('industry', '')}</span>
+            <div class="qsp-progress" style="flex:1;"><div class="fill" style="width:{bar_w}%;background:{C['accent']};"></div></div>
+            <span style="font-size:0.72rem;color:{C['text2']};width:80px;text-align:right;">热度 {heat:.1f}</span>
         </div>
         """, unsafe_allow_html=True)
 
-    if len(filtered) == 0:
-        st.info("无匹配新闻")
-else:
-    st.info("暂无新闻数据")
+# ========== 热门个股 ==========
+if not hot_stocks.empty:
+    section_header("热门个股")
+    for _, row in hot_stocks.head(10).iterrows():
+        sent = row.get("avg_sentiment", 0)
+        sent_b = badge("利好", "buy") if sent > 0.2 else badge("利空", "sell") if sent < -0.2 else badge("中性", "neutral")
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:12px;padding:7px 0;">
+            <span style="font-size:0.82rem;font-weight:600;width:140px;">{row.get('stock', '')}</span>
+            {sent_b}
+            <span style="font-size:0.72rem;color:{C['text2']};">热度 {row.get('heat_score', 0):.1f} · 提及 {row.get('mention_count', 0)}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-st.divider()
-st.caption("💡 数据来源: 新浪财经RSS | 每5分钟自动缓存")
+# ========== 新闻列表 ==========
+section_header("新闻列表")
+if not scored_df.empty:
+    for _, row in scored_df.head(30).iterrows():
+        title = row.get("title", "")
+        source = row.get("source", "")
+        heat = row.get("heat_score", 0)
+        sent_score = row.get("sentiment_score", 0)
+        sent_label = row.get("sentiment_label", "neutral")
+        sent_b = badge("利好", "buy") if sent_label == "positive" else badge("利空", "sell") if sent_label == "negative" else badge("中性", "neutral")
+
+        st.markdown(f"""
+        <div style="padding:6px 0;border-bottom:1px solid {C['border']};">
+            <div style="font-size:0.82rem;color:{C['text']};">{title}</div>
+            <div style="font-size:0.68rem;color:{C['text2']};margin-top:2px;">
+                {source} · 热度 {heat:.1f} · {sent_b}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+else:
+    empty_state("📰", "暂无新闻")
