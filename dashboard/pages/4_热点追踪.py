@@ -74,18 +74,20 @@ if not hot_stocks.empty:
 # ========== 新闻列表 ==========
 section_header("新闻列表")
 if not scored_df.empty:
-    for _, row in scored_df.head(30).iterrows():
+    for idx, (_, row) in enumerate(scored_df.head(30).iterrows()):
         title = row.get("title", "")
         source = row.get("source", "")
         heat = row.get("heat_score", 0)
         sent_score = row.get("sentiment_score", 0)
         sent_label = row.get("sentiment_label", "neutral")
         sent_b = badge("利好", "buy") if sent_label == "positive" else badge("利空", "sell") if sent_label == "negative" else badge("中性", "neutral")
+        row_bg = C['surface2'] if idx % 2 == 0 else C['surface']
+        tone_color = C['green'] if sent_label == "positive" else C['red'] if sent_label == "negative" else C['border2']
 
         st.markdown(f"""
-        <div style="padding:6px 0;border-bottom:1px solid {C['border']};">
-            <div style="font-size:0.82rem;color:{C['text']};">{title}</div>
-            <div style="font-size:0.68rem;color:{C['text2']};margin-top:2px;">
+        <div style="background:{row_bg};border:1px solid {C['border']};border-left:4px solid {tone_color};border-radius:0.375rem;padding:10px 12px;margin-bottom:7px;">
+            <div style="font-size:0.84rem;font-weight:600;line-height:1.45;color:{C['text']};">{title}</div>
+            <div style="font-size:0.70rem;color:{C['text2']};margin-top:5px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                 {source} · 热度 {heat:.1f} · {sent_b}
             </div>
         </div>

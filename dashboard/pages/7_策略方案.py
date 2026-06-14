@@ -35,7 +35,7 @@ for scheme in schemes:
         st.markdown(f"**{scheme.name}** {builtin_tag} {regime_tags}")
         st.caption(scheme.description)
     with col_action:
-        if st.button("选用", key=f"select_{scheme.scheme_id}", use_container_width=True):
+        if st.button("选用", key=f"select_{scheme.scheme_id}", width="stretch"):
             st.session_state.selected_scheme = scheme.scheme_id
             st.toast(f"已选用: {scheme.name}")
 
@@ -61,7 +61,7 @@ if selected:
         if weight_data:
             import pandas as pd
             df = pd.DataFrame(weight_data)
-            st.dataframe(df, use_container_width=True, hide_index=True,
+            st.dataframe(df, width="stretch", hide_index=True,
                          column_config={"权重": st.column_config.NumberColumn(format="%.2f")})
 
     # 信号规则
@@ -99,7 +99,7 @@ if selected:
                 cn = FACTOR_NAME_MAP.get(f, f)
                 edited_weights[f] = st.slider(cn, -1.0, 1.0, w, 0.05, key=f"cw_{f}")
 
-        if st.form_submit_button("💾 保存自定义方案", type="primary", use_container_width=True):
+        if st.form_submit_button("💾 保存自定义方案", type="primary", width="stretch"):
             new_scheme = StrategyScheme(
                 scheme_id=new_id,
                 name=new_name,

@@ -1,71 +1,108 @@
-"""共享主题 — 业务组件样式 + 配色常量
+"""共享主题 — Financial Professional 风格业务组件。
 
-框架层面（侧边栏/菜单/输入框/表格/按钮）交给 Streamlit 原生深色方案，
+参考 awesome-streamlit-themes/financial，并调整为米白暖色系：深海军蓝主色、米白背景、细边框、
+保守圆角和高对比排版。框架层面由 .streamlit/config.toml 控制，
 这里只管业务组件：信号卡、指标卡、徽章、进度条等。
 """
+import re
+
 import streamlit as st
 from typing import List, Dict, Optional, Any
 
 # ── 配色常量（供 Python 逻辑引用）──
 C = {
-    "bg":        "#0e1117",
-    "surface":   "#1a1d24",
-    "surface2":  "#24272f",
-    "border":    "#2d3139",
-    "text":      "#e0e0e0",
-    "text2":     "#8b8fa3",
-    "accent":    "#4f8cff",
-    "accent2":   "#3b6fd4",
-    "green":     "#22c55e",
-    "green_bg":  "rgba(34,197,94,0.12)",
-    "red":       "#ef4444",
-    "red_bg":    "rgba(239,68,68,0.12)",
-    "yellow":    "#f59e0b",
-    "yellow_bg": "rgba(245,158,11,0.12)",
-    "orange":    "#f97316",
-    "orange_bg": "rgba(249,115,22,0.12)",
-    "blue_bg":   "rgba(79,140,255,0.10)",
+    "bg":        "#ede7e0",
+    "surface":   "#e6ded3",
+    "surface2":  "#f6f3ed",
+    "surface3":  "#d8ccbd",
+    "border":    "#d2c7b8",
+    "border2":   "#c2b39f",
+    "text":      "#2f2a22",
+    "text2":     "#5f5648",
+    "accent":    "#1e3a8a",
+    "accent2":   "#1e40af",
+    "green":     "#047857",
+    "green_bg":  "rgba(4,120,87,0.10)",
+    "red":       "#b91c1c",
+    "red_bg":    "rgba(185,28,28,0.10)",
+    "yellow":    "#b45309",
+    "yellow_bg": "rgba(180,83,9,0.12)",
+    "orange":    "#c2410c",
+    "orange_bg": "rgba(194,65,12,0.10)",
+    "blue_bg":   "rgba(30,58,138,0.08)",
+    "shadow":    "0 1px 2px rgba(47,42,34,0.10)",
 }
 
 
 def inject_theme():
-    """注入业务组件 CSS。框架样式由 .streamlit/config.toml 的 theme.base=dark 管。"""
+    """注入业务组件 CSS。框架样式由 .streamlit/config.toml 管。"""
     st.markdown(f"""
     <style>
     /* ── 布局微调 ── */
     .block-container {{
         padding-top: 3.2rem !important;
-        max-width: 1200px;
+        max-width: 1280px;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    h1, h2, h3, h4, h5, h6 {{
+        color: {C['text']} !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.015em;
+    }}
+    [data-testid="stCaptionContainer"], .stCaption {{
+        color: {C['text2']} !important;
+    }}
+    .stApp {{
+        background: {C['bg']};
     }}
 
     /* ── 指标卡 ── */
     .qsp-metric {{
         background: {C['surface']};
         border: 1px solid {C['border']};
-        border-radius: 10px;
-        padding: 14px 16px;
+        border-radius: 0.375rem;
+        min-height: 92px;
+        padding: 12px 14px;
         text-align: center;
-        transition: border-color 0.15s;
+        box-shadow: {C['shadow']};
+        transition: border-color 0.15s, box-shadow 0.15s;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        box-sizing: border-box;
     }}
     .qsp-metric:hover {{
         border-color: {C['accent']};
+        box-shadow: 0 2px 6px rgba(47,42,34,0.12);
     }}
     .qsp-metric .label {{
         font-size: 0.72rem;
         color: {C['text2']};
         letter-spacing: 0.05em;
         margin-bottom: 4px;
+        min-height: 1rem;
+        white-space: nowrap;
     }}
     .qsp-metric .value {{
-        font-size: 1.4rem;
+        font-size: 1.18rem;
         font-weight: 700;
         color: {C['text']};
-        line-height: 1.2;
+        line-height: 1.22;
+        min-height: 1.6rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.08em;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
     }}
     .qsp-metric .value.green {{ color: {C['green']}; }}
     .qsp-metric .value.red   {{ color: {C['red']}; }}
     .qsp-metric .value.yellow {{ color: {C['yellow']}; }}
-    .qsp-metric .value.small {{ font-size: 1.02rem; line-height: 1.35; white-space: nowrap; }}
+    .qsp-metric .value.compact,
+    .qsp-metric .value.small {{ font-size: 1.02rem; line-height: 1.32; }}
     .qsp-metric .sub {{
         font-size: 0.68rem;
         color: {C['text2']};
@@ -76,10 +113,11 @@ def inject_theme():
     .qsp-signal {{
         background: {C['surface']};
         border: 1px solid {C['border']};
-        border-radius: 10px;
+        border-radius: 0.375rem;
         padding: 12px 14px;
         margin-bottom: 8px;
-        transition: border-color 0.15s;
+        box-shadow: {C['shadow']};
+        transition: border-color 0.15s, box-shadow 0.15s;
     }}
     .qsp-signal:hover {{
         border-color: {C['accent']};
@@ -101,7 +139,7 @@ def inject_theme():
         font-size: 0.65rem;
         font-weight: 600;
         padding: 2px 7px;
-        border-radius: 6px;
+        border-radius: 0.375rem;
         letter-spacing: 0.02em;
         vertical-align: middle;
     }}
@@ -117,9 +155,10 @@ def inject_theme():
     .qsp-topbar {{
         background: {C['surface']};
         border: 1px solid {C['border']};
-        border-radius: 10px;
+        border-radius: 0.375rem;
         padding: 10px 16px;
         margin-bottom: 12px;
+        box-shadow: {C['shadow']};
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -133,8 +172,8 @@ def inject_theme():
 
     /* ── 进度条 ── */
     .qsp-progress {{
-        background: {C['surface2']};
-        border-radius: 4px;
+        background: {C['surface3']};
+        border-radius: 0.375rem;
         height: 6px;
         overflow: hidden;
         margin-top: 4px;
@@ -151,6 +190,9 @@ def inject_theme():
         padding: 32px 16px;
         color: {C['text2']};
         font-size: 0.85rem;
+        background: {C['surface2']};
+        border: 1px dashed {C['border']};
+        border-radius: 0.375rem;
     }}
     .qsp-empty .icon {{
         font-size: 2rem;
@@ -161,7 +203,9 @@ def inject_theme():
     /* ── 移动端 ── */
     @media (max-width: 768px) {{
         .block-container {{ padding-left: 0.6rem; padding-right: 0.6rem; }}
-        .qsp-metric .value {{ font-size: 1.15rem; }}
+        .qsp-metric .value {{ font-size: 1.08rem; }}
+        .qsp-metric .value.compact,
+        .qsp-metric .value.small {{ font-size: 0.96rem; }}
     }}
     </style>
     """, unsafe_allow_html=True)
@@ -169,17 +213,52 @@ def inject_theme():
 
 # ── 组件函数 ──
 
+_CJK_OR_UNIT_RE = re.compile(r"[\u4e00-\u9fff]|[¥￥%％]|\d\s*[A-Za-z]+")
+
+
+def _metric_value_needs_compact(value: Any) -> bool:
+    """判断指标值是否需要紧凑字号。
+
+    根因：旧逻辑按单个字符串长度自动给 ``small``，导致同一行里
+    ``5819``、``0.5000%``、``6笔`` 字号不一致；中文单位又会触发字体 fallback，
+    视觉上更明显。现在只判断“整行是否应紧凑”，再统一应用到同一行。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return len(text) >= 6 or bool(_CJK_OR_UNIT_RE.search(text)) or "," in text
+
+
+def _metric_row_compact(metrics: List[Dict[str, Any]]) -> bool:
+    """同一 metric_row 内只允许一种值字号，避免数字/单位混排跳动。"""
+    return any(
+        str(m.get("value_class", "")).strip() in {"small", "compact"}
+        or _metric_value_needs_compact(m.get("value", ""))
+        for m in metrics
+    )
+
+
+def _metric_value_classes(metric: Dict[str, Any], row_compact: bool) -> str:
+    """生成指标值 class，保留颜色 class，字号由行级 compact 统一控制。"""
+    classes = []
+    color_cls = str(metric.get("color", "") or "").strip()
+    if color_cls:
+        classes.append(color_cls)
+    legacy_value_cls = str(metric.get("value_class", "") or "").strip()
+    if row_compact or legacy_value_cls in {"small", "compact"}:
+        classes.append("compact")
+    elif legacy_value_cls:
+        classes.append(legacy_value_cls)
+    return " ".join(classes)
+
 def metric_row(metrics: List[Dict[str, Any]], cols: int = 0):
     """渲染指标卡行。"""
     n = cols or len(metrics)
     columns = st.columns(n)
+    row_compact = _metric_row_compact(metrics)
     for i, m in enumerate(metrics):
         with columns[i % n]:
-            color_cls = m.get("color", "")
-            value_cls = m.get("value_class", "")
-            if not value_cls and len(str(m.get("value", ""))) >= 7:
-                value_cls = "small"
-            classes = " ".join(x for x in [color_cls, value_cls] if x)
+            classes = _metric_value_classes(m, row_compact)
             sub = m.get("sub", "")
             sub_html = f'<div class="sub">{sub}</div>' if sub else ""
             st.markdown(f"""

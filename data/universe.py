@@ -1,8 +1,9 @@
 """股票池(Universe)管理 - 全 A 加载 + 基本面过滤
 
 数据源策略:
-- 主表: ak.stock_zh_a_spot_em (一次拿全市场快照, 含市值/PE/换手率)
-- 上市日期: ak.stock_info_sh/sz_name_code (沪/深各一次)
+- 主表: Tushare stock_basic + daily_basic (稳定股票基础信息/上市日期/估值)
+- 实时行情: 腾讯批量行情补 close/amount/turnover
+- 兜底: AKShare 东财快照 / AKShare 代码列表 + 腾讯行情
 - 北交所: 自动识别 (代码以 43/83/87/88/92 开头)
 - ST 识别: name 字段含 'ST' (含 *ST/SST/S/PT)
 - 退市: name 含 '退' 或东财数据查不到
@@ -34,7 +35,111 @@ from data.cache_manager import CacheManager
 # 加载器
 # ════════════════════════════════════════════════════════════
 def _load_spot_em() -> pd.DataFrame:
-    """东财全 A 实时快照 (主数据源), 失败降级到腾讯批量行情"""
+    """股票池主表。优先 Tushare，AKShare 仅最后兜底。"""
+    df = _load_via_tushare()
+    if df is not None and not df.empty:
+        return df
+
+    logger.warning("[Universe] Tushare 股票池失败，兜底 AKShare 东财快照")
+    return _load_spot_em_akshare()
+
+
+def _load_via_tushare() -> pd.DataFrame:
+    """Tushare 股票基础信息 + daily_basic + 腾讯实时行情。"""
+    try:
+        from data.fetchers.tushare_fetcher import TushareFetcher
+        fetcher = TushareFetcher()
+        if not getattr(fetcher, "_has_token", lambda: False)():
+            logger.warning("[Universe] Tushare token 不可用，跳过 Tushare 股票池")
+            return pd.DataFrame()
+
+        base = fetcher.get_stock_list()
+        if base is None or base.empty:
+            logger.warning("[Universe] Tushare stock_basic 为空")
+            return pd.DataFrame()
+        base = base.copy()
+        base["symbol"] = base["symbol"].astype(str).str.zfill(6)
+        base["list_date"] = pd.to_datetime(base.get("list_date"), errors="coerce")
+
+        # daily_basic 使用最近一个可用交易日；如果当日非交易日/未收盘，Tushare 可能返回空，不阻断股票池。
+        basic = fetcher.get_daily_basic()
+        if basic is not None and not basic.empty:
+            basic = basic.copy()
+            basic["symbol"] = basic["ts_code"].astype(str).str.slice(0, 6)
+            rename = {
+                "turnover_rate": "turnover",
+                "pe_ttm": "pe_ttm",
+                "pb": "pb",
+                "total_mv": "total_mv",
+                "circ_mv": "float_mv",
+            }
+            cols = ["symbol"] + [c for c in rename if c in basic.columns]
+            basic = basic[cols].rename(columns=rename)
+            # Tushare 市值单位为万元，统一转元，匹配现有过滤逻辑。
+            for col in ["total_mv", "float_mv"]:
+                if col in basic.columns:
+                    basic[col] = pd.to_numeric(basic[col], errors="coerce") * 10000.0
+            base = base.merge(basic, on="symbol", how="left")
+        else:
+            logger.warning("[Universe] Tushare daily_basic 为空，仅使用基础信息 + 腾讯行情")
+
+        # 用腾讯补 close/pct_change/amount/volume；失败不阻断，至少保留 Tushare 股票基础信息。
+        try:
+            from data.fetchers.tencent_fetcher import TencentFetcher
+            tf = TencentFetcher()
+            symbols = base["symbol"].tolist()
+            all_quotes = []
+            batch_size = 60
+            for i in range(0, len(symbols), batch_size):
+                batch = symbols[i:i + batch_size]
+                rt = tf.get_realtime_quotes(batch)
+                if rt is not None and not rt.empty:
+                    all_quotes.append(rt)
+                if i // batch_size % 10 == 0 and i > 0:
+                    logger.info(f"[Universe] 腾讯行情补充进度 {i}/{len(symbols)}")
+            if all_quotes:
+                quotes = pd.concat(all_quotes, ignore_index=True).drop_duplicates(subset=["symbol"])
+                quotes["symbol"] = quotes["symbol"].astype(str).str.zfill(6)
+                quote_cols = [
+                    "symbol", "close", "pct_change", "amount", "volume",
+                    "turnover", "pe_ttm", "pb", "total_mv", "float_mv",
+                ]
+                quotes = quotes[[c for c in quote_cols if c in quotes.columns]]
+                base = base.merge(quotes, on="symbol", how="left", suffixes=("", "_q"))
+                for col in ["close", "pct_change", "amount", "volume", "turnover", "pe_ttm", "pb", "total_mv", "float_mv"]:
+                    qcol = f"{col}_q"
+                    if qcol in base.columns:
+                        if col in base.columns:
+                            base[col] = base[col].where(base[col].notna(), base[qcol])
+                        else:
+                            base[col] = base[qcol]
+                        base = base.drop(columns=[qcol])
+        except Exception as e:
+            logger.warning(f"[Universe] 腾讯行情补充失败: {e}")
+
+        defaults = {
+            "close": 0, "pct_change": 0, "volume": 0, "amount": 0,
+            "turnover": 0, "pe_ttm": None, "pb": None,
+            "total_mv": None, "float_mv": None,
+        }
+        for col, default in defaults.items():
+            if col not in base.columns:
+                base[col] = default
+
+        keep = [
+            "symbol", "name", "close", "pct_change", "volume", "amount",
+            "turnover", "pe_ttm", "pb", "total_mv", "float_mv", "list_date",
+        ]
+        out = base[[c for c in keep if c in base.columns]].copy()
+        logger.success(f"[Universe] Tushare 股票池加载成功: {len(out)} 只")
+        return out
+    except Exception as e:
+        logger.warning(f"[Universe] Tushare 股票池失败: {e}")
+        return pd.DataFrame()
+
+
+def _load_spot_em_akshare() -> pd.DataFrame:
+    """AKShare 东财全 A 实时快照兜底，失败再降级腾讯批量行情。"""
     import akshare as ak
     gw = SourceGateway.get()
 
@@ -366,11 +471,16 @@ class Universe:
             logger.error("[Universe] 主表为空, 无法构建股票池")
             return df
 
-        # 2. merge 上市日期
-        listing = _load_listing_dates()
-        if not listing.empty:
-            df = df.merge(listing, on="symbol", how="left")
+        # 2. merge 上市日期。Tushare 主路径已带 list_date，只有缺失时才用 AKShare 兜底。
+        if "list_date" not in df.columns or df["list_date"].isna().all():
+            listing = _load_listing_dates()
         else:
+            listing = pd.DataFrame()
+        if not listing.empty:
+            if "list_date" in df.columns:
+                df = df.drop(columns=["list_date"])
+            df = df.merge(listing, on="symbol", how="left")
+        elif "list_date" not in df.columns:
             df["list_date"] = pd.NaT
 
         # 3. 链式过滤

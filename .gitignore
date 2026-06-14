@@ -30,7 +30,6 @@ data/backtest_runs/
 
 # Streamlit
 .streamlit/secrets.toml
-.streamlit/config.toml
 
 # Generated market data cache
 /data/cache/

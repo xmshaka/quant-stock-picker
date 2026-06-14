@@ -43,19 +43,21 @@ from data.scan_status import load_scan_reports
 try:
     reports = load_scan_reports()
     if not reports.empty:
-        for _, row in reports.head(10).iterrows():
+        for idx, (_, row) in enumerate(reports.head(10).iterrows()):
             ts = str(row.get("ts", ""))[:16]
             total = row.get("total_symbols", 0)
             updated = row.get("updated_count", 0)
             failed = row.get("failed_count", 0)
             elapsed = row.get("elapsed_seconds", 0)
+            row_bg = C['surface2'] if idx % 2 == 0 else C['surface']
+            tone_color = C['green'] if failed == 0 else C['red']
 
             status_b = badge("成功", "buy") if failed == 0 else badge(f"失败{failed}", "sell")
             st.markdown(f"""
-            <div style="display:flex;align-items:center;gap:12px;padding:7px 0;border-bottom:1px solid {C['border']};">
-                <span style="font-size:0.78rem;width:140px;color:{C['text']};">{ts}</span>
-                {status_b}
-                <span style="font-size:0.72rem;color:{C['text2']};">池 {total} · 更新 {updated} · 耗时 {elapsed:.0f}s</span>
+            <div style="background:{row_bg};border:1px solid {C['border']};border-left:4px solid {tone_color};border-radius:0.375rem;margin-bottom:7px;padding:9px 12px;display:flex;align-items:center;gap:14px;">
+                <span style="font-size:0.78rem;font-weight:600;min-width:140px;color:{C['text']};">{ts}</span>
+                <span style="min-width:58px;">{status_b}</span>
+                <span style="font-size:0.72rem;color:{C['text2']};">股票池 {total} · 更新 {updated} · 耗时 {elapsed:.0f}s</span>
             </div>
             """, unsafe_allow_html=True)
     else:

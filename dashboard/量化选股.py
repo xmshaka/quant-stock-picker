@@ -111,7 +111,7 @@ if "nav_page" not in st.session_state:
 nav = st.columns(len(PAGES))
 for i, label in enumerate(PAGES):
     with nav[i]:
-        if st.button(label, key=f"nav_{i}", use_container_width=True,
+        if st.button(label, key=f"nav_{i}", width="stretch",
                      type="primary" if st.session_state.nav_page == i else "secondary"):
             st.session_state.nav_page = i
             st.rerun()
@@ -196,7 +196,7 @@ def show_factor_detail(symbol, factor_df, price_df, latest_date):
             })
         if rows:
             with st.expander(f"**{group_name}** ({len(rows)})", expanded=False):
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
                              column_config={"判断": st.column_config.TextColumn()})
 
 # ========== 页面 0: 信号 ==========
@@ -225,7 +225,7 @@ if page_idx == 0:
                     weights[f] = st.slider(cn, -1.0, 1.0, default, 0.05, key=f"ws_{f}")
             col_idx += 1
 
-        if st.button("应用权重", type="primary", use_container_width=True):
+        if st.button("应用权重", type="primary", width="stretch"):
             st.session_state._signal_weights = weights
             # 清除信号缓存
             compute_signals.clear()
@@ -253,7 +253,7 @@ if page_idx == 0:
         with c2:
             manual_pool = st.selectbox("池", ["观察池", "持仓池"], label_visibility="collapsed")
         with c3:
-            if st.button("添加", type="primary", use_container_width=True):
+            if st.button("添加", type="primary", width="stretch"):
                 if manual_symbol:
                     sym = manual_symbol.strip().upper()
                     today = str(datetime.now().date())
@@ -289,11 +289,11 @@ if page_idx == 0:
                 if in_hold:
                     st.markdown(f'<div style="text-align:center;padding-top:12px;">{badge("持仓", "hold")}</div>', unsafe_allow_html=True)
                 elif in_watch:
-                    if st.button("买入", key=f"buy_{s.symbol}", use_container_width=True):
+                    if st.button("买入", key=f"buy_{s.symbol}", width="stretch"):
                         pm.move_to_hold(s.symbol)
                         st.rerun()
                 else:
-                    if st.button("+观察", key=f"watch_{s.symbol}", use_container_width=True):
+                    if st.button("+观察", key=f"watch_{s.symbol}", width="stretch"):
                         pm.add_to_watch(PoolItem(
                             symbol=s.symbol, add_date=str(latest_date),
                             add_reason=s.strategy_name, signal_strength=s.strength, signal_score=s.score,
@@ -319,7 +319,7 @@ if page_idx == 0:
                 )
             with col_action:
                 if in_hold:
-                    if st.button("卖出", key=f"sell_{s.symbol}", type="primary", use_container_width=True):
+                    if st.button("卖出", key=f"sell_{s.symbol}", type="primary", width="stretch"):
                         pm.remove_from_hold(s.symbol)
                         st.rerun()
                 else:
@@ -343,14 +343,14 @@ elif page_idx == 1:
             with col_btns:
                 b1, b2, b3 = st.columns(3)
                 with b1:
-                    if st.button("📊", key=f"wd_{item.symbol}", help="详情", use_container_width=True):
+                    if st.button("📊", key=f"wd_{item.symbol}", help="详情", width="stretch"):
                         st.session_state.detail_symbol = item.symbol
                 with b2:
-                    if st.button("买入", key=f"wb_{item.symbol}", use_container_width=True):
+                    if st.button("买入", key=f"wb_{item.symbol}", width="stretch"):
                         pm.move_to_hold(item.symbol)
                         st.rerun()
                 with b3:
-                    if st.button("✕", key=f"wr_{item.symbol}", use_container_width=True):
+                    if st.button("✕", key=f"wr_{item.symbol}", width="stretch"):
                         pm.remove_from_watch(item.symbol)
                         st.rerun()
 
@@ -396,10 +396,10 @@ elif page_idx == 2:
             with col_btns:
                 b1, b2 = st.columns(2)
                 with b1:
-                    if st.button("📊", key=f"hd_{item.symbol}", help="详情", use_container_width=True):
+                    if st.button("📊", key=f"hd_{item.symbol}", help="详情", width="stretch"):
                         st.session_state.detail_symbol = item.symbol
                 with b2:
-                    if st.button("卖出", key=f"hs_{item.symbol}", type="primary", use_container_width=True):
+                    if st.button("卖出", key=f"hs_{item.symbol}", type="primary", width="stretch"):
                         pm.remove_from_hold(item.symbol)
                         st.rerun()
 
@@ -477,7 +477,7 @@ elif page_idx == 4:
 elif page_idx == 5:
     section_header("系统配置")
     st.caption("跳转到独立配置页面进行股票池、扫描参数等设置。")
-    if st.button("打开配置页面 →", type="primary", use_container_width=True):
+    if st.button("打开配置页面 →", type="primary", width="stretch"):
         st.switch_page("pages/6_股票配置.py")
 
 st.divider()

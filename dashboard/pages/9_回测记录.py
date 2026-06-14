@@ -15,6 +15,15 @@ from backtest.records import (
 )
 from backtest.scheme_backtest import _fetch_ohlcv
 from dashboard.components.kline_chart import plot_equity_curve, plot_kline_with_signals
+from dashboard.history_compare import (
+    build_run_compare_table,
+    best_run_summary,
+    compare_table_to_csv,
+    format_compare_table,
+    plot_multi_equity_curves,
+)
+from dashboard.history_filters import filter_backtest_runs, unique_non_empty
+from dashboard.history_state import ensure_history_state, reset_history_state, sync_history_state, valid_default, valid_default_list
 from signals.rules import TradePoint
 from theme import inject_theme, metric_row, section_header, empty_state, C
 
@@ -34,6 +43,7 @@ def _record_table_height(row_count: int) -> int:
 
 section_header("历史回测记录")
 st.caption("读取 data/backtest_runs/*：metrics/config/trades/equity/signals，用于复盘和审计。")
+ensure_history_state(st.session_state)
 
 
 runs = list_backtest_runs()
@@ -41,8 +51,56 @@ if runs.empty:
     empty_state("🧾", "暂无回测记录，请先在策略回测页持久化一次结果")
     st.stop()
 
+# ── 筛选 ──
+with st.expander("筛选回测记录", expanded=True):
+    reset_col, hint_col = st.columns([1, 4])
+    with reset_col:
+        if st.button("重置筛选", width="stretch"):
+            reset_history_state(st.session_state)
+            st.rerun()
+    with hint_col:
+        st.caption("筛选条件会在刷新/切页后保留；如列表为空或记录变少，可一键重置。")
+    f1, f2, f3, f4 = st.columns([2, 1.4, 1.2, 1.2])
+    with f1:
+        symbol_query = st.text_input(
+            "股票代码 / Run ID",
+            value=st.session_state.history_symbol_query,
+            placeholder="如 002145 / 5156150 / 20260613",
+        )
+    with f2:
+        scheme_options = ["全部"] + unique_non_empty(runs.get("scheme_name", []))
+        scheme_default = valid_default(st.session_state.history_scheme_filter, scheme_options, "全部")
+        scheme_filter = st.selectbox("策略方案", scheme_options, index=scheme_options.index(scheme_default))
+    with f3:
+        pool_options = ["全部"] + unique_non_empty(runs.get("pool_mode", []))
+        pool_default = valid_default(st.session_state.history_pool_filter, pool_options, "全部")
+        pool_filter = st.selectbox("股票池", pool_options, index=pool_options.index(pool_default))
+    with f4:
+        recent_options = [0, 1, 3, 7, 30]
+        recent_default = valid_default(st.session_state.history_recent_days, recent_options, 0)
+        recent_days = st.selectbox("保存时间", recent_options, format_func=lambda x: "全部" if x == 0 else f"最近{x}天", index=recent_options.index(recent_default))
+
+sync_history_state(
+    st.session_state,
+    history_symbol_query=symbol_query,
+    history_scheme_filter=scheme_filter,
+    history_pool_filter=pool_filter,
+    history_recent_days=recent_days,
+)
+
+filtered_runs = filter_backtest_runs(
+    runs,
+    symbol_query=symbol_query,
+    scheme_name=scheme_filter,
+    pool_mode=pool_filter,
+    recent_days=recent_days,
+)
+if filtered_runs.empty:
+    empty_state("🔎", "没有匹配的回测记录，请调整筛选条件")
+    st.stop()
+
 # ── 列表 ──
-display = runs.copy()
+display = filtered_runs.copy()
 for col in ("total_return", "annual_return", "max_drawdown", "win_rate"):
     display[col] = display[col].map(lambda x: f"{float(x):+.2%}" if col in ("total_return", "annual_return") else f"{float(x):.2%}")
 display["sharpe_ratio"] = display["sharpe_ratio"].map(lambda x: f"{float(x):.3f}")
@@ -66,21 +124,69 @@ show_cols = {
 }
 st.dataframe(
     display[list(show_cols.keys())].rename(columns=show_cols),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     height=_record_table_height(len(display)),
 )
-st.caption(f"共 {len(display)} 条回测记录；列表高度随记录数自适应，超过可视上限后可在表格内滚动。")
+st.caption(f"筛选后 {len(display)} / 全部 {len(runs)} 条回测记录；列表高度随记录数自适应，超过可视上限后可在表格内滚动。")
+
+# ── 多 run 横向对比 ──
+with st.expander("多记录横向对比", expanded=False):
+    default_compare = filtered_runs["run_id"].head(min(3, len(filtered_runs))).tolist()
+    persisted_compare = valid_default_list(st.session_state.history_compare_run_ids, filtered_runs["run_id"].tolist())
+    compare_run_ids = st.multiselect(
+        "选择要对比的回测记录",
+        filtered_runs["run_id"].tolist(),
+        default=persisted_compare or default_compare,
+        help="基于当前筛选结果选择多个 Run，横向比较收益、回撤、夏普、交易次数。",
+    )
+    sync_history_state(st.session_state, history_compare_run_ids=compare_run_ids)
+    compare_table = build_run_compare_table(filtered_runs, compare_run_ids)
+    if compare_table.empty:
+        empty_state("📊", "请选择至少一条回测记录进行对比")
+    else:
+        compare_summary = best_run_summary(compare_table)
+        metric_row([
+            {"label": "对比数量", "value": f"{compare_summary.get('count', 0)}条"},
+            {"label": "最高收益", "value": f"{float(compare_summary.get('best_return', 0)):+.2%}", "color": "green" if float(compare_summary.get('best_return', 0)) > 0 else "red"},
+            {"label": "最低回撤", "value": f"{float(compare_summary.get('best_drawdown', 0)):.2%}"},
+            {"label": "最高夏普", "value": f"{float(compare_summary.get('best_sharpe', 0)):.3f}"},
+        ], cols=4)
+        st.caption(
+            f"最高收益: {compare_summary.get('best_return_run_id', '-')}；"
+            f"最低回撤: {compare_summary.get('best_drawdown_run_id', '-')}；"
+            f"最高夏普: {compare_summary.get('best_sharpe_run_id', '-')}"
+        )
+        st.download_button(
+            "导出对比CSV",
+            data=compare_table_to_csv(compare_table),
+            file_name="backtest_run_compare.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        st.dataframe(format_compare_table(compare_table), width="stretch", hide_index=True)
+        equity_map = {}
+        for cmp_run_id in compare_table["run_id"].tolist():
+            try:
+                cmp_run = load_backtest_run(cmp_run_id)
+                if not cmp_run["equity"].empty:
+                    equity_map[cmp_run_id] = cmp_run["equity"]
+            except Exception:
+                continue
+        if equity_map:
+            st.plotly_chart(plot_multi_equity_curves(equity_map), width="stretch", key="history_compare_equity")
+        else:
+            empty_state("📈", "选中记录暂无权益曲线数据")
 
 c1, c2, c3 = st.columns([3, 1, 1])
 with c1:
-    run_id = st.selectbox("选择回测记录", runs["run_id"].tolist(), index=0)
+    run_id = st.selectbox("选择回测记录", filtered_runs["run_id"].tolist(), index=0)
 with c2:
-    if st.button("刷新列表", use_container_width=True):
+    if st.button("刷新列表", width="stretch"):
         st.rerun()
 with c3:
     delete_confirm = st.checkbox("确认删除", key=f"delete_confirm_{run_id}")
-    if st.button("删除记录", type="secondary", use_container_width=True, disabled=not delete_confirm):
+    if st.button("删除记录", type="secondary", width="stretch", disabled=not delete_confirm):
         try:
             dst = delete_backtest_run(run_id, trash=True)
             st.success(f"已移入回收站: {dst}")
@@ -142,7 +248,7 @@ with tab_trades:
         preferred_cols = [c for c in preferred_cols if c in display_trades.columns]
         rest_cols = [c for c in display_trades.columns if c not in preferred_cols]
         display_trades = display_trades[preferred_cols + rest_cols]
-        st.dataframe(display_trades, use_container_width=True, hide_index=True)
+        st.dataframe(display_trades, width="stretch", hide_index=True)
         st.caption(f"共 {len(trades)} 笔成交；字段数 {len(trades.columns)}")
 
 with tab_liquidity:
@@ -169,7 +275,7 @@ with tab_liquidity:
                 buckets[col] = pd.to_numeric(buckets[col], errors="coerce").round(2)
         if "加权滑点率" in buckets.columns:
             buckets["加权滑点率"] = pd.to_numeric(buckets["加权滑点率"], errors="coerce").map(lambda x: f"{x:.4%}")
-        st.dataframe(buckets, use_container_width=True, hide_index=True)
+        st.dataframe(buckets, width="stretch", hide_index=True)
         st.caption("分层规则：>5亿=0.2%，1亿–5亿=0.5%，<1亿=1.0%；成交额缺失回退默认滑点。")
 
 with tab_equity:
@@ -178,8 +284,8 @@ with tab_equity:
     else:
         eq_dict = dict(zip(equity["date"].astype(str), pd.to_numeric(equity["equity"], errors="coerce")))
         fig = plot_equity_curve(eq_dict, title=f"{run_id} 权益曲线")
-        st.plotly_chart(fig, use_container_width=True, key=f"history_eq_{run_id}")
-        st.dataframe(equity, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig, width="stretch", key=f"history_eq_{run_id}")
+        st.dataframe(equity, width="stretch", hide_index=True)
 
 with tab_kline:
     if signals_executed.empty:
@@ -216,13 +322,13 @@ with tab_kline:
         else:
             bars["trade_date"] = pd.to_datetime(bars["trade_date"])
             fig = plot_kline_with_signals(bars[bars["symbol"] == sym], points, symbol=sym, show_ma=True, show_volume=True, show_kdj=True)
-            st.plotly_chart(fig, use_container_width=True, key=f"history_kline_{run_id}_{sym}")
-            st.dataframe(sym_sigs, use_container_width=True, hide_index=True)
+            st.plotly_chart(fig, width="stretch", key=f"history_kline_{run_id}_{sym}")
+            st.dataframe(sym_sigs, width="stretch", hide_index=True)
 
 with tab_raw:
     st.write("**报告**")
     st.markdown(run.get("report", ""))
     with st.expander("signals_executed"):
-        st.dataframe(signals_executed, use_container_width=True, hide_index=True)
+        st.dataframe(signals_executed, width="stretch", hide_index=True)
     with st.expander("signals_raw"):
-        st.dataframe(signals_raw, use_container_width=True, hide_index=True)
+        st.dataframe(signals_raw, width="stretch", hide_index=True)

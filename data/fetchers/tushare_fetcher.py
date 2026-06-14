@@ -10,7 +10,7 @@ except ImportError:
 
 import pandas as pd
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
 
 from .base import BaseFetcher
@@ -137,14 +137,24 @@ class TushareFetcher(BaseFetcher):
         """获取每日指标（估值等）"""
         if not self._has_token():
             return pd.DataFrame()
-        td = trade_date or datetime.now().strftime("%Y%m%d")
+        if trade_date:
+            dates = [trade_date]
+        else:
+            today = datetime.now()
+            dates = [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(10)]
 
-        def _fetch():
-            df = self.pro.daily_basic(trade_date=td)
-            return df
+        for td in dates:
+            def _fetch(_td=td):
+                return self.pro.daily_basic(trade_date=_td)
 
-        result = self._safe_fetch(_fetch)
-        return result if result is not None else pd.DataFrame()
+            result = self._safe_fetch(_fetch)
+            if result is not None and not result.empty:
+                result = result.copy()
+                result.attrs["trade_date"] = td
+                return result
+            logger.debug(f"[Tushare] daily_basic {td} 为空，尝试前一日")
+
+        return pd.DataFrame()
 
     def get_financial_indicator(self, symbol: str) -> pd.DataFrame:
         """获取财务指标"""

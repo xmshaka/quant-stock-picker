@@ -45,10 +45,10 @@ if not latest_factors.empty:
 
         fig = px.imshow(corr_cn, text_auto=".2f", aspect="equal",
                         color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-        fig.update_layout(height=520, template="plotly_dark",
+        fig.update_layout(height=520, template="plotly_white",
                           paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                           font=dict(color=C['text'], size=11))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # 高相关警告
         high_pairs = []
@@ -88,11 +88,11 @@ if len(ic_dict) >= 2:
 
     fig_ic = px.imshow(ic_corr_cn, text_auto=".2f", aspect="equal",
                        color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-    fig_ic.update_layout(height=520, template="plotly_dark",
+    fig_ic.update_layout(height=520, template="plotly_white",
                          paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                          font=dict(color=C['text'], size=11),
                          title_text="IC 序列相关性（因子预测力的时间一致性）")
-    st.plotly_chart(fig_ic, use_container_width=True)
+    st.plotly_chart(fig_ic, width="stretch")
 
     # 散点
     section_header("IC 散点矩阵")
@@ -103,10 +103,10 @@ if len(ic_dict) >= 2:
     if len(selected) >= 2:
         ic_sel = ic_combined[selected].rename(columns=cn_map)
         fig_sc = px.scatter_matrix(ic_sel.reset_index(), dimensions=list(ic_sel.columns))
-        fig_sc.update_layout(height=550, template="plotly_dark",
+        fig_sc.update_layout(height=550, template="plotly_white",
                              paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                              font=dict(color=C['text']))
-        st.plotly_chart(fig_sc, use_container_width=True)
+        st.plotly_chart(fig_sc, width="stretch")
 else:
     empty_state("📈", "IC 序列数据不足")
 
@@ -129,10 +129,10 @@ for idx, name in enumerate(factor_names):
 fig_grp.update_layout(
     title=f"各因子分组收益 (预测期={selected_h}日)",
     xaxis_title="分组", yaxis_title="平均收益", height=420,
-    template="plotly_dark", paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
+    template="plotly_white", paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
     font=dict(color=C['text']),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
 )
 fig_grp.add_hline(y=0, line_dash="dash", line_color=C['border'])
-st.plotly_chart(fig_grp, use_container_width=True)
+st.plotly_chart(fig_grp, width="stretch")
 st.caption("💡 有效因子的分组收益应呈现单调趋势")

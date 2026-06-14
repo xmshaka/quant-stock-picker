@@ -43,6 +43,19 @@ def read_scan_reports(path: Optional[str | Path] = None, limit: int = 50) -> lis
     return out[-limit:]
 
 
+def load_scan_reports(path: Optional[str | Path] = None, limit: int = 50) -> pd.DataFrame:
+    """兼容旧看板接口：返回最近扫描报告 DataFrame，最新记录在前。
+
+    Streamlit 首页和「数据状态」页历史代码使用 ``load_scan_reports()``，
+    并读取 ``ts/total_symbols/updated_count/failed_count/elapsed_seconds`` 等原始字段。
+    因此这里保留原始 JSON 字段，不调用 ``reports_to_frame()`` 的中文列转换。
+    """
+    reports = read_scan_reports(path=path, limit=limit)
+    if not reports:
+        return pd.DataFrame()
+    return pd.DataFrame(reports).iloc[::-1].reset_index(drop=True)
+
+
 def latest_scan_report(path: Optional[str | Path] = None) -> dict[str, Any]:
     """返回最近一次扫描报告；不存在则返回空 dict。"""
     reports = read_scan_reports(path=path, limit=1)

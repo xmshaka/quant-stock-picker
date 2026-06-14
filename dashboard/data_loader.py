@@ -266,20 +266,20 @@ class DataLoader:
         factor_df, price_df, names = loader.load(n_stocks=100, n_days=60)
 
         # 或指定多个源
-        loader = DataLoader(sources=["tencent", "akshare", "tushare", "mock"])
+        loader = DataLoader(sources=["tencent", "tushare", "akshare", "mock"])
     """
 
     def __init__(self, sources: Optional[List[str]] = None, preferred: Optional[str] = None, include_symbols: Optional[List[str]] = None):
         """
         Args:
-            sources: 数据源优先级列表，如 ["tencent", "akshare", "tushare", "mock"]
+            sources: 数据源优先级列表，如 ["tencent", "tushare", "akshare", "mock"]
             preferred: 优先使用的单个数据源（简写，自动补全回退链）
             include_symbols: 必须包含的股票代码列表（优先加载）
         """
         if preferred:
             chain = {
-                "tencent": ["tencent", "akshare", "tushare", "mock"],
-                "akshare": ["akshare", "tencent", "tushare", "mock"],
+                "tencent": ["tencent", "tushare", "akshare", "mock"],
+                "akshare": ["akshare", "tushare", "tencent", "mock"],
                 "tushare": ["tushare", "tencent", "akshare", "mock"],
                 "mock": ["mock"],
             }
@@ -287,7 +287,7 @@ class DataLoader:
         elif sources:
             self.sources = sources
         else:
-            self.sources = ["tencent", "akshare", "tushare", "mock"]
+            self.sources = ["tencent", "tushare", "akshare", "mock"]
 
         self.include_symbols: List[str] = list(include_symbols) if include_symbols else []
         self._fetchers: Dict[str, Any] = {}

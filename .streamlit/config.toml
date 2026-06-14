@@ -1,0 +1,22 @@
+[server]
+headless = true
+address = "0.0.0.0"
+port = 5004
+
+[theme]
+# Financial Professional Theme
+primaryColor = "#1e3a8a"
+backgroundColor = "#ede7e0"
+secondaryBackgroundColor = "#e6ded3"
+textColor = "#2f2a22"
+linkColor = "#1e40af"
+borderColor = "#d2c7b8"
+showWidgetBorder = true
+baseRadius = "0.375rem"
+font = "sans serif"
+codeBackgroundColor = "#f6f3ed"
+showSidebarBorder = true
+
+[theme.sidebar]
+backgroundColor = "#f6f3ed"
+secondaryBackgroundColor = "#e6ded3"

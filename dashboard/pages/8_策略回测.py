@@ -99,7 +99,7 @@ current_context_signature = backtest_context_signature(pool_mode, custom_symbols
 clear_stale_compare(st.session_state, current_context_signature)
 
 # ========== 执行回测 ==========
-if st.button("▶ 运行回测", type="primary", use_container_width=True):
+if st.button("▶ 运行回测", type="primary", width="stretch"):
     factor_df, price_df, factor_names = get_data(n_stocks=300)
 
     progress_bar = st.progress(0)
@@ -184,7 +184,7 @@ if "bt_result" in st.session_state:
     # 持久化按钮
     if st.session_state.get("bt_last_saved_dir"):
         st.caption(f"最近自动保存: {st.session_state.bt_last_saved_dir}")
-    if st.button("💾 持久化回测结果到 parquet", use_container_width=True, type="secondary"):
+    if st.button("💾 持久化回测结果到 parquet", width="stretch", type="secondary"):
         try:
             config = st.session_state.get("bt_run_config")
             if config is not None:
@@ -198,7 +198,7 @@ if "bt_result" in st.session_state:
     if result.equity_curve:
         section_header("权益曲线")
         fig_eq = plot_equity_curve(result.equity_curve, title=f"{result.scheme_name} 权益曲线")
-        st.plotly_chart(fig_eq, use_container_width=True)
+        st.plotly_chart(fig_eq, width="stretch")
 
     # P1: 流动性分层滑点审计
     if result.trade_details:
@@ -229,7 +229,7 @@ if "bt_result" in st.session_state:
                     liq_buckets[col] = pd.to_numeric(liq_buckets[col], errors="coerce").round(2)
             if "加权滑点率" in liq_buckets.columns:
                 liq_buckets["加权滑点率"] = pd.to_numeric(liq_buckets["加权滑点率"], errors="coerce").map(lambda x: f"{x:.4%}")
-            st.dataframe(liq_buckets, use_container_width=True, hide_index=True)
+            st.dataframe(liq_buckets, width="stretch", hide_index=True)
 
     # P0: K线默认展示 signals_executed，提供原始信号叠加选项
     show_points = result.signals_executed if result.signals_executed else result.stock_signals
@@ -278,7 +278,7 @@ if "bt_result" in st.session_state:
                         sym_bars, all_points, symbol=label,
                         show_ma=True, show_volume=show_vol, show_rsi=False, show_kdj=True,
                     )
-                    st.plotly_chart(fig, use_container_width=True, key=f"kline_bs_v7_lane_line_{sym}")
+                    st.plotly_chart(fig, width="stretch", key=f"kline_bs_v7_lane_line_{sym}")
 
                     # P0: 买卖点明细 — 默认显示执行信号，可选叠加强调raw
                     if all_points:
@@ -323,14 +323,14 @@ if "bt_result" in st.session_state:
                             pts_data.append(row)
 
                         if pts_data:
-                            st.dataframe(pd.DataFrame(pts_data), use_container_width=True, hide_index=True,
+                            st.dataframe(pd.DataFrame(pts_data), width="stretch", hide_index=True,
                                          column_config={"来源": st.column_config.TextColumn(), "方向": st.column_config.TextColumn()})
                 else:
                     st.warning(f"{sym} 无K线数据")
 
     # 方案对比（批量回测）
     st.divider()
-    if st.button("📊 对比全部方案", use_container_width=True):
+    if st.button("📊 对比全部方案", width="stretch"):
         factor_df, price_df, factor_names = get_data(n_stocks=300)
         all_schemes = registry.list_all()
         compare_progress = st.progress(0)
@@ -370,7 +370,7 @@ if "bt_result" in st.session_state:
                 "胜率": f"{r.win_rate:.0%}",
                 "交易": r.trade_summary,
             })
-        st.dataframe(pd.DataFrame(compare_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(compare_data), width="stretch", hide_index=True)
 
 else:
     empty_state("📈", "点击「运行回测」开始")

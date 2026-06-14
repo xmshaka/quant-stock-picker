@@ -61,7 +61,7 @@ display['win_rate'] = display['win_rate'].apply(lambda x: f"{x:.0%}")
 display['sharpe'] = display['sharpe'].apply(lambda x: f"{x:.2f}")
 display['score'] = display['score'].apply(lambda x: f"{x:.1f}")
 display.columns = ['策略名称', '5日均涨', '10日均涨', '胜率', '夏普', '评分', '交易数']
-st.dataframe(display, use_container_width=True, hide_index=True)
+st.dataframe(display, width="stretch", hide_index=True)
 
 # ========== 评分图 ==========
 section_header("策略评分对比")
@@ -73,13 +73,13 @@ fig.add_trace(go.Bar(
     text=[f"{s:.1f}" for s in stats_df['score']], textposition='outside',
     textfont=dict(size=10),
 ))
-fig.update_layout(height=380, template="plotly_dark",
+fig.update_layout(height=380, template="plotly_white",
                   paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                   font=dict(color=C['text']),
                   xaxis_title="策略", yaxis_title="评分")
 fig.add_hline(y=8, line_dash="dot", line_color=C['green'], annotation_text="优秀")
 fig.add_hline(y=5, line_dash="dot", line_color=C['yellow'], annotation_text="一般")
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # ========== 收益 vs 胜率 ==========
 section_header("收益 vs 胜率分布")
@@ -89,12 +89,12 @@ fig2 = px.scatter(stats_df, x='win_rate', y='avg_return_5d',
                   color_continuous_scale=[[0, C['red']], [0.5, C['yellow']], [1, C['green']]],
                   hover_name='strategy_name',
                   labels={'win_rate': '胜率', 'avg_return_5d': '5日平均收益'})
-fig2.update_layout(height=400, template="plotly_dark",
+fig2.update_layout(height=400, template="plotly_white",
                    paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                    font=dict(color=C['text']))
 fig2.add_hline(y=0, line_dash="dash", line_color=C['border'])
 fig2.add_vline(x=0.5, line_dash="dash", line_color=C['border'])
-st.plotly_chart(fig2, use_container_width=True)
+st.plotly_chart(fig2, width="stretch")
 
 # ========== 文本 ==========
 with st.expander("📝 文本版"):

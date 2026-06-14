@@ -1,12 +1,12 @@
 """多源降级数据获取器
 
-统一封装 Tencent / AKShare / Tushare 的降级链路，供看板、增量扫描、脚本复用。
+统一封装 Tencent / Tushare / AKShare 的降级链路，供看板、增量扫描、脚本复用。
 
 设计原则：
 1. 主源优先：默认 Tencent 免费、快、无需 token。
 2. 失败即切源：异常、空 DataFrame、基础校验失败都触发下一源。
 3. 保留来源：返回数据增加 ``source`` 字段，便于追踪质量和排障。
-4. 不强依赖可选源：AKShare / Tushare 初始化失败时自动跳过。
+4. 不强依赖可选源：Tushare / AKShare 初始化失败时自动跳过。
 """
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class FallbackFetcher(BaseFetcher):
     """统一多源降级 Fetcher。
 
     默认源顺序来自 ``settings.data_source_order``，推荐：
-    ``tencent,akshare,tushare``。
+    ``tencent,tushare,akshare``。AKShare 网络稳定性较差，只作为最后兜底。
     """
 
     def __init__(self, source_order: Optional[Iterable[str]] = None):
@@ -76,7 +76,7 @@ class FallbackFetcher(BaseFetcher):
         self._init_fetchers()
 
     def _settings_order(self) -> list[str]:
-        value = getattr(settings, "data_source_order", "tencent,akshare,tushare")
+        value = getattr(settings, "data_source_order", "tencent,tushare,akshare")
         if isinstance(value, str):
             return [x.strip() for x in value.split(",") if x.strip()]
         return list(value or [])
@@ -88,7 +88,7 @@ class FallbackFetcher(BaseFetcher):
             s = str(src).strip().lower()
             if s in valid and s not in out:
                 out.append(s)
-        return out or ["tencent", "akshare", "tushare"]
+        return out or ["tencent", "tushare", "akshare"]
 
     def _init_fetchers(self) -> None:
         constructors = {

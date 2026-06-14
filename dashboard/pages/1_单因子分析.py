@@ -84,10 +84,10 @@ if not ic_series.empty:
     fig.add_hline(y=s['rank_ic_mean'], line_dash="dot", line_color=C['red'],
                   annotation_text=f"均值={s['rank_ic_mean']:+.4f}", row=2, col=1)
 
-    fig.update_layout(height=480, template="plotly_dark", showlegend=False,
+    fig.update_layout(height=480, template="plotly_white", showlegend=False,
                       paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                       font=dict(color=C['text']))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 else:
     empty_state("📈", "IC 序列数据为空")
 
@@ -103,19 +103,19 @@ if not ic_decay.empty:
                            marker_color=C['red'], name='IR'), row=1, col=2)
     fig_d.add_hline(y=0, line_dash="dash", line_color=C['border'], row=1, col=2)
     fig_d.add_hline(y=0.3, line_dash="dot", line_color=C['green'], row=1, col=2, annotation_text="有效")
-    fig_d.update_layout(height=340, template="plotly_dark", showlegend=False,
+    fig_d.update_layout(height=340, template="plotly_white", showlegend=False,
                         paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
                         font=dict(color=C['text']))
     fig_d.update_xaxes(title_text="预测期(日)", row=1, col=1)
     fig_d.update_xaxes(title_text="预测期(日)", row=1, col=2)
-    st.plotly_chart(fig_d, use_container_width=True)
+    st.plotly_chart(fig_d, width="stretch")
 
     with st.expander("衰减详情表"):
         ddisp = ic_decay.copy()
         ddisp.columns = ['预测期(日)', 'IC均值', 'Rank IC均值', 'IC标准差', 'IR', '有效天数']
         for c in ['IC均值', 'Rank IC均值', 'IR']:
             ddisp[c] = ddisp[c].apply(lambda x: f"{x:+.4f}" if pd.notna(x) else "N/A")
-        st.dataframe(ddisp, hide_index=True, use_container_width=True)
+        st.dataframe(ddisp, hide_index=True, width="stretch")
 else:
     empty_state("📉", "IC 衰减数据为空")
 
@@ -139,12 +139,12 @@ if not group_return.empty:
     fig_g.update_layout(
         title=f"分组收益 (预测期={horizon_label}日)",
         xaxis_title="分组 (G0=最小, G末=最大)", yaxis_title="平均收益",
-        height=380, template="plotly_dark",
+        height=380, template="plotly_white",
         paper_bgcolor=C['bg'], plot_bgcolor=C['surface'],
         font=dict(color=C['text']),
     )
     fig_g.add_hline(y=0, line_dash="dash", line_color=C['border'])
-    st.plotly_chart(fig_g, use_container_width=True)
+    st.plotly_chart(fig_g, width="stretch")
 
     returns = group_return['mean_return'].values
     mono = all(returns[i] <= returns[i+1] for i in range(len(returns)-1)) or \
@@ -160,7 +160,7 @@ if not group_return.empty:
         gdisp.columns = ['分组', '平均收益', '标准差', '样本数']
         gdisp['平均收益'] = gdisp['平均收益'].apply(lambda x: f"{x:+.4f}")
         gdisp['标准差'] = gdisp['标准差'].apply(lambda x: f"{x:.4f}")
-        st.dataframe(gdisp, hide_index=True, use_container_width=True)
+        st.dataframe(gdisp, hide_index=True, width="stretch")
 else:
     empty_state("📊", "分组收益数据为空")
 

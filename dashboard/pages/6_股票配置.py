@@ -102,13 +102,13 @@ overrides = {
 }
 
 section_header("预览")
-if st.button("🔍 预览股票池", use_container_width=True):
+if st.button("🔍 预览股票池", width="stretch"):
     with st.spinner("构建中..."):
         try:
             df = preview_universe(overrides)
             st.success(f"筛选后: {len(df)} 只")
             cols = [c for c in ["symbol", "name", "close", "pct_change", "float_mv", "turnover_rate"] if c in df.columns]
-            st.dataframe(df[cols].head(50) if cols else df.head(50), use_container_width=True, hide_index=True)
+            st.dataframe(df[cols].head(50) if cols else df.head(50), width="stretch", hide_index=True)
         except Exception as e:
             st.error(f"预览失败: {e}")
 
@@ -131,7 +131,7 @@ scan_vals = {
 }
 
 st.divider()
-if st.button("💾 保存到 .env", type="primary", use_container_width=True):
+if st.button("💾 保存到 .env", type="primary", width="stretch"):
     try:
         update_env_file({**overrides, **scan_vals})
         st.success("已保存")
