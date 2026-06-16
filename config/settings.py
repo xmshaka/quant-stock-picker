@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     max_workers_quote: int = 2        # 批量行情并发数
 
     # ── 多源降级 ──
-    data_source_order: str = "tencent,tushare,akshare"  # 日K/板块等通用数据源降级顺序；本机 AKShare 偶发断连，Tushare token 已配置
+    data_source_order: str = "tencent,tushare,akshare,baostock"  # 日K/板块等通用数据源降级顺序；baostock 免费兜底但无实时估值
     incremental_use_fallback: bool = True               # 增量扫描是否启用多源降级
 
     # ── 每日调度 ──
@@ -91,6 +91,7 @@ class Settings(BaseSettings):
     cache_l1_ttl_seconds: int = 600        # L1 内存缓存 TTL
     cache_l2_quote_ttl_seconds: int = 1800 # L2 行情快照 TTL (盘中可短一些)
     cache_l2_kline_use_increment: bool = True  # K线启用增量更新
+    cache_l3_kline_enabled: bool = True    # PG K线缓存已按 source/adjust 隔离，允许启用预热/写入
 
     # ────────────────────────────────────────────────────
     # 股票池过滤

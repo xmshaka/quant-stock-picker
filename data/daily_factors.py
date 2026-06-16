@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -63,7 +64,6 @@ def latest_snapshot_date() -> Optional[str]:
 
 def load_snapshot_meta(date_str: Optional[str] = None) -> Optional[dict]:
     """读取指定日期的快照 meta。"""
-    import json
     d = date_str or latest_snapshot_date()
     if not d:
         return None
@@ -74,6 +74,23 @@ def load_snapshot_meta(date_str: Optional[str] = None) -> Optional[dict]:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def latest_data_source_meta() -> dict:
+    """返回最新快照/缓存可追溯的数据来源摘要，供状态页展示。"""
+    d = latest_snapshot_date()
+    meta = load_snapshot_meta(d) if d else None
+    if meta:
+        return {
+            "snapshot_date": d,
+            "snapshot_source": meta.get("data_source", "daily_factor_snapshot"),
+            "primary_source": meta.get("universe_source", ""),
+            "quote_source": meta.get("quote_source", ""),
+            "daily_basic_source": meta.get("daily_basic_source", ""),
+            "daily_basic_date": meta.get("daily_basic_date", ""),
+            "computed_at": meta.get("computed_at", ""),
+        }
+    return {"snapshot_date": d or "", "snapshot_source": "none"}
 
 
 def load_daily_factors(date_str: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
@@ -105,6 +122,7 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
 
     # 1. 加载股票池
     universe_df = Universe().load(use_cache=True)
+    source_meta = dict(universe_df.attrs.get("source_meta", {}))
     symbols = universe_df["symbol"].tolist()
     logger.info(f"[DailyFactors] 股票池: {len(symbols)} 只")
 
@@ -128,9 +146,13 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
     factor_df.to_parquet(_factor_path(today))
     price_df.to_parquet(_price_path(today))
 
-    import json
     meta = {
         "date": today,
+        "data_source": "daily_factor_snapshot",
+        "universe_source": source_meta.get("primary_source", "unknown"),
+        "quote_source": source_meta.get("quote_source", "unknown"),
+        "daily_basic_source": source_meta.get("daily_basic_source", "unknown"),
+        "daily_basic_date": source_meta.get("daily_basic_date"),
         "universe_size": len(symbols),
         "factor_rows": len(factor_df),
         "price_rows": len(price_df),

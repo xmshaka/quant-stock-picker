@@ -81,6 +81,23 @@ def test_fallback_stock_list_marks_source():
     assert ff.last_report.operation == "get_stock_list"
 
 
+def test_fallback_can_use_baostock_as_last_resort():
+    from data.fetchers.fallback_fetcher import FallbackFetcher
+
+    ff = FallbackFetcher(source_order=["tencent", "baostock"])
+    ff.fetchers = {
+        "tencent": _FailFetcher(),
+        "baostock": _OkFetcher(),
+    }
+
+    df = ff.get_daily_bars("000001", "20260501", "20260522")
+
+    assert not df.empty
+    assert df["source"].iloc[0] == "baostock"
+    assert ff.last_report.selected_source == "baostock"
+    assert [a.source for a in ff.last_report.attempts] == ["tencent", "baostock"]
+
+
 def test_scheduler_write_scan_alert(tmp_path, monkeypatch):
     from data.incremental import ScanReport
     from data import scheduler

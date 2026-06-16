@@ -11,7 +11,7 @@ from strategy.schemes import StrategyScheme
 from backtest.scheme_backtest import SchemeBacktester, run_multi_scheme_backtest
 from backtest.records import BacktestRunConfig, load_backtest_run, summarize_liquidity_slippage
 from dashboard.backtest_state import backtest_context_signature, clear_stale_compare
-from dashboard.components.kline_chart import plot_kline_with_signals, plot_equity_curve
+from dashboard.components.kline_chart import plot_kline_with_signals, plot_equity_curve, render_kline_chart
 from signals.rules import TradePoint
 from theme import inject_theme, metric_row, section_header, badge, empty_state, C
 
@@ -278,7 +278,7 @@ if "bt_result" in st.session_state:
                         sym_bars, all_points, symbol=label,
                         show_ma=True, show_volume=show_vol, show_rsi=False, show_kdj=True,
                     )
-                    st.plotly_chart(fig, width="stretch", key=f"kline_bs_v7_lane_line_{sym}")
+                    render_kline_chart(fig, key=f"kline_bs_v7_lane_line_{sym}", height=760)
 
                     # P0: 买卖点明细 — 默认显示执行信号，可选叠加强调raw
                     if all_points:

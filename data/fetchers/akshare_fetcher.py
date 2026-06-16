@@ -4,6 +4,7 @@ import pandas as pd
 from typing import Optional
 from datetime import datetime
 from .base import BaseFetcher
+from data.bars_normalizer import normalize_daily_bars
 
 
 class AKShareFetcher(BaseFetcher):
@@ -82,6 +83,7 @@ class AKShareFetcher(BaseFetcher):
             })
             df["symbol"] = symbol
             df["trade_date"] = pd.to_datetime(df["trade_date"])
+            df = normalize_daily_bars(df, source="akshare", symbol=symbol, adjust=adjust)
             return df
 
         result = self._safe_fetch(_fetch)

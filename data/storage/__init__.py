@@ -4,11 +4,11 @@ from .models import (
     SectorData, HotspotRecord, BacktestResult, FactorIC,
     init_db, get_engine, get_session_factory
 )
-from .repository import StockRepository, FactorRepository, SectorRepository
+from .repository import StockRepository, FactorRepository, BacktestRepository
 
 __all__ = [
     "Base", "StockInfo", "StockBar", "FactorValue",
     "SectorData", "HotspotRecord", "BacktestResult", "FactorIC",
     "init_db", "get_engine", "get_session_factory",
-    "StockRepository", "FactorRepository", "SectorRepository",
+    "StockRepository", "FactorRepository", "BacktestRepository",
 ]

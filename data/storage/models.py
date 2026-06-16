@@ -53,13 +53,15 @@ class StockBar(Base):
     amount = Column(BigInteger, comment="成交额")
     turnover = Column(Float, comment="换手率")
     amplitude = Column(Float, comment="振幅")
-    adj_factor = Column(Float, comment="复权因子", default=1.0)
+    source = Column(String(20), comment="数据来源", default="", server_default="")
+    adjust = Column(String(10), comment="复权口径", default="raw", server_default="raw")
     created_at = Column(DateTime, default=datetime.now)
     
     __table_args__ = (
-        UniqueConstraint("symbol", "trade_date", name="uix_symbol_date"),
-        Index("idx_symbol_date", "symbol", "trade_date"),
+        UniqueConstraint("symbol", "trade_date", "source", "adjust", name="uix_symbol_date_source_adjust"),
+        Index("idx_symbol_date_src_adj", "symbol", "trade_date", "source", "adjust"),
         Index("idx_trade_date", "trade_date"),
+        Index("idx_source_adjust", "source", "adjust"),
     )
 
 
@@ -202,11 +204,17 @@ class BacktestResult(Base):
     # 曲线数据
     equity_curve = Column(JSONB, comment="权益曲线")
     
+    # 数据来源追踪
+    data_source = Column(String(20), comment="数据来源", default="", server_default="")
+    data_adjust = Column(String(10), comment="复权口径", default="raw", server_default="raw")
+    data_version = Column(String(40), comment="数据版本", default="", server_default="")
+    
     created_at = Column(DateTime, default=datetime.now)
     
     __table_args__ = (
         Index("idx_bt_strategy", "strategy_name"),
         Index("idx_bt_date", "start_date", "end_date"),
+        Index("idx_bt_data_source", "data_source", "data_adjust"),
     )
 
 

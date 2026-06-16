@@ -33,6 +33,7 @@ from backtest.records import (
     BacktestRunConfig, make_run_id, trade_points_to_frame,
     trade_details_to_frame, equity_curve_to_frame, persist_backtest_run,
 )
+from data.bars_normalizer import assert_raw_for_execution, normalize_daily_bars
 from config.settings import settings
 import copy
 
@@ -53,9 +54,16 @@ def _fetch_ohlcv(symbols: list, lookback_days: int, adjust: str = "") -> pd.Data
         frames = []
         for sym in symbols:
             try:
-                df = fetcher.get_daily_bars(sym, start_date=start, end_date=end, adjust=adjust)
+                # 确保adjust参数正确传递：空字符串表示raw
+                effective_adjust = "raw" if adjust == "" else adjust
+                df = fetcher.get_daily_bars(sym, start_date=start, end_date=end, adjust=effective_adjust)
                 if df is not None and not df.empty:
-                    df["adjust"] = adjust or "none"
+                    # 确保数据包含source和adjust字段
+                    if not {"source", "adjust"}.issubset(df.columns):
+                        df = normalize_daily_bars(df, source="tencent", symbol=sym, adjust=effective_adjust)
+                    # 验证回测使用raw数据
+                    if effective_adjust == "raw":
+                        assert_raw_for_execution(df)
                     frames.append(df)
             except Exception as e:
                 logger.debug(f"[SchemeBacktest] 拉取{sym} OHLCV失败: {e}")
@@ -67,6 +75,37 @@ def _fetch_ohlcv(symbols: list, lookback_days: int, adjust: str = "") -> pd.Data
     except Exception as e:
         logger.warning(f"[SchemeBacktest] 拉取OHLCV失败: {e}")
     return pd.DataFrame()
+
+
+def _prepare_execution_bars(df: pd.DataFrame, *, fallback_source: str = "snapshot") -> pd.DataFrame:
+    """回测撮合前K线硬校验与单位兜底标准化。
+
+    回测入口只能接受 adjust=raw 的不复权K线。若输入来自旧快照且缺 adjust/source，
+    为兼容历史数据默认按 raw+fallback_source 标准化；若显式标记 qfq/hfq，直接拒绝。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    # 新版 fetcher 已经输出标准化单位；只做类型整理，严禁二次乘以100/1000。
+    if {"source", "adjust"}.issubset(out.columns):
+        out["trade_date"] = pd.to_datetime(out["trade_date"])
+        for col in ("open", "high", "low", "close", "volume", "amount", "pct_change", "change", "turnover"):
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.sort_values("trade_date").reset_index(drop=True)
+    else:
+        if "source" not in out.columns:
+            out["source"] = fallback_source
+        if "adjust" not in out.columns:
+            out["adjust"] = "raw"
+        out = normalize_daily_bars(
+            out,
+            source=str(out["source"].iloc[0]),
+            symbol=str(out["symbol"].iloc[0]) if "symbol" in out.columns and not out.empty else None,
+            adjust=str(out["adjust"].iloc[0]),
+        )
+    assert_raw_for_execution(out)
+    return out
 
 
 @dataclass
@@ -86,6 +125,12 @@ class SchemeBacktestResult:
     buy_count: int = 0         # 买入次数（单边）
     sell_count: int = 0        # 卖出次数（单边）
     final_value: float = 0.0
+    
+    # 数据来源追踪
+    data_source: str = ""
+    data_adjust: str = "raw"
+    data_version: str = ""
+    
     run_id: str = ""
     # 事件源（P0：K线默认展示 signals_executed）
     signals_executed: Dict[str, List[TradePoint]] = field(default_factory=dict)
@@ -135,6 +180,8 @@ class SchemeBacktestResult:
             f"交易: {self.trade_summary}",
             f"最终资金: {self.fmt('final_value')}",
             f"run_id: {self.run_id}",
+            f"数据源: {self.data_source}/{self.data_adjust}",
+            f"数据版本: {self.data_version}",
         ]
         return "\n".join(lines)
 
@@ -228,6 +275,27 @@ class SchemeBacktester:
         have_ohlcv = not ohlcv_df.empty
         if have_ohlcv:
             ohlcv_df['trade_date'] = pd.to_datetime(ohlcv_df['trade_date'])
+        
+        # ========== 关键修复：确保price_df包含source和adjust字段 ==========
+        if not price_df.empty:
+            # 如果price_df没有source字段，添加默认值
+            if 'source' not in price_df.columns:
+                logger.warning(f"[SingleStockFix] price_df缺少source字段，添加默认值'tencent'")
+                price_df['source'] = 'tencent'
+            # 如果source字段存在但全部为空，填充默认值
+            elif price_df['source'].isna().all() or (price_df['source'] == '').all():
+                logger.warning(f"[SingleStockFix] price_df.source字段全部为空，填充为'tencent'")
+                price_df['source'] = 'tencent'
+            
+            # 如果price_df没有adjust字段，添加默认值
+            if 'adjust' not in price_df.columns:
+                logger.warning(f"[SingleStockFix] price_df缺少adjust字段，添加默认值'raw'")
+                price_df['adjust'] = 'raw'
+            # 如果adjust字段存在但全部为空，填充默认值
+            elif price_df['adjust'].isna().all() or (price_df['adjust'] == '').all():
+                logger.warning(f"[SingleStockFix] price_df.adjust字段全部为空，填充为'raw'")
+                price_df['adjust'] = 'raw'
+        # ===============================================================
 
         # 为每只股票生成信号 + ATR
         stock_signal_details: Dict[str, List[TradePoint]] = {}
@@ -253,6 +321,8 @@ class SchemeBacktester:
             for col in ('open', 'high', 'low', 'volume'):
                 if col not in sym_bars_full.columns:
                     sym_bars_full[col] = sym_bars_full['close']
+            sym_bars = _prepare_execution_bars(sym_bars, fallback_source="scheme_backtest")
+            sym_bars_full = _prepare_execution_bars(sym_bars_full, fallback_source="scheme_backtest")
             sym_bars_map[sym] = sym_bars
 
             # 计算 ATR（用完整数据，取回测区间内的部分）
@@ -624,6 +694,77 @@ class SchemeBacktester:
         eq_curve = {str(dt): val for dt, val in equity_curve.items()}
 
         trade_count = len(trades_pnl)  # 完成的交易轮数
+        
+        # 提取数据源信息（单股模式）
+        data_source = ""
+        data_adjust = "raw"
+        data_version = "single_stock_mode"
+        
+        # ========== 调试日志：追踪数据源 ==========
+        logger.info(f"[SingleStockDebug] 单股模式数据源追踪:")
+        logger.info(f"  have_ohlcv: {have_ohlcv}")
+        logger.info(f"  price_df空: {price_df.empty}")
+        if not price_df.empty:
+            logger.info(f"  price_df字段: {list(price_df.columns)}")
+            if 'source' in price_df.columns:
+                source_values = price_df['source'].unique()
+                logger.info(f"  price_df.source值: {source_values[:5] if len(source_values) > 0 else '空'}")
+                logger.info(f"  price_df.source非空: {not price_df['source'].isna().all()}")
+            else:
+                logger.warning(f"  price_df没有source字段")
+            
+            if 'adjust' in price_df.columns:
+                adjust_values = price_df['adjust'].unique()
+                logger.info(f"  price_df.adjust值: {adjust_values[:5] if len(adjust_values) > 0 else '空'}")
+                logger.info(f"  price_df.adjust非空: {not price_df['adjust'].isna().all()}")
+            else:
+                logger.warning(f"  price_df没有adjust字段")
+        
+        if have_ohlcv:
+            logger.info(f"  ohlcv_df空: {ohlcv_df.empty}")
+            if not ohlcv_df.empty:
+                logger.info(f"  ohlcv_df字段: {list(ohlcv_df.columns)}")
+                if 'source' in ohlcv_df.columns:
+                    source_values = ohlcv_df['source'].unique()
+                    logger.info(f"  ohlcv_df.source值: {source_values[:5] if len(source_values) > 0 else '空'}")
+                    logger.info(f"  ohlcv_df.source非空: {not ohlcv_df['source'].isna().all()}")
+                else:
+                    logger.warning(f"  ohlcv_df没有source字段")
+        # =======================================
+        
+        # 尝试从price_df提取数据源
+        if not price_df.empty:
+            if 'source' in price_df.columns and not price_df['source'].isna().all():
+                data_source = str(price_df.iloc[0]['source'])
+                logger.info(f"[SingleStockDebug] 从price_df提取source: {data_source}")
+            else:
+                logger.warning(f"[SingleStockDebug] price_df没有source字段或全部为空")
+                
+            if 'adjust' in price_df.columns and not price_df['adjust'].isna().all():
+                data_adjust = str(price_df.iloc[0]['adjust'])
+                logger.info(f"[SingleStockDebug] 从price_df提取adjust: {data_adjust}")
+            else:
+                logger.warning(f"[SingleStockDebug] price_df没有adjust字段或全部为空")
+                
+            data_version = f"source={data_source}, adjust={data_adjust}, single_stock_mode"
+            logger.info(f"[SingleStockDebug] 最终data_version: {data_version}")
+        
+        # 如果使用了ohlcv_df，也从中提取
+        elif have_ohlcv and not ohlcv_df.empty:
+            if 'source' in ohlcv_df.columns and not ohlcv_df['source'].isna().all():
+                data_source = str(ohlcv_df.iloc[0]['source'])
+                logger.info(f"[SingleStockDebug] 从ohlcv_df提取source: {data_source}")
+            else:
+                logger.warning(f"[SingleStockDebug] ohlcv_df没有source字段或全部为空")
+                
+            if 'adjust' in ohlcv_df.columns and not ohlcv_df['adjust'].isna().all():
+                data_adjust = str(ohlcv_df.iloc[0]['adjust'])
+                logger.info(f"[SingleStockDebug] 从ohlcv_df提取adjust: {data_adjust}")
+            else:
+                logger.warning(f"[SingleStockDebug] ohlcv_df没有adjust字段或全部为空")
+                
+            data_version = f"source={data_source}, adjust={data_adjust}, single_stock_mode"
+            logger.info(f"[SingleStockDebug] 最终data_version: {data_version}")
 
         result = SchemeBacktestResult(
             scheme_id=scheme.scheme_id if scheme else '',
@@ -645,6 +786,9 @@ class SchemeBacktester:
             signals_executed=stock_signal_details,
             signals_raw=raw_signal_details,
             trade_details=trade_details,
+            data_source=data_source,
+            data_adjust=data_adjust,
+            data_version=data_version,
         )
 
         logger.info(f"[SingleStock] 收益={total_return:+.2%}, 交易={result.trade_summary}, "
@@ -785,6 +929,7 @@ class SchemeBacktester:
             return SchemeBacktestResult(
                 scheme_id=scheme.scheme_id, scheme_name=scheme.name,
                 start_date=str(start_date), end_date=str(end_date),
+                data_source="", data_adjust="raw", data_version="no_signals",
             )
 
         # 2b. 去重：相邻交易日目标股票相同时跳过，避免无效调仓
@@ -835,6 +980,7 @@ class SchemeBacktester:
                 for col in ('open', 'high', 'low', 'volume'):
                     if col not in sym_bars.columns:
                         sym_bars[col] = sym_bars['close']
+                sym_bars = _prepare_execution_bars(sym_bars, fallback_source="scheme_backtest")
                 points = evaluate_all_rules(sym_bars, scheme.signal_rules)
                 if points:
                     stock_signal_details[sym] = points
@@ -868,6 +1014,7 @@ class SchemeBacktester:
                 lambda r: estimate_turnover_amount(r.get('amount', 0.0), r.get('volume', 0.0), r.get('close', 0.0)),
                 axis=1,
             )
+            sym_data = _prepare_execution_bars(sym_data, fallback_source="scheme_backtest")
             sym_data = sym_data.set_index('trade_date')[['open', 'high', 'low', 'close', 'volume', 'amount']]
             sym_data.index = pd.to_datetime(sym_data.index)
             engine.add_data(sym, sym_data)
@@ -878,6 +1025,7 @@ class SchemeBacktester:
             return SchemeBacktestResult(
                 scheme_id=scheme.scheme_id, scheme_name=scheme.name,
                 start_date=str(start_date), end_date=str(end_date),
+                data_source="", data_adjust="raw", data_version="no_data",
             )
 
         signals_for_bt = {}
@@ -897,9 +1045,36 @@ class SchemeBacktester:
             return SchemeBacktestResult(
                 scheme_id=scheme.scheme_id, scheme_name=scheme.name,
                 start_date=str(start_date), end_date=str(end_date),
+                data_source="", data_adjust="raw", data_version="backtrader_failed",
             )
 
         # 5. 汇总结果
+        
+        # 提取数据源信息
+        data_source = ""
+        data_adjust = "raw"
+        data_version = ""
+        
+        # 尝试从ohlcv_df提取数据源
+        if have_ohlcv and not ohlcv_df.empty:
+            # 从第一个有数据的记录中提取
+            first_row = ohlcv_df.iloc[0]
+            if 'source' in ohlcv_df.columns and not ohlcv_df['source'].isna().all():
+                data_source = str(first_row['source'])
+            if 'adjust' in ohlcv_df.columns and not ohlcv_df['adjust'].isna().all():
+                data_adjust = str(first_row['adjust'])
+            data_version = f"source={data_source}, adjust={data_adjust}"
+        elif not price_df.empty:
+            # 单股模式从price_df提取
+            if 'source' in price_df.columns and not price_df['source'].isna().all():
+                data_source = str(price_df.iloc[0]['source'])
+            if 'adjust' in price_df.columns and not price_df['adjust'].isna().all():
+                data_adjust = str(price_df.iloc[0]['adjust'])
+            data_version = f"source={data_source}, adjust={data_adjust}"
+        else:
+            # 没有数据，记录异常情况
+            data_version = f"empty_factor_panel"
+        
         result = SchemeBacktestResult(
             scheme_id=scheme.scheme_id,
             scheme_name=scheme.name,
@@ -920,6 +1095,9 @@ class SchemeBacktester:
             signals_executed=bt_result.get("executed_points", {}),
             signals_raw=stock_signal_details,
             trade_details=bt_result.get("trade_details", []),
+            data_source=data_source,
+            data_adjust=data_adjust,
+            data_version=data_version,
         )
 
         logger.info(f"[SchemeBacktest] {scheme.name}: 收益={result.total_return:+.2%}, "

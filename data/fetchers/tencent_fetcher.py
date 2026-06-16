@@ -30,6 +30,7 @@ from .base import BaseFetcher
 from data.ratelimit import SourceGateway, retry_with_backoff, RateLimitError
 from data.cache_manager import CacheManager
 from data.validator import Validator
+from data.bars_normalizer import normalize_daily_bars
 from config.settings import settings
 
 
@@ -283,7 +284,7 @@ class TencentFetcher(BaseFetcher):
         code = tcode[2:] if tcode[:2] in ("sh", "sz") else tcode
         market = tcode[:2]
 
-        adj_map = {"qfq": "qfq", "hfq": "hfq", "": ""}
+        adj_map = {"qfq": "qfq", "hfq": "hfq", "": "", "raw": ""}
         adj = adj_map.get(adjust, "qfq")
 
         if start_date and end_date:
@@ -337,13 +338,14 @@ class TencentFetcher(BaseFetcher):
             if end_date:
                 df = df[df["trade_date"] <= pd.to_datetime(end_date)]
 
-            # 腾讯 K 线接口当前未稳定返回成交额；volume 单位为“手”，用于滑点分层时必须估算成交额。
+            # 腾讯 K 线接口当前未稳定返回成交额；原始 volume 单位为“手”，此处先估算 amount(元)，再标准化 volume=股。
             df["amount"] = df["volume"].astype(float) * df["close"].astype(float) * 100.0
             df["pct_change"] = df["close"].pct_change() * 100
             df["change"] = df["close"].diff()
 
             df = df[["symbol", "trade_date", "open", "high", "low", "close",
                      "volume", "amount", "pct_change", "change"]].sort_values("trade_date").reset_index(drop=True)
+            df = normalize_daily_bars(df, source="tencent", symbol=code, adjust=adjust)
             # 写入前过校验
             df = self.validator.validate_bars_df(df)
             return df
@@ -377,6 +379,8 @@ class TencentFetcher(BaseFetcher):
             start_date=start_date,
             end_date=end_date,
             fetch_fn=_fetch,
+            source="tencent",
+            adjust=adjust,
         )
 
     def get_sector_list(self) -> pd.DataFrame:

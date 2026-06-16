@@ -219,19 +219,22 @@ class IncrementalUpdater:
         if df is None or df.empty:
             return 0
 
-        # source 字段用于链路追踪，不写入 bars 存储表，避免污染 schema
-        persist_df = df.drop(columns=["source"], errors="ignore")
+        source = str(df["source"].iloc[0]) if "source" in df.columns and not df.empty else "incremental"
+        adjust = str(df["adjust"].iloc[0]) if "adjust" in df.columns and not df.empty else "raw"
 
-        # 写 L2 parquet
+        # 写 L2 parquet：按 source+adjust 隔离，保留 source/adjust 供链路追踪。
+        persist_df = df.copy()
         try:
-            self.cache.l2.upsert_bars(symbol, persist_df)
+            self.cache.l2.upsert_bars(symbol, persist_df, source=source, adjust=adjust)
         except Exception as e:
             logger.debug(f"[Updater] {symbol} L2 写入失败: {e}")
 
-        # 写 L3 PG
-        try:
-            self.repo.save_bars(persist_df)
-        except Exception as e:
-            logger.warning(f"[Updater] {symbol} L3 写入失败: {e}")
+        # 写 L3 PG：当前表结构未隔离 source/adjust，默认禁用，防止复权口径污染。
+        if settings.cache_l3_kline_enabled:
+            pg_df = persist_df.drop(columns=["source", "adjust", "amount_estimated"], errors="ignore")
+            try:
+                self.repo.save_bars(pg_df)
+            except Exception as e:
+                logger.warning(f"[Updater] {symbol} L3 写入失败: {e}")
 
         return len(persist_df)

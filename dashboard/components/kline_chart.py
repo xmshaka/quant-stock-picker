@@ -630,3 +630,97 @@ def plot_equity_curve(
     fig.add_hline(y=0, line_dash="dash", line_color=KC['grid'])
 
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════
+# JS 十字光标跨子图同步渲染
+# ══════════════════════════════════════════════════════════════════
+
+CROSSHAIR_JS = r"""
+<script>
+(function() {
+    var pollCount = 0;
+    function initCrosshair() {
+        pollCount++;
+        var gd = document.querySelector('.js-plotly-plot');
+        if (!gd) {
+            if (pollCount < 50) setTimeout(initCrosshair, 200);
+            return;
+        }
+        try {
+            if (!gd._fullLayout || !gd._fullLayout.xaxis) {
+                if (pollCount < 50) setTimeout(initCrosshair, 200);
+                return;
+            }
+        } catch(e) {
+            if (pollCount < 50) setTimeout(initCrosshair, 200);
+            return;
+        }
+
+        var line = document.createElement('div');
+        line.className = 'custom-crosshair-v';
+        line.style.cssText = 'position:absolute;width:1px;background:rgba(136,136,136,0.5);pointer-events:none;display:none;z-index:999;top:0;';
+        gd.appendChild(line);
+
+        gd.on('plotly_hover', function(evt) {
+            if (!evt || !evt.points || !evt.points.length) return;
+            var xval = evt.points[0].x;
+            var fullLayout = gd._fullLayout;
+            var xaxis = fullLayout.xaxis;
+            if (!xaxis || typeof xaxis.d2p !== 'function') return;
+
+            var xPixel = xaxis.d2p(xval);
+            var xOffset = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
+            var margin = fullLayout.margin || {t:0, b:0};
+            var containerH = gd.offsetHeight || gd.clientHeight || 0;
+
+            line.style.left = (xOffset + xPixel) + 'px';
+            line.style.top = margin.t + 'px';
+            line.style.height = (containerH - margin.t - margin.b) + 'px';
+            line.style.display = 'block';
+        });
+
+        gd.on('plotly_unhover', function() {
+            line.style.display = 'none';
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function() { setTimeout(initCrosshair, 300); });
+    } else {
+        setTimeout(initCrosshair, 100);
+    }
+})();
+</script>
+"""
+
+
+def render_kline_chart(fig: go.Figure, key: str = "", height: int = 760):
+    """
+    渲染 K 线图（带 JS 十字光标跨子图同步）。
+
+    替代 st.plotly_chart()，注入 JavaScript 监听 plotly_hover 事件，
+    在所有子图（K线/成交量/KDJ/MACD）上同步绘制十字光标竖线。
+
+    原理：
+    - Plotly 内置 spikemode='across' 仅作用于当前 hover 子图
+    - JS 方案监听 plotly_hover，获取 x 值后在全图高度绘制竖线
+    - 使用 xaxis.d2p() 将数据坐标转为像素坐标，精确定位
+    """
+    import streamlit.components.v1 as components
+
+    fig_html = fig.to_html(
+        include_plotlyjs='cdn',
+        full_html=True,
+        config={
+            'responsive': True,
+            'displayModeBar': True,
+            'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+            'displaylogo': False,
+        }
+    )
+
+    # 在 </body> 前注入 JS
+    fig_html = fig_html.replace('</body>', CROSSHAIR_JS + '\n</body>')
+
+    components.html(fig_html, height=height, scrolling=False)

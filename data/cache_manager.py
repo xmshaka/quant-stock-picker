@@ -26,6 +26,7 @@ import pandas as pd
 from loguru import logger
 
 from config.settings import settings
+from data.bars_normalizer import normalize_adjust
 
 
 # ════════════════════════════════════════════════════════════
@@ -174,10 +175,17 @@ class ParquetCache:
                 pass
 
     # ── K线增量缓存 ──
-    def _bars_path(self, symbol: str) -> Path:
+    def _bars_path(self, symbol: str, source: str = "default", adjust: str = "raw") -> Path:
+        """K线缓存路径，按 source+adjust 隔离。
+
+        旧版仅按 symbol 存储，容易把 raw/qfq/hfq 混写到同一文件。
+        新路径: bars/{source}/{adjust}/{prefix}/{symbol}.parquet
+        """
+        source_safe = "".join(c if c.isalnum() else "_" for c in str(source or "default").lower())
+        adjust_safe = normalize_adjust(adjust)
         # 按交易所前两位分子目录, 避免单目录文件过多
         prefix = symbol[:2] if len(symbol) >= 6 else "xx"
-        d = self.bars_dir / prefix
+        d = self.bars_dir / source_safe / adjust_safe / prefix
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{symbol}.parquet"
 
@@ -186,9 +194,11 @@ class ParquetCache:
         symbol: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        source: str = "default",
+        adjust: str = "raw",
     ) -> Optional[pd.DataFrame]:
         """读取本地 K 线. 不存在返回 None"""
-        p = self._bars_path(symbol)
+        p = self._bars_path(symbol, source=source, adjust=adjust)
         if not p.exists():
             return None
         try:
@@ -209,7 +219,13 @@ class ParquetCache:
                 pass
             return None
 
-    def upsert_bars(self, symbol: str, new_df: pd.DataFrame):
+    def upsert_bars(
+        self,
+        symbol: str,
+        new_df: pd.DataFrame,
+        source: str = "default",
+        adjust: str = "raw",
+    ):
         """增量合并 K 线: 按 trade_date 去重, 新数据覆盖旧数据
         
         ⚠️ 复权数据有特殊处理: 由于前复权基准会随时间变化,
@@ -223,8 +239,12 @@ class ParquetCache:
 
         new_df = new_df.copy()
         new_df["trade_date"] = pd.to_datetime(new_df["trade_date"])
+        if "source" not in new_df.columns:
+            new_df["source"] = source
+        if "adjust" not in new_df.columns:
+            new_df["adjust"] = normalize_adjust(adjust)
 
-        p = self._bars_path(symbol)
+        p = self._bars_path(symbol, source=source, adjust=adjust)
         with self._lock:
             try:
                 if p.exists():
@@ -271,9 +291,14 @@ class ParquetCache:
             except Exception as e:
                 logger.error(f"[L2] upsert_bars 失败 {symbol}: {e}")
 
-    def last_trade_date(self, symbol: str) -> Optional[pd.Timestamp]:
+    def last_trade_date(
+        self,
+        symbol: str,
+        source: str = "default",
+        adjust: str = "raw",
+    ) -> Optional[pd.Timestamp]:
         """返回本地最新的交易日期"""
-        df = self.get_bars(symbol)
+        df = self.get_bars(symbol, source=source, adjust=adjust)
         if df is None or df.empty:
             return None
         return df["trade_date"].max()
@@ -345,24 +370,35 @@ class CacheManager:
         start_date: str,
         end_date: str,
         fetch_fn: Callable[[str, str], pd.DataFrame],
-        use_pg: bool = True,
+        use_pg: Optional[bool] = None,
+        source: str = "default",
+        adjust: str = "raw",
     ) -> pd.DataFrame:
         """K线增量获取: 本地有就用本地, 缺失部分才请求源
 
         fetch_fn(start_date, end_date) -> DataFrame
-        use_pg: 是否启用 L3 (PostgreSQL) 级缓存
+        use_pg: 是否启用 L3 (PostgreSQL) 级缓存。None 时读取 settings.cache_l3_kline_enabled。
+                当前 PG bars 未按 source/adjust 隔离，默认禁用，避免复权口径污染 L2。
         """
+        if use_pg is None:
+            use_pg = bool(getattr(settings, "cache_l3_kline_enabled", False))
+
         end_ts = pd.to_datetime(end_date)
         start_ts = pd.to_datetime(start_date)
 
-        cached = self.l2.get_bars(symbol)
+        cached = self.l2.get_bars(symbol, source=source, adjust=adjust)
 
         # L2 未命中 -> 尝试 L3 (PG) 预热
         if (cached is None or cached.empty) and use_pg:
-            cached = self._load_from_pg(symbol)
+            # 现在 PG 已支持 source/adjust，但 _load_from_pg 默认只读旧数据。
+            # 为了安全，只对 source='' & adjust='raw' 启用 L3。
+            if source == "" and adjust == "raw":
+                cached = self._load_from_pg(symbol)
+            else:
+                logger.debug(f"[Cache] L3 skip for source={source}, adjust={adjust} (source=''&adjust='raw' only)")
             if cached is not None and not cached.empty:
                 logger.debug(f"[Cache] {symbol} L3->L2 预热 {len(cached)} 条")
-                self.l2.upsert_bars(symbol, cached)
+                self.l2.upsert_bars(symbol, cached, source=source, adjust=adjust)
 
         if cached is not None and not cached.empty:
             last_local = cached["trade_date"].max()
@@ -379,10 +415,10 @@ class CacheManager:
                 logger.info(f"[Cache] {symbol} 增量补尾: {gap_start} -> {end_date}")
                 new_df = fetch_fn(gap_start, end_date)
                 if new_df is not None and not new_df.empty:
-                    self.l2.upsert_bars(symbol, new_df)
+                    self.l2.upsert_bars(symbol, new_df, source=source, adjust=adjust)
                     if use_pg:
                         self._save_to_pg(new_df)
-                    merged = self.l2.get_bars(symbol, start_date, end_date)
+                    merged = self.l2.get_bars(symbol, start_date, end_date, source=source, adjust=adjust)
                     if merged is not None and not merged.empty:
                         return merged
                     return new_df
@@ -392,7 +428,7 @@ class CacheManager:
         logger.info(f"[Cache] {symbol} 全量拉取: {start_date} -> {end_date}")
         new_df = fetch_fn(start_date, end_date)
         if new_df is not None and not new_df.empty:
-            self.l2.upsert_bars(symbol, new_df)
+            self.l2.upsert_bars(symbol, new_df, source=source, adjust=adjust)
             if use_pg:
                 self._save_to_pg(new_df)
         return new_df
@@ -401,6 +437,7 @@ class CacheManager:
     def _load_from_pg(self, symbol: str) -> Optional[pd.DataFrame]:
         """从 PG 拉一只股票的全部 K 线 (供预热 L2)"""
         try:
+            # 默认只读 source='' & adjust='raw' 的记录，兼容旧数据
             from data.storage.repository import StockRepository
             repo = StockRepository()
             df = repo.get_bars(symbol)
@@ -415,6 +452,7 @@ class CacheManager:
     def _save_to_pg(self, df: pd.DataFrame):
         """写入 PG (异常不阻断主流程)"""
         try:
+            # 写入时会带上 df 中的 source/adjust 字段
             from data.storage.repository import StockRepository
             repo = StockRepository()
             repo.save_bars(df)

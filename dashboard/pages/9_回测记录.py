@@ -14,7 +14,7 @@ from backtest.records import (
     validate_trade_schema,
 )
 from backtest.scheme_backtest import _fetch_ohlcv
-from dashboard.components.kline_chart import plot_equity_curve, plot_kline_with_signals
+from dashboard.components.kline_chart import plot_equity_curve, plot_kline_with_signals, render_kline_chart
 from dashboard.history_compare import (
     build_run_compare_table,
     best_run_summary,
@@ -106,6 +106,31 @@ for col in ("total_return", "annual_return", "max_drawdown", "win_rate"):
 display["sharpe_ratio"] = display["sharpe_ratio"].map(lambda x: f"{float(x):.3f}")
 display["交易"] = display.apply(lambda r: f"买{int(r['buy_count'])} 卖{int(r['sell_count'])}（{int(r['trade_count'])}轮）", axis=1)
 display["一致性"] = display["consistency_ok"].map(lambda x: "PASS" if x else "FAIL")
+
+# 确保数据源字段存在（兼容旧记录）
+for col in ["data_source", "data_adjust", "data_version"]:
+    if col not in display.columns:
+        display[col] = ""
+
+# 数据源格式化
+def format_data_source(row):
+    source = row["data_source"] if pd.notna(row["data_source"]) else ""
+    adjust = row["data_adjust"] if pd.notna(row["data_adjust"]) else "raw"
+    version = row["data_version"] if pd.notna(row["data_version"]) else ""
+    if not source:
+        return "未知"
+    base = f"{source}/{adjust}"
+    # 如果版本信息是默认格式，不显示
+    default_version = f"source={source}, adjust={adjust}"
+    if version and version != default_version and not version.startswith(default_version + ","):
+        # 简化显示
+        if len(version) > 20:
+            version = version[:17] + "..."
+        return f"{base} ({version})"
+    return base
+
+display["数据源"] = display.apply(format_data_source, axis=1)
+
 show_cols = {
     "run_id": "Run ID",
     "scheme_name": "策略",
@@ -120,6 +145,7 @@ show_cols = {
     "sharpe_ratio": "夏普",
     "交易": "交易",
     "一致性": "一致性",
+    "数据源": "数据源",
     "created_at": "保存时间",
 }
 st.dataframe(
@@ -157,6 +183,19 @@ with st.expander("多记录横向对比", expanded=False):
             f"最低回撤: {compare_summary.get('best_drawdown_run_id', '-')}；"
             f"最高夏普: {compare_summary.get('best_sharpe_run_id', '-')}"
         )
+        
+        # 数据源统计
+        if "data_source" in compare_table.columns and "data_adjust" in compare_table.columns:
+            # 确保字段存在并填充默认值
+            compare_table["data_source"] = compare_table.get("data_source", "")
+            compare_table["data_adjust"] = compare_table.get("data_adjust", "raw")
+            
+            source_stats = compare_table.groupby(["data_source", "data_adjust"]).size().reset_index(name="count")
+            if not source_stats.empty:
+                source_text = "，".join([f"{row['data_source']}/{row['data_adjust']}×{row['count']}" 
+                                       for _, row in source_stats.iterrows()])
+                st.caption(f"数据源分布: {source_text}")
+        
         st.download_button(
             "导出对比CSV",
             data=compare_table_to_csv(compare_table),
@@ -322,7 +361,7 @@ with tab_kline:
         else:
             bars["trade_date"] = pd.to_datetime(bars["trade_date"])
             fig = plot_kline_with_signals(bars[bars["symbol"] == sym], points, symbol=sym, show_ma=True, show_volume=True, show_kdj=True)
-            st.plotly_chart(fig, width="stretch", key=f"history_kline_{run_id}_{sym}")
+            render_kline_chart(fig, key=f"history_kline_{run_id}_{sym}", height=760)
             st.dataframe(sym_sigs, width="stretch", hide_index=True)
 
 with tab_raw:

@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from loguru import logger
 
 from .base import BaseFetcher
+from data.cache_manager import CacheManager
+from data.bars_normalizer import normalize_daily_bars
 
 
 def _get_tushare_token() -> Optional[str]:
@@ -110,6 +112,8 @@ class TushareFetcher(BaseFetcher):
             })
             df["trade_date"] = pd.to_datetime(df["trade_date"])
             df["symbol"] = symbol
+            # Tushare daily 为不复权；volume=手，amount=千元，统一交给标准化层转为股/元。
+            df = normalize_daily_bars(df, source="tushare", symbol=symbol, adjust="raw")
             return df.sort_values("trade_date").reset_index(drop=True)
 
         result = self._safe_fetch(_fetch)
@@ -134,7 +138,12 @@ class TushareFetcher(BaseFetcher):
         return result if result is not None else pd.DataFrame()
 
     def get_daily_basic(self, trade_date: Optional[str] = None) -> pd.DataFrame:
-        """获取每日指标（估值等）"""
+        """获取每日指标（估值等），带本地 Parquet 缓存。
+
+        - 显式 trade_date：历史日数据近似不可变，优先读本地缓存，避免重复消耗 Tushare 积分。
+        - 默认 trade_date=None：从今天向前回看最近 10 天，逐日先查缓存，再请求接口。
+        - 返回值 attrs["trade_date"] / attrs["source"] 用于前台暴露真实数据来源。
+        """
         if not self._has_token():
             return pd.DataFrame()
         if trade_date:
@@ -143,7 +152,19 @@ class TushareFetcher(BaseFetcher):
             today = datetime.now()
             dates = [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(10)]
 
+        cache = CacheManager.get()
+        ttl_seconds = 86400 * 30 if trade_date else 86400 * 7
+
         for td in dates:
+            cache_key = f"tushare_daily_basic_{td}"
+            cached = cache.l2.get_snapshot(cache_key, ttl_seconds=ttl_seconds)
+            if cached is not None and not cached.empty:
+                cached = cached.copy()
+                cached.attrs["trade_date"] = td
+                cached.attrs["source"] = "tushare_daily_basic_cache"
+                logger.info(f"[Tushare] daily_basic 命中本地缓存 {td}: {len(cached)} 条")
+                return cached
+
             def _fetch(_td=td):
                 return self.pro.daily_basic(trade_date=_td)
 
@@ -151,6 +172,9 @@ class TushareFetcher(BaseFetcher):
             if result is not None and not result.empty:
                 result = result.copy()
                 result.attrs["trade_date"] = td
+                result.attrs["source"] = "tushare_daily_basic_api"
+                cache.l2.set_snapshot(cache_key, result)
+                logger.info(f"[Tushare] daily_basic 已缓存 {td}: {len(result)} 条")
                 return result
             logger.debug(f"[Tushare] daily_basic {td} 为空，尝试前一日")
 

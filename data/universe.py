@@ -63,8 +63,12 @@ def _load_via_tushare() -> pd.DataFrame:
 
         # daily_basic 使用最近一个可用交易日；如果当日非交易日/未收盘，Tushare 可能返回空，不阻断股票池。
         basic = fetcher.get_daily_basic()
+        daily_basic_source = "none"
+        daily_basic_date = None
         if basic is not None and not basic.empty:
             basic = basic.copy()
+            daily_basic_source = str(basic.attrs.get("source", "tushare_daily_basic"))
+            daily_basic_date = basic.attrs.get("trade_date")
             basic["symbol"] = basic["ts_code"].astype(str).str.slice(0, 6)
             rename = {
                 "turnover_rate": "turnover",
@@ -88,15 +92,7 @@ def _load_via_tushare() -> pd.DataFrame:
             from data.fetchers.tencent_fetcher import TencentFetcher
             tf = TencentFetcher()
             symbols = base["symbol"].tolist()
-            all_quotes = []
-            batch_size = 60
-            for i in range(0, len(symbols), batch_size):
-                batch = symbols[i:i + batch_size]
-                rt = tf.get_realtime_quotes(batch)
-                if rt is not None and not rt.empty:
-                    all_quotes.append(rt)
-                if i // batch_size % 10 == 0 and i > 0:
-                    logger.info(f"[Universe] 腾讯行情补充进度 {i}/{len(symbols)}")
+            all_quotes = _fetch_tencent_quotes_for_symbols(tf, symbols, label="Tushare主表")
             if all_quotes:
                 quotes = pd.concat(all_quotes, ignore_index=True).drop_duplicates(subset=["symbol"])
                 quotes["symbol"] = quotes["symbol"].astype(str).str.zfill(6)
@@ -131,6 +127,12 @@ def _load_via_tushare() -> pd.DataFrame:
             "turnover", "pe_ttm", "pb", "total_mv", "float_mv", "list_date",
         ]
         out = base[[c for c in keep if c in base.columns]].copy()
+        out.attrs["source_meta"] = {
+            "primary_source": "tushare_stock_basic",
+            "daily_basic_source": daily_basic_source,
+            "daily_basic_date": daily_basic_date,
+            "quote_source": "tencent_realtime",
+        }
         logger.success(f"[Universe] Tushare 股票池加载成功: {len(out)} 只")
         return out
     except Exception as e:
@@ -179,6 +181,10 @@ def _load_spot_em_akshare() -> pd.DataFrame:
             keep = [c for c in rename.values() if c in df.columns]
             df = df[keep].copy()
             df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+            df.attrs["source_meta"] = {
+                "primary_source": "akshare_eastmoney_spot",
+                "quote_source": "akshare_eastmoney_spot",
+            }
             logger.success(f"[Universe] 东财快照加载成功: {len(df)} 只")
             return df
     except Exception as e:
@@ -186,6 +192,25 @@ def _load_spot_em_akshare() -> pd.DataFrame:
 
     # ── 降级: 用 AKShare 拿代码列表 + 腾讯批量行情补数据 ──
     return _load_via_tencent()
+
+
+def _fetch_tencent_quotes_for_symbols(tf, symbols: List[str], label: str = "") -> List[pd.DataFrame]:
+    """批量补腾讯实时行情，统一进度日志与异常隔离。"""
+    all_quotes: List[pd.DataFrame] = []
+    batch_size = 60
+    total = len(symbols)
+    for i in range(0, total, batch_size):
+        batch = symbols[i:i + batch_size]
+        try:
+            rt = tf.get_realtime_quotes(batch)
+            if rt is not None and not rt.empty:
+                all_quotes.append(rt)
+        except Exception as e:
+            logger.debug(f"[Universe] 腾讯行情补充失败 batch={i}: {e}")
+        if i > 0 and (i // batch_size) % 10 == 0:
+            prefix = f"{label} " if label else ""
+            logger.info(f"[Universe] {prefix}腾讯行情补充进度 {min(i, total)}/{total}")
+    return all_quotes
 
 
 def _load_via_tencent() -> pd.DataFrame:
@@ -249,6 +274,10 @@ def _load_via_tencent() -> pd.DataFrame:
         on="symbol", how="left", suffixes=("", "_q"),
     )
     logger.success(f"[Universe] 腾讯降级路径完成: {len(merged)} 只 (其中 {quotes.shape[0]} 只有行情)")
+    merged.attrs["source_meta"] = {
+        "primary_source": "akshare_code_name",
+        "quote_source": "tencent_realtime",
+    }
     return merged
 
 
@@ -467,6 +496,7 @@ class Universe:
 
         # 1. 主表
         df = _load_spot_em()
+        source_meta = dict(df.attrs.get("source_meta", {}))
         if df.empty:
             logger.error("[Universe] 主表为空, 无法构建股票池")
             return df
@@ -503,6 +533,7 @@ class Universe:
         )
         result = f.df.reset_index(drop=True)
         result.attrs["filter_report"] = report
+        result.attrs["source_meta"] = source_meta
         return result
 
     @classmethod

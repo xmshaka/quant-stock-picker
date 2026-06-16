@@ -266,7 +266,7 @@ class DataLoader:
         factor_df, price_df, names = loader.load(n_stocks=100, n_days=60)
 
         # 或指定多个源
-        loader = DataLoader(sources=["tencent", "tushare", "akshare", "mock"])
+        loader = DataLoader(sources=["tencent", "tushare", "akshare", "baostock", "mock"])
     """
 
     def __init__(self, sources: Optional[List[str]] = None, preferred: Optional[str] = None, include_symbols: Optional[List[str]] = None):
@@ -278,16 +278,17 @@ class DataLoader:
         """
         if preferred:
             chain = {
-                "tencent": ["tencent", "tushare", "akshare", "mock"],
-                "akshare": ["akshare", "tushare", "tencent", "mock"],
-                "tushare": ["tushare", "tencent", "akshare", "mock"],
+                "tencent": ["tencent", "tushare", "akshare", "baostock", "mock"],
+                "akshare": ["akshare", "tushare", "tencent", "baostock", "mock"],
+                "tushare": ["tushare", "tencent", "akshare", "baostock", "mock"],
+                "baostock": ["baostock", "tencent", "tushare", "akshare", "mock"],
                 "mock": ["mock"],
             }
             self.sources = chain.get(preferred, [preferred, "mock"])
         elif sources:
             self.sources = sources
         else:
-            self.sources = ["tencent", "tushare", "akshare", "mock"]
+            self.sources = ["tencent", "tushare", "akshare", "baostock", "mock"]
 
         self.include_symbols: List[str] = list(include_symbols) if include_symbols else []
         self._fetchers: Dict[str, Any] = {}
@@ -296,11 +297,11 @@ class DataLoader:
     def _init_fetchers(self):
         """延迟初始化 fetcher"""
         try:
-            from data.fetchers import TencentFetcher, AKShareFetcher, TushareFetcher
+            from data.fetchers import TencentFetcher, AKShareFetcher, TushareFetcher, BaostockFetcher
         except ImportError:
             try:
                 sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
-                from data.fetchers import TencentFetcher, AKShareFetcher, TushareFetcher
+                from data.fetchers import TencentFetcher, AKShareFetcher, TushareFetcher, BaostockFetcher
             except ImportError as e:
                 logger.warning(f"无法导入Fetcher: {e}")
                 return
@@ -315,6 +316,8 @@ class DataLoader:
                     self._fetchers["akshare"] = AKShareFetcher()
                 elif src == "tushare":
                     self._fetchers["tushare"] = TushareFetcher()
+                elif src == "baostock":
+                    self._fetchers["baostock"] = BaostockFetcher()
             except Exception as e:
                 logger.warning(f"初始化 {src} 失败: {e}")
 
@@ -337,6 +340,8 @@ class DataLoader:
                 return self._load_from_akshare(fetcher, n_stocks, n_days)
             elif source == "tushare":
                 return self._load_from_tushare(fetcher, n_stocks, n_days)
+            elif source == "baostock":
+                return self._load_from_baostock(fetcher, n_stocks, n_days)
         except Exception as e:
             logger.warning(f"[DataLoader] {source} 获取失败: {e}")
             return None
@@ -639,6 +644,48 @@ class DataLoader:
         factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
         return factor_df, price_df, factor_names
 
+    def _load_from_baostock(self, fetcher, n_stocks: int, n_days: int) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+        """从 Baostock 加载日线。Baostock 只作为免费兜底源，不提供实时估值因子。"""
+        stock_list = fetcher.get_stock_list()
+        if stock_list.empty or len(stock_list) < 10:
+            raise ValueError("Baostock返回股票列表为空或过少")
+
+        symbols = stock_list["symbol"].head(n_stocks).tolist()
+        if self.include_symbols:
+            extra = [s for s in self.include_symbols if s in stock_list["symbol"].values]
+            base = [s for s in symbols if s not in extra]
+            symbols = extra + base
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=n_days + 30)
+        start_str = start_date.strftime("%Y%m%d")
+        end_str = end_date.strftime("%Y%m%d")
+
+        all_price = []
+        all_factor = []
+
+        for symbol in symbols:
+            try:
+                df = fetcher.get_daily_bars(symbol, start_date=start_str, end_date=end_str, adjust="qfq")
+                if df is None or df.empty or len(df) < 20:
+                    continue
+
+                all_price.append(df[["symbol", "trade_date", "close"]].copy())
+                df["close_num"] = pd.to_numeric(df["close"], errors="coerce")
+                all_factor.extend(self._compute_factors(df, symbol))
+            except Exception:
+                continue
+
+        if not all_price:
+            raise ValueError("Baostock数据源未获取到任何价格数据")
+
+        price_df = pd.concat(all_price, ignore_index=True)
+        factor_df = pd.DataFrame(all_factor)
+        factor_df = factor_df.dropna(subset=["momentum_20d", "reversal"])
+
+        factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
+        return factor_df, price_df, factor_names
+
     def load(self, n_stocks: int = 100, n_days: int = 60,
              use_cache: bool = True, cache_ttl_hours: int = 6,
              include_symbols: Optional[List[str]] = None
@@ -714,7 +761,7 @@ def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs)
     """统一数据加载接口 (兼容旧版)
 
     Args:
-        data_source: "mock" | "real" | "tencent" | "akshare" | "tushare"
+        data_source: "mock" | "real" | "tencent" | "akshare" | "tushare" | "baostock"
         prefer_snapshot: True 时，若当日全池快照存在则优先读取（秒开）
     """
     # ── 优先读取每日全池因子快照 ──
@@ -753,7 +800,7 @@ def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs)
     if data_source == "mock":
         factor_df, price_df, factor_names = generate_mock_data(**kwargs)
     else:
-        preferred = data_source if data_source in ("tencent", "akshare", "tushare") else "tencent"
+        preferred = data_source if data_source in ("tencent", "akshare", "tushare", "baostock") else "tencent"
         loader = DataLoader(preferred=preferred)
         factor_df, price_df, factor_names = loader.load(**kwargs)
 

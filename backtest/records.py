@@ -309,6 +309,13 @@ def persist_backtest_run(
         "sell_count": getattr(result, "sell_count", 0),
         "final_value": getattr(result, "final_value", 0.0),
         "consistency": validate_backtest_consistency(result),
+        # 数据源信息
+        # 数据源信息
+        "data_source": getattr(result, "data_source", ""),
+        "data_adjust": getattr(result, "data_adjust", "raw"),
+        "data_version": getattr(result, "data_version", ""),
+        # 运行标识
+        "run_id": getattr(result, "run_id", config.run_id),
     }
     (run_dir / "metrics.json").write_text(_json(metrics), encoding="utf-8")
 
@@ -384,10 +391,16 @@ def list_backtest_runs(root: Path = BACKTEST_RUN_ROOT) -> pd.DataFrame:
             "sell_count": int(metrics.get("sell_count", 0) or 0),
             "final_value": _float(metrics.get("final_value", 0.0)),
             "consistency_ok": bool(consistency.get("ok", False)),
+            # 数据源信息
+            "data_source": metrics.get("data_source", ""),
+            "data_adjust": metrics.get("data_adjust", "raw"),
+            "data_version": metrics.get("data_version", ""),
             "created_at": created_at,
             "path": str(run_dir),
         })
-    return pd.DataFrame(rows, columns=RUN_LIST_COLUMNS)
+    # 扩展列名
+    all_columns = RUN_LIST_COLUMNS + ["data_source", "data_adjust", "data_version"]
+    return pd.DataFrame(rows, columns=all_columns)
 
 
 def load_backtest_run(run_id: str, root: Path = BACKTEST_RUN_ROOT) -> Dict[str, Any]:

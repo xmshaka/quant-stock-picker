@@ -62,6 +62,35 @@ def test_snapshot_helpers_roundtrip(tmp_path, monkeypatch):
     assert loaded_meta["factor_names"] == ["momentum_20d", "rsi_14"]
 
 
+def test_latest_data_source_meta_reads_snapshot_meta(tmp_path, monkeypatch):
+    """状态页应能从快照 meta 暴露真实数据来源。"""
+    from data import daily_factors as df_mod
+
+    monkeypatch.setattr(df_mod, "DAILY_FACTOR_DIR", tmp_path)
+    date_str = "20260612"
+    pd.DataFrame({"symbol": ["000001"], "trade_date": ["2026-06-12"]}).to_parquet(
+        tmp_path / f"factors_{date_str}.parquet"
+    )
+    meta = {
+        "date": date_str,
+        "data_source": "daily_factor_snapshot",
+        "universe_source": "tushare_stock_basic",
+        "quote_source": "tencent_realtime",
+        "daily_basic_source": "tushare_daily_basic_cache",
+        "daily_basic_date": "20260612",
+        "computed_at": "2026-06-12T16:30:00",
+    }
+    (tmp_path / f"meta_{date_str}.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+    )
+
+    source = df_mod.latest_data_source_meta()
+
+    assert source["snapshot_date"] == date_str
+    assert source["primary_source"] == "tushare_stock_basic"
+    assert source["daily_basic_source"] == "tushare_daily_basic_cache"
+
+
 def test_load_data_prefers_snapshot(tmp_path, monkeypatch):
     """load_data 命中快照时不应调用真实数据源。"""
     from data import daily_factors as df_mod
