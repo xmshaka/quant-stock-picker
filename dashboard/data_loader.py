@@ -95,30 +95,18 @@ NAME_MAP: Dict[str, str] = {}
 # 因子中文名映射
 FACTOR_NAME_MAP = {
     # 技术因子
-    'rsi14': 'RSI14',
-    'macd_hist': 'MACD柱状线',
+    'rsi14': 'RSI(14日)',
     'boll_position': '布林带位置',
     'volatility_20d': '20日波动率',
-    'max_dd_60d': '60日最大回撤',
-    # 情绪因子
-    'north_hold_change': '北向资金20日变化',
-    'margin_change': '融资融券20日变化',
-    'turnover_ratio': '换手率比率',
-    'volume_ratio': '量比',
+    # 市场/规模因子
+    'volume_ratio': '量比(5日/20日)',
+    'high_20d_distance': '20日高点距离',
+    'float_market_cap': '流通市值(对数)',
     # 估值因子
-    'pe_ttm': '市盈率TTM',
     'pb': '市净率',
-    'ep': '盈利收益率',
-    # 质量因子
-    'roe': '净资产收益率',
-    'gross_margin': '毛利率',
-    'revenue_growth': '营收增长率',
-    'profit_growth': '利润增长率',
-    # 动量/流动性
+    # 动量因子
     'momentum_5d': '5日动量',
     'momentum_20d': '20日动量',
-    'momentum_60d': '60日动量',
-    'liquidity': '流动性综合',
     'reversal': '反转因子',
 }
 
@@ -132,7 +120,7 @@ def generate_mock_data(
     seed: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """
-    生成模拟数据用于演示 - 包含多类因子
+    生成模拟数据用于演示 - 短线择时因子集
 
     Returns:
         factor_df: DataFrame [symbol, trade_date, factor1, factor2, ...]
@@ -175,68 +163,35 @@ def generate_mock_data(
             if len(p_window) < 20:
                 continue
 
-            # 技术因子
+            # ── 技术因子 ──
             deltas = np.diff(p_window[-15:])
             gains = np.sum(deltas[deltas > 0]) if len(deltas) > 0 else 0
             losses = abs(np.sum(deltas[deltas < 0])) if len(deltas) > 0 else 1
             rsi = 100 - 100 / (1 + gains / max(losses, 1e-6))
             row['rsi14'] = rsi + np.random.randn() * 2
 
-            if len(p_window) >= 26:
-                ema12 = pd.Series(p_window).ewm(span=12).mean().iloc[-1]
-                ema26 = pd.Series(p_window).ewm(span=26).mean().iloc[-1]
-                dif = ema12 - ema26
-                dea = pd.Series(p_window).ewm(span=9).mean().iloc[-1]
-                row['macd_hist'] = (dif - dea) / prices[i] * 100 + np.random.randn() * 0.5
-            else:
-                row['macd_hist'] = np.random.randn() * 0.5
-
-            if len(p_window) >= 20:
-                ma20 = np.mean(p_window[-20:])
-                std20 = np.std(p_window[-20:])
-                row['boll_position'] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100 + np.random.randn() * 5
-            else:
-                row['boll_position'] = 50 + np.random.randn() * 10
+            ma20 = np.mean(p_window[-20:])
+            std20 = np.std(p_window[-20:])
+            row['boll_position'] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100 + np.random.randn() * 5
 
             rets = np.diff(p_window[-20:]) / p_window[-20:-1]
             row['volatility_20d'] = np.std(rets) * np.sqrt(252) * 100
 
-            if len(p_window) >= 60:
-                peak = np.maximum.accumulate(p_window)
-                dd = (p_window - peak) / peak
-                row['max_dd_60d'] = np.min(dd) * 100
-            else:
-                row['max_dd_60d'] = np.random.uniform(-30, 0)
+            # ── 市场/规模因子 ──
+            hh20 = np.max(p_window[-20:])
+            ll20 = np.min(p_window[-20:])
+            row['high_20d_distance'] = (prices[i] - ll20) / (hh20 - ll20 + 1e-6) * 100
 
-            # 情绪因子
-            row['north_hold_change'] = np.random.randn() * 2
-            row['margin_change'] = np.random.randn() * 1.5
-            row['turnover_ratio'] = np.random.uniform(0.5, 5)
+            row['volume_ratio'] = np.random.uniform(50, 200)
 
-            # 估值因子
-            row['pe_ttm'] = np.random.uniform(10, 80) + np.random.randn() * 5
+            row['float_market_cap'] = np.log(np.random.uniform(2e9, 5e11))
+
+            # ── 估值因子 ──
             row['pb'] = np.random.uniform(0.8, 5) + np.random.randn() * 0.3
-            row['ep'] = 1 / max(row['pe_ttm'], 1) * 100
 
-            # 质量因子
-            row['roe'] = np.random.uniform(5, 25) + np.random.randn() * 2
-            row['gross_margin'] = np.random.uniform(10, 60) + np.random.randn() * 3
-            row['revenue_growth'] = np.random.uniform(-20, 50) + np.random.randn() * 5
-            row['profit_growth'] = np.random.uniform(-30, 60) + np.random.randn() * 8
-
-            # 动量/流动性
+            # ── 动量因子 ──
             row['momentum_5d'] = (prices[i] / prices[max(0, i-5)] - 1) * 100 + np.random.randn() * 0.5 if i >= 5 else np.random.randn() * 2
-            if len(p_window) >= 20:
-                row['momentum_20d'] = (prices[i] / p_window[-20] - 1) * 100
-            else:
-                row['momentum_20d'] = np.random.randn() * 5
-
-            if len(p_window) >= 60:
-                row['momentum_60d'] = (prices[i] / p_window[-60] - 1) * 100
-            else:
-                row['momentum_60d'] = np.random.randn() * 10
-
-            row['liquidity'] = np.random.uniform(0.3, 3)
+            row['momentum_20d'] = (prices[i] / p_window[-20] - 1) * 100 if len(p_window) >= 20 else np.random.randn() * 5
             row['reversal'] = -(prices[i] / prices[max(0, i-5)] - 1) * 100 + np.random.randn() if i >= 5 else np.random.randn() * 2
 
             factor_data.append(row)
@@ -244,11 +199,10 @@ def generate_mock_data(
     factor_df = pd.DataFrame(factor_data)
 
     factor_names = [
-        'rsi14', 'macd_hist', 'boll_position', 'volatility_20d', 'max_dd_60d',
-        'north_hold_change', 'margin_change', 'turnover_ratio',
-        'pe_ttm', 'pb', 'ep',
-        'roe', 'gross_margin', 'revenue_growth', 'profit_growth',
-        'momentum_5d', 'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'
+        'rsi14', 'boll_position', 'volatility_20d',
+        'volume_ratio', 'high_20d_distance', 'float_market_cap',
+        'pb',
+        'momentum_5d', 'momentum_20d', 'reversal',
     ]
     factor_names = [f for f in factor_names if f in factor_df.columns]
 
@@ -372,7 +326,6 @@ class DataLoader:
                 "trade_date": row["trade_date"],
                 "momentum_5d": (prices[i] / prices[max(0, i-5)] - 1) * 100,
                 "momentum_20d": (prices[i] / prices[max(0, i-20)] - 1) * 100,
-                "momentum_60d": (prices[i] / prices[max(0, i-60)] - 1) * 100 if len(p_window) >= 60 else np.nan,
                 "reversal": -(prices[i] / prices[max(0, i-5)] - 1) * 100,
                 "volatility_20d": np.std(np.diff(p_window[-20:]) / p_window[-20:-1]) * np.sqrt(252) * 100 if len(p_window) >= 20 else np.nan,
             }
@@ -383,41 +336,30 @@ class DataLoader:
             losses = abs(np.sum(deltas[deltas < 0]))
             frow["rsi14"] = 100 - 100 / (1 + gains / max(losses, 1e-6))
 
-            # 60日最大回撤
-            if len(p_window) >= 60:
-                peak = np.maximum.accumulate(p_window)
-                dd = (p_window - peak) / peak
-                frow["max_dd_60d"] = np.min(dd) * 100
-
             # 布林带
             ma20 = np.mean(p_window[-20:])
             std20 = np.std(p_window[-20:])
             frow["boll_position"] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100
 
-            # ── 估值因子 (从 extra 传入) ──
+            # 20日最高价距离（用收盘价逼近）
+            hh20 = np.max(p_window[-20:])
+            ll20 = np.min(p_window[-20:])
+            frow["high_20d_distance"] = (prices[i] - ll20) / (hh20 - ll20 + 1e-6) * 100
+
+            # 量比 = 5日均量 / 20日均量
+            if len(v_window) >= 20 and np.mean(v_window[-20:]) > 0:
+                frow["volume_ratio"] = np.mean(v_window[-5:]) / np.mean(v_window[-20:]) * 100
+
+            # PB (从 extra 传入)
             if extra:
-                pe = extra.get("pe_ttm")
                 pb = extra.get("pb")
-                if pe is not None and pe > 0:
-                    frow["pe_ttm"] = pe
-                    frow["ep"] = 1.0 / pe  # 盈利收益率
                 if pb is not None and pb > 0:
                     frow["pb"] = pb
 
-            # ── 情绪因子 (从价格和成交量计算) ──
-            # 换手率比率 (近5日平均 / 近20日平均)
-            if len(v_window) >= 20 and volumes[i] > 0:
-                avg_vol_5 = np.mean(volumes[max(0, i-4):i+1])
-                avg_vol_20 = np.mean(volumes[max(0, i-19):i+1])
-                if avg_vol_20 > 0:
-                    frow["turnover_ratio"] = avg_vol_5 / avg_vol_20
-
-            # 量比 (从 extra 传入的实时量比)
-            if extra and "volume_ratio" in extra and extra["volume_ratio"] is not None:
-                frow["volume_ratio"] = extra["volume_ratio"]
-
-            # 北向资金变化 / 融资融券变化: 腾讯API无此数据
-            # 如后续接入akshare北向数据，可在这里补充
+                # 流通市值 (对数)
+                float_mv = extra.get("float_mv")
+                if float_mv is not None and float_mv > 0:
+                    frow["float_market_cap"] = np.log(max(float_mv, 2e9))
 
             all_factor.append(frow)
 
@@ -452,10 +394,9 @@ class DataLoader:
                 sym = row.get("symbol", "")
                 if sym:
                     extra_map[sym] = {
-                        "pe_ttm": row.get("pe_ttm"),
                         "pb": row.get("pb"),
                         "turnover": row.get("turnover"),
-                        "volume_ratio": row.get("volume_ratio"),
+                        "float_mv": row.get("float_mv"),
                     }
 
         for symbol in symbols:

@@ -176,30 +176,4 @@ class Volatility20D(Factor):
                           direction=self.direction, group=self.group)
 
 
-@FactorRegistry.register
-class MaxDrawdown60D(Factor):
-    """60日最大回撤 - 反向因子
 
-    公式来源: 经典风险度量
-    回撤 = (当前价 - 60日内最高价) / 60日内最高价
-    越低（回撤越小）越好
-    """
-    name = "max_drawdown_60d"
-    group = "technical"
-    direction = -1
-
-    def calculate(self, df: pd.DataFrame) -> FactorResult:
-        df = df.sort_values(["symbol", "trade_date"])
-
-        def calc_dd(group):
-            if len(group) < 60:
-                return np.nan
-            close = group.tail(60).values
-            peak = np.maximum.accumulate(close)
-            dd = (close[-1] - peak[-1]) / peak[-1]
-            return dd
-
-        dd = df.groupby("symbol")["close"].apply(calc_dd)
-        dd = winsorize(dd, 0.01, 0.99).clip(-1, 0)
-        return FactorResult(name=self.name, values=dd,
-                          direction=self.direction, group=self.group)

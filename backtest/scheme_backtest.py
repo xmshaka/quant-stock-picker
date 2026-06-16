@@ -26,6 +26,8 @@ import numpy as np
 from loguru import logger
 
 from strategy.schemes import StrategyScheme
+from signals.layers import evaluate_layered
+from market.timing import MarketTimingModel
 from signals.rules import TradePoint, evaluate_all_rules
 from signals.engine import SignalEngine
 from backtest.engine import BacktestEngine, BacktestParams, estimate_turnover_amount, get_liquidity_slippage_rate
@@ -269,6 +271,20 @@ class SchemeBacktester:
         tp_mult = scheme.take_profit_atr_mult if scheme else 3.0
         trail_mult = scheme.trailing_atr_mult if scheme else 2.0
         atr_period = scheme.atr_period if scheme else 14
+        enable_market_timing = scheme.enable_market_timing if scheme else True
+
+        # ── 大盘择时 ──
+        market_timing = None
+        if enable_market_timing:
+            try:
+                start_str = start_date.strftime('%Y%m%d') if hasattr(start_date, 'strftime') else str(start_date).replace('-', '')
+                end_str = end_date.strftime('%Y%m%d') if hasattr(end_date, 'strftime') else str(end_date).replace('-', '')
+                market_timing = MarketTimingModel()
+                market_timing.fetch_all(start_str, end_str)
+                logger.info(f"[MarketTiming] 大盘择时已启用")
+            except Exception as e:
+                logger.warning(f"[MarketTiming] 初始化失败，回退到固定仓位: {e}")
+                market_timing = None
 
         # 拉取 OHLCV
         ohlcv_df = _fetch_ohlcv(symbols, lookback_days)
@@ -339,7 +355,12 @@ class SchemeBacktester:
                         atr_val = np.nan
                 atr_lookup.setdefault(sym, {})[dt] = float(atr_val) if not pd.isna(atr_val) else 0.0
 
-            points = evaluate_all_rules(sym_bars, signal_rules)
+            signal_mode = scheme.signal_mode if scheme else "layered"
+            scheme_type = scheme.scheme_id if scheme else "balanced"
+            if signal_mode == "layered":
+                points = evaluate_layered(sym_bars, strategy_type=scheme_type)
+            else:
+                points = evaluate_all_rules(sym_bars, signal_rules)
             if points:
                 stock_signal_details[sym] = points
 
@@ -486,14 +507,17 @@ class SchemeBacktester:
             max_alloc = total_value * max_single_pct
 
             if is_add:
-                # 加仓：受单股上限约束
+                # 加仓：受单股上限约束，同样受大盘择时调制
                 existing = positions[sym]
                 current_val = existing['shares'] * price
                 remaining = max_alloc - current_val
-                alloc = min(cash * pos_pct_per_entry, remaining)
+                market_mult = market_timing.position_multiplier_on(dt_key) if market_timing else 0.78
+                alloc = min(cash * pos_pct_per_entry * market_mult, remaining)
             else:
                 # 建仓
-                alloc = min(cash * pos_pct_per_entry, max_alloc)
+                # ── 大盘择时仓位调制 ──
+                market_mult = market_timing.position_multiplier_on(dt_key) if market_timing else 0.78
+                alloc = min(cash * pos_pct_per_entry * market_mult, max_alloc)
 
             shares = int(alloc / price / 100) * 100
             if shares <= 0:
@@ -981,7 +1005,11 @@ class SchemeBacktester:
                     if col not in sym_bars.columns:
                         sym_bars[col] = sym_bars['close']
                 sym_bars = _prepare_execution_bars(sym_bars, fallback_source="scheme_backtest")
-                points = evaluate_all_rules(sym_bars, scheme.signal_rules)
+                signal_mode = getattr(scheme, 'signal_mode', 'layered')
+                if signal_mode == "layered":
+                    points = evaluate_layered(sym_bars, strategy_type=scheme.scheme_id)
+                else:
+                    points = evaluate_all_rules(sym_bars, scheme.signal_rules)
                 if points:
                     stock_signal_details[sym] = points
 

@@ -41,7 +41,7 @@ for scheme in schemes:
 
 # ========== 当前方案详情 ==========
 st.divider()
-selected_id = st.session_state.get("selected_scheme", "composite")
+selected_id = st.session_state.get("selected_scheme", "balanced")
 selected = registry.get(selected_id)
 if not selected:
     selected = schemes[0] if schemes else None

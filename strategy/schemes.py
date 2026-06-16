@@ -47,6 +47,10 @@ class StrategyScheme:
     signal_rules: List[SignalRuleConfig]  # 信号规则列表
     regime_fit: List[str]              # 适配行情 ["震荡整理", "强势单边上涨", "*"]
     is_builtin: bool = True            # 是否内置
+    # ── 信号引擎 ──
+    signal_mode: str = "layered"       # "layered" 三层过滤 | "legacy" 旧规则
+    # ── 大盘择时 ──
+    enable_market_timing: bool = True   # 是否启用大盘择时仓位调制
     # ── 资金管理 ──
     max_add_times: int = 2             # 最大加仓次数（0=不加仓，仅建仓）
     position_pct_per_entry: float = 0.30  # 每次建仓/加仓占可用资金比例
@@ -66,6 +70,8 @@ class StrategyScheme:
             "signal_rules": [r.to_dict() for r in self.signal_rules],
             "regime_fit": self.regime_fit,
             "is_builtin": self.is_builtin,
+            "signal_mode": self.signal_mode,
+            "enable_market_timing": self.enable_market_timing,
             "max_add_times": self.max_add_times,
             "position_pct_per_entry": self.position_pct_per_entry,
             "max_single_pct": self.max_single_pct,
@@ -85,6 +91,8 @@ class StrategyScheme:
             signal_rules=[SignalRuleConfig.from_dict(r) for r in d.get("signal_rules", [])],
             regime_fit=d.get("regime_fit", ["*"]),
             is_builtin=d.get("is_builtin", False),
+            signal_mode=d.get("signal_mode", "layered"),
+            enable_market_timing=d.get("enable_market_timing", True),
             max_add_times=d.get("max_add_times", 2),
             position_pct_per_entry=d.get("position_pct_per_entry", 0.30),
             max_single_pct=d.get("max_single_pct", 0.30),
@@ -107,37 +115,12 @@ def _register(scheme: StrategyScheme):
 
 
 _register(StrategyScheme(
-    scheme_id="reversal",
-    name="反转优选",
-    description="适合震荡市。低RSI + 高反转 + 低波动，捕捉超跌反弹。",
+    scheme_id="trend_momentum",
+    name="强势追涨",
+    description="适合强势上涨市。高动量 + 高量比 + 布林上轨，顺势追涨。",
     factor_weights={
-        'rsi14': -0.3, 'macd_hist': 0.15, 'boll_position': 0.1,
-        'volatility_20d': -0.2, 'max_dd_60d': -0.15,
-        'north_hold_change': 0.2, 'turnover_ratio': 0.1, 'volume_ratio': 0.1,
-        'pe_ttm': -0.15, 'pb': -0.1, 'ep': 0.1,
-        'roe': 0.15, 'gross_margin': 0.1, 'revenue_growth': 0.1, 'profit_growth': 0.1,
-        'momentum_5d': -0.25, 'momentum_20d': -0.15, 'momentum_60d': 0.0,
-        'liquidity': 0.1, 'reversal': 0.4,
-    },
-    signal_rules=[
-        SignalRuleConfig(RuleType.RSI_REVERSAL, {"oversold": 30, "overbought": 70}),
-        SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
-    ],
-    regime_fit=["震荡整理"],
-))
-
-_register(StrategyScheme(
-    scheme_id="momentum",
-    name="趋势动量",
-    description="适合强势上涨市。高动量 + 放量 + MACD金叉，顺势追涨。",
-    factor_weights={
-        'rsi14': 0.15, 'macd_hist': 0.25, 'boll_position': 0.1,
-        'volatility_20d': -0.05, 'max_dd_60d': -0.05,
-        'north_hold_change': 0.3, 'turnover_ratio': 0.15, 'volume_ratio': 0.2,
-        'pe_ttm': -0.05, 'pb': -0.05, 'ep': 0.1,
-        'roe': 0.15, 'gross_margin': 0.1, 'revenue_growth': 0.15, 'profit_growth': 0.15,
-        'momentum_5d': 0.2, 'momentum_20d': 0.35, 'momentum_60d': 0.2,
-        'liquidity': 0.15, 'reversal': -0.1,
+        'momentum_20d': 0.30, 'momentum_5d': 0.20, 'volume_ratio': 0.20,
+        'boll_position': 0.10, 'high_20d_distance': 0.10, 'rsi14': 0.10,
     },
     signal_rules=[
         SignalRuleConfig(RuleType.MA_CROSS, {"short": 5, "long": 20}),
@@ -147,37 +130,44 @@ _register(StrategyScheme(
 ))
 
 _register(StrategyScheme(
-    scheme_id="value",
-    name="低波价值",
-    description="适合弱势/防御。低估值 + 高ROE + 低波动，安全边际优先。",
+    scheme_id="pullback",
+    name="回调低吸",
+    description="适合上升趋势中的回调。高反转 + 低RSI + 远离高点，低吸买入。",
     factor_weights={
-        'rsi14': -0.1, 'macd_hist': 0.05, 'boll_position': 0.05,
-        'volatility_20d': -0.25, 'max_dd_60d': -0.2,
-        'north_hold_change': 0.15, 'turnover_ratio': -0.05, 'volume_ratio': -0.05,
-        'pe_ttm': -0.3, 'pb': -0.25, 'ep': 0.2,
-        'roe': 0.3, 'gross_margin': 0.25, 'revenue_growth': 0.1, 'profit_growth': 0.1,
-        'momentum_5d': -0.05, 'momentum_20d': -0.05, 'momentum_60d': 0.0,
-        'liquidity': 0.05, 'reversal': 0.15,
+        'reversal': 0.30, 'rsi14': -0.20, 'high_20d_distance': -0.20,
+        'volume_ratio': -0.15, 'volatility_20d': -0.15,
     },
     signal_rules=[
+        SignalRuleConfig(RuleType.RSI_REVERSAL, {"oversold": 25, "overbought": 75}),
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
-        SignalRuleConfig(RuleType.VOLUME_BREAKOUT, {"volume_mult": 1.5, "lookback": 20}),
     ],
-    regime_fit=["弱势单边下跌", "震荡整理"],
+    regime_fit=["震荡整理", "弱势单边下跌"],
 ))
 
 _register(StrategyScheme(
-    scheme_id="composite",
-    name="均衡复合",
+    scheme_id="breakout",
+    name="横盘突破",
+    description="适合横盘整理后的突破。布林收窄 + 放量突破 + 短期强势。",
+    factor_weights={
+        'boll_position': 0.30, 'volume_ratio': 0.25, 'momentum_5d': 0.20,
+        'high_20d_distance': 0.15, 'momentum_20d': 0.10,
+    },
+    signal_rules=[
+        SignalRuleConfig(RuleType.VOLUME_BREAKOUT, {"volume_mult": 1.5, "lookback": 20}),
+        SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
+    ],
+    regime_fit=["震荡整理", "强势单边上涨"],
+))
+
+_register(StrategyScheme(
+    scheme_id="balanced",
+    name="均衡择时",
     description="全行情适配。各因子均衡配置，不押注单一风格。",
     factor_weights={
-        'rsi14': -0.1, 'macd_hist': 0.2, 'boll_position': 0.1,
-        'volatility_20d': -0.1, 'max_dd_60d': -0.1,
-        'north_hold_change': 0.4, 'turnover_ratio': 0.15, 'volume_ratio': 0.15,
-        'pe_ttm': -0.2, 'pb': -0.1, 'ep': 0.1,
-        'roe': 0.3, 'gross_margin': 0.2, 'revenue_growth': 0.2, 'profit_growth': 0.2,
-        'momentum_5d': -0.15, 'momentum_20d': -0.1, 'momentum_60d': 0.0,
-        'liquidity': 0.1, 'reversal': 0.3,
+        'momentum_20d': 0.10, 'momentum_5d': 0.10, 'reversal': 0.10,
+        'rsi14': 0.10, 'boll_position': 0.10, 'volatility_20d': 0.10,
+        'volume_ratio': 0.10, 'high_20d_distance': 0.10,
+        'float_market_cap': 0.10, 'pb': 0.10,
     },
     signal_rules=[
         SignalRuleConfig(RuleType.RSI_REVERSAL, {"oversold": 30, "overbought": 70}),
@@ -186,3 +176,4 @@ _register(StrategyScheme(
     ],
     regime_fit=["*"],
 ))
+

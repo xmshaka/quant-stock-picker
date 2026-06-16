@@ -127,6 +127,16 @@ if st.button("▶ 运行回测", type="primary", width="stretch"):
     status_text.caption("✅ 回测完成")
     st.session_state.bt_result = result
     st.session_state.bt_result_signature = current_context_signature
+    # ── 大盘择时数据 ──
+    try:
+        from market.timing import MarketTimingModel
+        mt = MarketTimingModel()
+        s = result.start_date.strftime('%Y%m%d') if hasattr(result.start_date, 'strftime') else str(result.start_date).replace('-', '')
+        e = result.end_date.strftime('%Y%m%d') if hasattr(result.end_date, 'strftime') else str(result.end_date).replace('-', '')
+        mt.fetch_all(s, e)
+        st.session_state.bt_market_scores = mt.to_dataframe()
+    except Exception:
+        st.session_state.bt_market_scores = None
     # FIX: 股票池/参数已发生新回测时，旧“方案对比”结果不再可信，必须清空。
     st.session_state.pop("bt_compare", None)
     st.session_state.pop("bt_compare_signature", None)
@@ -199,6 +209,36 @@ if "bt_result" in st.session_state:
         section_header("权益曲线")
         fig_eq = plot_equity_curve(result.equity_curve, title=f"{result.scheme_name} 权益曲线")
         st.plotly_chart(fig_eq, width="stretch")
+
+    # 大盘择时评分
+    if st.session_state.get("bt_market_scores"):
+        with st.expander("📊 大盘择时评分", expanded=False):
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            scores_df = st.session_state["bt_market_scores"]
+            fig_mt = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                row_heights=[0.6, 0.4],
+                vertical_spacing=0.08,
+                subplot_titles=("市场评分", "仓位档位"),
+            )
+            fig_mt.add_trace(go.Scatter(
+                x=scores_df['date'], y=scores_df['score'],
+                mode='lines', name='市场评分',
+                line=dict(color='#FF6B35', width=2),
+            ), row=1, col=1)
+            fig_mt.add_hline(y=80, line_dash="dash", line_color="green", row=1, col=1)
+            fig_mt.add_hline(y=60, line_dash="dash", line_color="gray", row=1, col=1)
+            fig_mt.add_hline(y=40, line_dash="dash", line_color="gray", row=1, col=1)
+            fig_mt.add_hline(y=20, line_dash="dash", line_color="red", row=1, col=1)
+            fig_mt.add_trace(go.Bar(
+                x=scores_df['date'], y=scores_df['position_pct'],
+                name='仓位', marker_color='#2196F3',
+            ), row=2, col=1)
+            fig_mt.update_yaxes(title_text="评分 (0-100)", row=1, col=1, range=[0, 100])
+            fig_mt.update_yaxes(title_text="仓位%", row=2, col=1, range=[0, 1], tickformat=".0%")
+            fig_mt.update_layout(height=400, hovermode="x unified", showlegend=False)
+            st.plotly_chart(fig_mt, width="stretch")
 
     # P1: 流动性分层滑点审计
     if result.trade_details:

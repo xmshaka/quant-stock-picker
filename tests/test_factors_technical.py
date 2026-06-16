@@ -5,7 +5,7 @@ import numpy as np
 
 from factors.technical import (
     RSI14, MACD_Hist, BollingerPosition, BollingerWidth,
-    Volatility20D, MaxDrawdown60D
+    Volatility20D, 
 )
 
 
@@ -162,41 +162,3 @@ class TestVolatility20D:
         assert result.values["A"] == pytest.approx(0.0, abs=1e-6)
 
 
-class TestMaxDrawdown60D:
-    """测试60日最大回撤因子"""
-
-    def test_drawdown_calculation(self, sample_bars_30d):
-        factor = MaxDrawdown60D()
-        result = factor.calculate(sample_bars_30d)
-
-        assert result.name == "max_drawdown_60d"
-        assert result.direction == -1
-
-        # 30天数据不够60天
-        assert result.values.isna().all()
-
-    def test_drawdown_with_enough_data(self):
-        # 构造70天数据，先涨后跌
-        close = list(range(10, 80)) + list(range(80, 50, -1))
-        df = pd.DataFrame({
-            "symbol": ["A"] * len(close),
-            "trade_date": pd.date_range("2025-01-01", periods=len(close)),
-            "close": close,
-        })
-        factor = MaxDrawdown60D()
-        result = factor.calculate(df)
-
-        # 回撤应为负值（当前价低于历史高点）
-        assert result.values["A"] < 0
-
-    def test_drawdown_at_peak(self):
-        # 价格一直涨，回撤为0
-        close = list(range(10, 90))
-        df = pd.DataFrame({
-            "symbol": ["A"] * len(close),
-            "trade_date": pd.date_range("2025-01-01", periods=len(close)),
-            "close": close,
-        })
-        factor = MaxDrawdown60D()
-        result = factor.calculate(df)
-        assert result.values["A"] == pytest.approx(0.0, abs=1e-6)
