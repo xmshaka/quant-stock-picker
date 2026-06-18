@@ -690,7 +690,7 @@ CROSSHAIR_JS = r"""
         // ── 成交量子图数据框 ──
         var volBox = document.createElement('div');
         volBox.style.cssText =
-            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'position:absolute;left:50%;transform:translate(-50%,-50%);' +
             'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
             'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
             'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
@@ -699,7 +699,7 @@ CROSSHAIR_JS = r"""
         // ── KDJ 子图数据框 ──
         var kdjBox = document.createElement('div');
         kdjBox.style.cssText =
-            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'position:absolute;left:50%;transform:translate(-50%,-50%);' +
             'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
             'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
             'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
@@ -708,7 +708,7 @@ CROSSHAIR_JS = r"""
         // ── MACD 子图数据框 ──
         var macdBox = document.createElement('div');
         macdBox.style.cssText =
-            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'position:absolute;left:50%;transform:translate(-50%,-50%);' +
             'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
             'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
             'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
@@ -843,18 +843,18 @@ CROSSHAIR_JS = r"""
                     ' <span style="color:#8a7f6d;font-size:10px;">' + (sellInfo.reason || '') + '</span>';
             }
 
-            // 成交量框（yaxis2 顶部）
+            // 成交量框（以子图边界为中心，translateY(-50%) 避免遮挡）
             if (fullLayout.yaxis2 && typeof fullLayout.yaxis2._offset === 'number') {
-                volBox.style.top = (fullLayout.yaxis2._offset + 2) + 'px';
+                volBox.style.top = fullLayout.yaxis2._offset + 'px';
                 if (volY != null) {
                     volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手';
                     volBox.style.display = 'block';
                 }
             }
 
-            // KDJ 框（yaxis3 顶部）
+            // KDJ 框（以子图边界为中心）
             if (fullLayout.yaxis3 && typeof fullLayout.yaxis3._offset === 'number') {
-                kdjBox.style.top = (fullLayout.yaxis3._offset + 2) + 'px';
+                kdjBox.style.top = fullLayout.yaxis3._offset + 'px';
                 if (kY != null || dY != null || jY != null) {
                     kdjBox.innerHTML =
                         '<span style="color:#f0b90b;">K ' + fmtNum(kY, 2) + '</span>' +
@@ -864,9 +864,9 @@ CROSSHAIR_JS = r"""
                 }
             }
 
-            // MACD 框（yaxis4 顶部）
+            // MACD 框（以子图边界为中心）
             if (fullLayout.yaxis4 && typeof fullLayout.yaxis4._offset === 'number') {
-                macdBox.style.top = (fullLayout.yaxis4._offset + 2) + 'px';
+                macdBox.style.top = fullLayout.yaxis4._offset + 'px';
                 if (difY != null || deaY != null || macdY != null) {
                     var histColor = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a';
                     macdBox.innerHTML =
@@ -934,7 +934,7 @@ _CROSSHAIR_INJECT = r"""
 
         function makeBox() {
             var b = D.createElement('div');
-            b.style.cssText = 'position:absolute;left:50%;transform:translateX(-50%);background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+            b.style.cssText = 'position:absolute;left:50%;transform:translate(-50%,-50%);background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
             gd.appendChild(b); return b;
         }
 
@@ -1030,9 +1030,10 @@ _CROSSHAIR_INJECT = r"""
                 dataBox.style.display = 'block';
             }
 
-            if (fl.yaxis2 && typeof fl.yaxis2._offset === 'number') { volBox.style.top = (fl.yaxis2._offset + 2) + 'px'; if (volY != null) { volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手'; volBox.style.display = 'block'; } }
-            if (fl.yaxis3 && typeof fl.yaxis3._offset === 'number') { kdjBox.style.top = (fl.yaxis3._offset + 2) + 'px'; if (kY != null || dY != null || jY != null) { kdjBox.innerHTML = '<span style="color:#f0b90b;">K ' + fmtNum(kY,2) + '</span>&nbsp; <span style="color:#1e88e5;">D ' + fmtNum(dY,2) + '</span>&nbsp; <span style="color:#ab47bc;">J ' + fmtNum(jY,2) + '</span>'; kdjBox.style.display = 'block'; } }
-            if (fl.yaxis4 && typeof fl.yaxis4._offset === 'number') { macdBox.style.top = (fl.yaxis4._offset + 2) + 'px'; if (difY != null || deaY != null || macdY != null) { var hc = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a'; macdBox.innerHTML = '<span style="color:#5f5648;">DIF ' + fmtNum(difY,4) + '</span>&nbsp; <span style="color:#1e88e5;">DEA ' + fmtNum(deaY,4) + '</span>&nbsp; <span style="color:' + hc + ';">MACD ' + fmtNum(macdY,4) + '</span>'; macdBox.style.display = 'block'; } }
+            // 副图数据框以子图边界为中心（translateY(-50%)），不遮挡线条和坐标轴
+            if (fl.yaxis2 && typeof fl.yaxis2._offset === 'number') { volBox.style.top = fl.yaxis2._offset + 'px'; if (volY != null) { volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手'; volBox.style.display = 'block'; } }
+            if (fl.yaxis3 && typeof fl.yaxis3._offset === 'number') { kdjBox.style.top = fl.yaxis3._offset + 'px'; if (kY != null || dY != null || jY != null) { kdjBox.innerHTML = '<span style="color:#f0b90b;">K ' + fmtNum(kY,2) + '</span>&nbsp; <span style="color:#1e88e5;">D ' + fmtNum(dY,2) + '</span>&nbsp; <span style="color:#ab47bc;">J ' + fmtNum(jY,2) + '</span>'; kdjBox.style.display = 'block'; } }
+            if (fl.yaxis4 && typeof fl.yaxis4._offset === 'number') { macdBox.style.top = fl.yaxis4._offset + 'px'; if (difY != null || deaY != null || macdY != null) { var hc = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a'; macdBox.innerHTML = '<span style="color:#5f5648;">DIF ' + fmtNum(difY,4) + '</span>&nbsp; <span style="color:#1e88e5;">DEA ' + fmtNum(deaY,4) + '</span>&nbsp; <span style="color:' + hc + ';">MACD ' + fmtNum(macdY,4) + '</span>'; macdBox.style.display = 'block'; } }
         }
 
         function onUnhover() {
