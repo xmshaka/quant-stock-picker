@@ -186,16 +186,15 @@ def plot_kline_with_signals(
     date_range_ms = (bars['trade_date'].iloc[-1] - bars['trade_date'].iloc[0]).total_seconds() * 1000 if n_bars > 1 else 86_400_000
     bar_width_ms = max(43_200_000, min(86_400_000, date_range_ms / max(n_bars, 1) * 0.75))
 
-    # K线 hover 锚点：lines+markers 双重覆盖，消灭周末 gap 盲区。
-    # alpha=0.005 肉眼不可见但非零，避免 Plotly 优化跳过 hover 命中。
-    # JS 通过日期匹配（而非 pointIndex）定位数据，确保 gap 区域命中最近交易日。
+    # K线 hover 锚点：mode='markers' + hoverdistance=-1。
+    # 超大透明散点（size=80）确保周末 gap 也能命中最近的数据点。
+    # pointIndex 在 markers 模式下可靠（无线插值），JS 直接用。
     # 原生 TIP 通过透明 hoverlabel + hovermode='x' 设为不可见。
     fig.add_trace(go.Scatter(
         x=bars['trade_date'],
         y=c,
-        mode='lines+markers',
-        line=dict(color='rgba(0,0,0,0.005)', width=3),
-        marker=dict(size=30, color='rgba(0,0,0,0.005)', line=dict(width=0)),
+        mode='markers',
+        marker=dict(size=80, color='rgba(0,0,0,0)', line=dict(width=0)),
         name='K线',
         showlegend=False,
         customdata=hover_cd,
@@ -204,11 +203,10 @@ def plot_kline_with_signals(
     ), row=1, col=1)
 
     # K线蜡烛图：go.Candlestick 替代 go.Bar，原生日期轴定位，天然处理周末 gap
-    # go.Bar 在 shared_xaxes 下定位有根本性缺陷，即使 type='date' 也可能在 gap 附近错位
     fig.add_trace(go.Candlestick(
         x=bars['trade_date'],
         open=o, high=h, low=l, close=c,
-        name='K线',
+        name='K线蜡烛',
         showlegend=False,
         increasing=dict(line=dict(color=KC['up'], width=1),
                          fillcolor=KC['up']),
@@ -937,104 +935,95 @@ _CROSSHAIR_INJECT = r"""
             var cH = gd.offsetHeight || gd.clientHeight || 0;
             var cW = gd.offsetWidth || gd.clientWidth || 0;
 
-            // ── 日期匹配：在 K线 trace 的 x 数组中找最近的交易日索引 ──
-            // 不依赖 Plotly 的 pointIndex（mode='lines' 时不可靠）
-            var klineTrace = null, klineIdx = -1;
-            for (var i = 0; i < gd.data.length; i++) {
-                if (gd.data[i].name === 'K线' && gd.data[i].x) { klineTrace = gd.data[i]; break; }
-            }
-            if (klineTrace && klineTrace.x.length > 0) {
-                var hoverX = evt.points[0].x;
-                var bestDist = Infinity;
-                for (var j = 0; j < klineTrace.x.length; j++) {
-                    var dist = Math.abs(new Date(klineTrace.x[j]) - new Date(hoverX));
-                    if (dist < bestDist) { bestDist = dist; klineIdx = j; }
+            // ── 从 evt.points 中定位 K线 hover 锚点（mode='markers'，pointIndex 可靠）──
+            var ptIdx = -1, xval = null, yVal = null;
+            for (var i = 0; i < evt.points.length; i++) {
+                var p = evt.points[i];
+                if (p.data && p.data.name === 'K线') {
+                    ptIdx = p.pointIndex;
+                    xval = p.x;
+                    yVal = p.y;
+                    break;
                 }
             }
-
-            // ── 锁定到最近数据点的 x 值，确保竖线/日期/数据三位一体对齐 ──
-            var xval;
-            if (klineIdx >= 0 && klineTrace) {
-                xval = klineTrace.x[klineIdx];
-            } else {
-                xval = evt.points[0].x;
-            }
+            if (ptIdx < 0) return;  // 没有命中 K线锚点，忽略
 
             var xPixel = xaxis.d2p(xval);
             var xOff = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
 
+            // ── 十字光标竖线 ──
             vLine.style.left = (xOff + xPixel) + 'px';
             vLine.style.top = margin.t + 'px';
             vLine.style.height = (cH - margin.t - margin.b) + 'px';
             vLine.style.display = 'block';
 
-            // X 轴日期标签
+            // ── X 轴日期标签 ──
             var xDate = new Date(xval);
             xLabel.textContent = xDate.getFullYear() + '-' + ('0'+(xDate.getMonth()+1)).slice(-2) + '-' + ('0'+xDate.getDate()).slice(-2);
             xLabel.style.left = (xOff + xPixel) + 'px';
             xLabel.style.display = 'block';
 
-            // 横线 + Y轴标签（K线子图）
-            var yaxis = fl.yaxis, yVal = null;
-            if (klineIdx >= 0 && klineTrace && klineTrace.y && klineIdx < klineTrace.y.length) {
-                yVal = klineTrace.y[klineIdx];
-            }
-            if (yVal == null && evt.points[0].y !== undefined) yVal = evt.points[0].y;
-            if (yVal != null && yaxis && typeof yaxis.d2p === 'function') {
-                var yPx = yaxis.d2p(yVal), yOff = (typeof yaxis._offset === 'number') ? yaxis._offset : 0;
-                hLine.style.top = (yOff + yPx) + 'px';
-                hLine.style.left = margin.l + 'px';
-                hLine.style.width = (cW - margin.l - margin.r) + 'px';
-                hLine.style.display = 'block';
-                yLabel.textContent = fmtNum(yVal);
-                yLabel.style.top = (yOff + yPx) + 'px';
-                yLabel.style.display = 'block';
+            // ── 横线 + Y轴标签（K线子图）──
+            if (yVal != null) {
+                var yaxis = fl.yaxis;
+                if (yaxis && typeof yaxis.d2p === 'function') {
+                    var yPx = yaxis.d2p(yVal), yOff = (typeof yaxis._offset === 'number') ? yaxis._offset : 0;
+                    hLine.style.top = (yOff + yPx) + 'px';
+                    hLine.style.left = margin.l + 'px';
+                    hLine.style.width = (cW - margin.l - margin.r) + 'px';
+                    hLine.style.display = 'block';
+                    yLabel.textContent = fmtNum(yVal);
+                    yLabel.style.top = (yOff + yPx) + 'px';
+                    yLabel.style.display = 'block';
+                }
             }
 
-            // ── 用匹配到的索引从 gd.data 取值（date-safe）──
+            // ── 用 ptIdx 从 gd.data 取值（所有 trace 索引对齐）──
             var cd = null, volY = null, kY = null, dY = null, jY = null;
             var difY = null, deaY = null, macdY = null;
             var buyInfo = null, sellInfo = null;
-            if (klineIdx >= 0) {
-                if (klineTrace.customdata && klineIdx < klineTrace.customdata.length) {
-                    var row = klineTrace.customdata[klineIdx];
+            for (var i = 0; i < gd.data.length; i++) {
+                var d = gd.data[i], nm = d.name || '';
+                if (nm === 'K线' && d.customdata && ptIdx < d.customdata.length) {
+                    var row = d.customdata[ptIdx];
                     if (row && row.length >= 6) cd = row;
                 }
-                for (var i = 0; i < gd.data.length; i++) {
-                    var d = gd.data[i], nm = d.name || '', yarr = d.y, xarr = d.x;
-                    if (nm === '成交量' && yarr && klineIdx < yarr.length) volY = yarr[klineIdx];
-                    if (nm === 'K' && yarr && klineIdx < yarr.length) kY = yarr[klineIdx];
-                    if (nm === 'D' && yarr && klineIdx < yarr.length) dY = yarr[klineIdx];
-                    if (nm === 'J' && yarr && klineIdx < yarr.length) jY = yarr[klineIdx];
-                    if (nm === 'DIF' && yarr && klineIdx < yarr.length) difY = yarr[klineIdx];
-                    if (nm === 'DEA' && yarr && klineIdx < yarr.length) deaY = yarr[klineIdx];
-                    if (nm === 'MACD柱' && yarr && klineIdx < yarr.length) macdY = yarr[klineIdx];
-                    // 买卖点：匹配日期
-                    if ((nm === '买入B' || nm === '卖出S') && d.customdata && xarr) {
-                        for (var k = 0; k < xarr.length; k++) {
-                            var xd = new Date(xarr[k]); var nd = new Date(klineTrace.x[klineIdx]);
-                            if (Math.abs(xd - nd) < 3600000) {  // 同一天（1小时容差）
-                                var cd2 = d.customdata[k];
-                                if (cd2 && cd2.length >= 2) {
-                                    if (nm === '买入B') buyInfo = {reason: cd2[0], price: cd2[1]};
-                                    else sellInfo = {reason: cd2[0], price: cd2[1]};
-                                }
-                                break;
+                if (d.y && ptIdx < d.y.length) {
+                    if (nm === '成交量') volY = d.y[ptIdx];
+                    if (nm === 'K') kY = d.y[ptIdx];
+                    if (nm === 'D') dY = d.y[ptIdx];
+                    if (nm === 'J') jY = d.y[ptIdx];
+                    if (nm === 'DIF') difY = d.y[ptIdx];
+                    if (nm === 'DEA') deaY = d.y[ptIdx];
+                    if (nm === 'MACD柱') macdY = d.y[ptIdx];
+                }
+                // 买卖点：customdata 长度可能不同于 bars，需单独匹配日期
+                if ((nm === '买入B' || nm === '卖出S') && d.customdata && d.x) {
+                    var xvalMs = new Date(xval).getTime();
+                    for (var k = 0; k < d.x.length; k++) {
+                        if (Math.abs(new Date(d.x[k]).getTime() - xvalMs) < 86400000) {
+                            var cd2 = d.customdata[k];
+                            if (cd2 && cd2.length >= 2) {
+                                if (nm === '买入B') buyInfo = {reason: cd2[0], price: cd2[1]};
+                                else sellInfo = {reason: cd2[0], price: cd2[1]};
                             }
+                            break;
                         }
                     }
                 }
             }
+
+            // ── 顶部 OHLCV 数据框 ──
             if (cd) {
                 var chgC = parseFloat(cd[5]) >= 0 ? '#ef5350' : '#26a69a';
                 var chgS = parseFloat(cd[5]) >= 0 ? '+' : '';
                 dataBox.innerHTML = '<span style="color:#5f5648;">' + cd[0] + '</span>&nbsp; O <b>' + fmtNum(cd[1]) + '</b>&nbsp; H <b style="color:#ef5350;">' + fmtNum(cd[2]) + '</b>&nbsp; L <b style="color:#26a69a;">' + fmtNum(cd[3]) + '</b>&nbsp; C <b>' + fmtNum(cd[4]) + '</b>&nbsp; <b style="color:' + chgC + ';">' + chgS + fmtNum(cd[5]) + '%</b>&nbsp; <span style="color:#8a7f6d;font-size:10px;">' + (cd[6] || '') + '</span>';
-                if (buyInfo) dataBox.innerHTML += '<br><span style="color:#d4a017;">▶ 买入 @ ' + fmtNum(buyInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (buyInfo.reason || '') + '</span>';
-                if (sellInfo) dataBox.innerHTML += '<br><span style="color:#ab47bc;">▶ 卖出 @ ' + fmtNum(sellInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (sellInfo.reason || '') + '</span>';
+                if (buyInfo) dataBox.innerHTML += '<br><span style="color:#d4a017;">\u25b6 买入 @ ' + fmtNum(buyInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (buyInfo.reason || '') + '</span>';
+                if (sellInfo) dataBox.innerHTML += '<br><span style="color:#ab47bc;">\u25b6 卖出 @ ' + fmtNum(sellInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (sellInfo.reason || '') + '</span>';
                 dataBox.style.display = 'block';
             }
 
-            // 副图数据框以子图边界为中心（translateY(-50%)），不遮挡线条和坐标轴
+            // ── 副图数据框：以子图边界为中心（translateY(-50%)）──
             if (fl.yaxis2 && typeof fl.yaxis2._offset === 'number') { volBox.style.top = fl.yaxis2._offset + 'px'; if (volY != null) { volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手'; volBox.style.display = 'block'; } }
             if (fl.yaxis3 && typeof fl.yaxis3._offset === 'number') { kdjBox.style.top = fl.yaxis3._offset + 'px'; if (kY != null || dY != null || jY != null) { kdjBox.innerHTML = '<span style="color:#f0b90b;">K ' + fmtNum(kY,2) + '</span>&nbsp; <span style="color:#1e88e5;">D ' + fmtNum(dY,2) + '</span>&nbsp; <span style="color:#ab47bc;">J ' + fmtNum(jY,2) + '</span>'; kdjBox.style.display = 'block'; } }
             if (fl.yaxis4 && typeof fl.yaxis4._offset === 'number') { macdBox.style.top = fl.yaxis4._offset + 'px'; if (difY != null || deaY != null || macdY != null) { var hc = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a'; macdBox.innerHTML = '<span style="color:#5f5648;">DIF ' + fmtNum(difY,4) + '</span>&nbsp; <span style="color:#1e88e5;">DEA ' + fmtNum(deaY,4) + '</span>&nbsp; <span style="color:' + hc + ';">MACD ' + fmtNum(macdY,4) + '</span>'; macdBox.style.display = 'block'; } }
