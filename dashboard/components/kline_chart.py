@@ -186,14 +186,16 @@ def plot_kline_with_signals(
     date_range_ms = (bars['trade_date'].iloc[-1] - bars['trade_date'].iloc[0]).total_seconds() * 1000 if n_bars > 1 else 86_400_000
     bar_width_ms = max(43_200_000, min(86_400_000, date_range_ms / max(n_bars, 1) * 0.75))
 
-    # K线 hover 锚点：透明折线提供连续悬停覆盖，消灭周末 gap 盲区。
+    # K线 hover 锚点：lines+markers 双重覆盖，消灭周末 gap 盲区。
+    # alpha=0.005 肉眼不可见但非零，避免 Plotly 优化跳过 hover 命中。
     # JS 通过日期匹配（而非 pointIndex）定位数据，确保 gap 区域命中最近交易日。
     # 原生 TIP 通过透明 hoverlabel + hovermode='x' 设为不可见。
     fig.add_trace(go.Scatter(
         x=bars['trade_date'],
         y=c,
-        mode='lines',
-        line=dict(color='rgba(0,0,0,0)', width=2),
+        mode='lines+markers',
+        line=dict(color='rgba(0,0,0,0.005)', width=3),
+        marker=dict(size=30, color='rgba(0,0,0,0.005)', line=dict(width=0)),
         name='K线',
         showlegend=False,
         customdata=hover_cd,
@@ -529,7 +531,9 @@ def plot_kline_with_signals(
         bargap=0.15,
     )
     _style_axis(fig, row=1)
-    fig.update_xaxes(matches='x', showspikes=False)
+    # 显式 date 轴：go.Bar 在 shared_xaxes 下默认走 categorical（index 对齐），
+    # 会导致 K 线柱体与均线/日期错位。强制 type='date' 修复。
+    fig.update_xaxes(type='date', showspikes=False)
     fig.update_xaxes(showticklabels=True, row=rows, col=1)
     for axis_name in [name for name in fig.layout if str(name).startswith('xaxis')]:
         axis = fig.layout[axis_name]
@@ -959,44 +963,48 @@ _CROSSHAIR_INJECT = r"""
 
         function onHover(evt) {
             if (!evt || !evt.points || !evt.points.length) return;
-            var xval = evt.points[0].x;
             var fl = gd._fullLayout;
             var xaxis = fl.xaxis;
             if (!xaxis || typeof xaxis.d2p !== 'function') return;
             margin = fl.margin || margin;
 
-            var xPixel = xaxis.d2p(xval);
-            var xOff = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
             var cH = gd.offsetHeight || gd.clientHeight || 0;
             var cW = gd.offsetWidth || gd.clientWidth || 0;
+
+            // ── 日期匹配：在 K线 trace 的 x 数组中找最近的交易日索引 ──
+            // 不依赖 Plotly 的 pointIndex（mode='lines' 时不可靠）
+            var klineTrace = null, klineIdx = -1;
+            for (var i = 0; i < gd.data.length; i++) {
+                if (gd.data[i].name === 'K线' && gd.data[i].x) { klineTrace = gd.data[i]; break; }
+            }
+            if (klineTrace && klineTrace.x.length > 0) {
+                var hoverX = evt.points[0].x;
+                var bestDist = Infinity;
+                for (var j = 0; j < klineTrace.x.length; j++) {
+                    var dist = Math.abs(new Date(klineTrace.x[j]) - new Date(hoverX));
+                    if (dist < bestDist) { bestDist = dist; klineIdx = j; }
+                }
+            }
+
+            // ── 锁定到最近数据点的 x 值，确保竖线/日期/数据三位一体对齐 ──
+            var xval;
+            if (klineIdx >= 0 && klineTrace) {
+                xval = klineTrace.x[klineIdx];
+            } else {
+                xval = evt.points[0].x;
+            }
+
+            var xPixel = xaxis.d2p(xval);
+            var xOff = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
 
             vLine.style.left = (xOff + xPixel) + 'px';
             vLine.style.top = margin.t + 'px';
             vLine.style.height = (cH - margin.t - margin.b) + 'px';
             vLine.style.display = 'block';
 
-            // ── 日期匹配：在 K线 trace 的 x 数组中找最近的交易日索引 ──
-            // 避免依赖 Plotly 的 pointIndex（mode='lines' 时不可靠）
-            var klineTrace = null, klineIdx = -1;
-            for (var i = 0; i < gd.data.length; i++) {
-                if (gd.data[i].name === 'K线' && gd.data[i].x) { klineTrace = gd.data[i]; break; }
-            }
-            if (klineTrace && klineTrace.x.length > 0) {
-                var bestDist = Infinity;
-                for (var j = 0; j < klineTrace.x.length; j++) {
-                    var dist = Math.abs(new Date(klineTrace.x[j]) - new Date(xval));
-                    if (dist < bestDist) { bestDist = dist; klineIdx = j; }
-                }
-            }
-
-            // X 轴日期标签（用最近交易日）
-            if (klineIdx >= 0 && klineTrace) {
-                var nearestDate = new Date(klineTrace.x[klineIdx]);
-                xLabel.textContent = nearestDate.getFullYear() + '-' + ('0'+(nearestDate.getMonth()+1)).slice(-2) + '-' + ('0'+nearestDate.getDate()).slice(-2);
-            } else {
-                var xDate = new Date(xval);
-                xLabel.textContent = xDate.getFullYear() + '-' + ('0'+(xDate.getMonth()+1)).slice(-2) + '-' + ('0'+xDate.getDate()).slice(-2);
-            }
+            // X 轴日期标签
+            var xDate = new Date(xval);
+            xLabel.textContent = xDate.getFullYear() + '-' + ('0'+(xDate.getMonth()+1)).slice(-2) + '-' + ('0'+xDate.getDate()).slice(-2);
             xLabel.style.left = (xOff + xPixel) + 'px';
             xLabel.style.display = 'block';
 
