@@ -203,54 +203,20 @@ def plot_kline_with_signals(
         hovertext=[''] * n,
     ), row=1, col=1)
 
-    # 影线：合并为单条 trace（NaN 分隔），替代 n 条独立 trace 避免渲染性能问题
-    x_wick = []
-    y_wick = []
-    for i in range(n):
-        x_wick.extend([bars['trade_date'].iloc[i], bars['trade_date'].iloc[i], None])
-        y_wick.extend([l.iloc[i], h.iloc[i], None])
-    fig.add_trace(go.Scatter(
-        x=x_wick, y=y_wick,
-        mode='lines',
-        line=dict(color=KC['wick'], width=1),
+    # K线蜡烛图：go.Candlestick 替代 go.Bar，原生日期轴定位，天然处理周末 gap
+    # go.Bar 在 shared_xaxes 下定位有根本性缺陷，即使 type='date' 也可能在 gap 附近错位
+    fig.add_trace(go.Candlestick(
+        x=bars['trade_date'],
+        open=o, high=h, low=l, close=c,
+        name='K线',
         showlegend=False,
+        increasing=dict(line=dict(color=KC['up'], width=1),
+                         fillcolor=KC['up']),
+        decreasing=dict(line=dict(color=KC['down'], width=1),
+                         fillcolor=KC['down']),
+        whiskerwidth=0.5,
         hoverinfo='skip',
-        connectgaps=False,
     ), row=1, col=1)
-
-    # 实体：阳线
-    up_mask = c >= o
-    if up_mask.any():
-        up_idx = bars.index[up_mask]
-        fig.add_trace(go.Bar(
-            x=bars.loc[up_idx, 'trade_date'],
-            y=(c[up_idx] - o[up_idx]).abs().clip(lower=0.001),
-            base=o[up_idx],
-            marker_color=KC['up'],
-            marker_line_color=KC['up'],
-            marker_line_width=0,
-            width=bar_width_ms,
-            name='阳线',
-            showlegend=False,
-            hoverinfo='skip',
-        ), row=1, col=1)
-
-    # 实体：阴线
-    down_mask = ~up_mask
-    if down_mask.any():
-        dn_idx = bars.index[down_mask]
-        fig.add_trace(go.Bar(
-            x=bars.loc[dn_idx, 'trade_date'],
-            y=(o[dn_idx] - c[dn_idx]).abs().clip(lower=0.001),
-            base=c[dn_idx],
-            marker_color=KC['down'],
-            marker_line_color=KC['down'],
-            marker_line_width=0,
-            width=bar_width_ms,
-            name='阴线',
-            showlegend=False,
-            hoverinfo='skip',
-        ), row=1, col=1)
 
     # ── 均线 ──
     if show_ma:

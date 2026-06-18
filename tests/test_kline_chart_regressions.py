@@ -57,7 +57,7 @@ def test_kline_unified_tip_does_not_duplicate_main_traces():
 
     # K线 锚点本身用 hoverinfo='text'（不含 hovertemplate），其他 trace 不含"日期"模板
     assert len(main_hover_templates) == 0  # JS overlay 下无 hovertemplate 含"日期"
-    assert {"阳线", "阴线", "MA5", "MA10", "MA20"}.issubset(set(skipped))
+    assert {"K线", "MA5", "MA10", "MA20"}.issubset(set(skipped))
 
 
 def test_kline_adds_macd_subplot_by_default():
