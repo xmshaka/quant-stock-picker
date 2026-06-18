@@ -211,7 +211,8 @@ if "bt_result" in st.session_state:
         st.plotly_chart(fig_eq, width="stretch")
 
     # 大盘择时评分
-    if st.session_state.get("bt_market_scores"):
+    market_scores_df = st.session_state.get("bt_market_scores")
+    if market_scores_df is not None and not market_scores_df.empty:
         with st.expander("📊 大盘择时评分", expanded=False):
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
@@ -343,9 +344,11 @@ if "bt_result" in st.session_state:
                                 ca = getattr(p, 'cash_after', 0)
                                 sl = getattr(p, 'stop_loss', 0)
                                 tp = getattr(p, 'take_profit', 0)
+                                ts = getattr(p, 'trailing_stop', 0)
                                 row["持股"] = f"{ps:,}" if ps else ""
                                 row["余额"] = f"¥{ca:,.0f}" if ca else ""
                                 row["止损"] = f"{sl:.2f}" if sl else ""
+                                row["跟止"] = f"{ts:.2f}" if ts else ""
                                 row["止盈"] = f"{tp:.2f}" if tp else ""
                             elif p.action == 'SELL':
                                 ca = getattr(p, 'cash_after', 0)

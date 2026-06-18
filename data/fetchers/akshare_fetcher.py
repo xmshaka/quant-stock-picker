@@ -1,5 +1,8 @@
 """AKShare 数据获取器 - A股免费数据源"""
-import akshare as ak
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 import pandas as pd
 from typing import Optional
 from datetime import datetime

@@ -46,7 +46,8 @@ KC = {
     "macd_signal":  "#1e88e5",
     "macd_hist_up": "rgba(239,83,80,0.72)",
     "macd_hist_down": "rgba(38,166,154,0.72)",
-    "crosshair":    "#c2b39f",
+    "crosshair":    "#8a7f6d",
+    "wick":         "#8a7f6d",
     "tooltip_bg":   "#f6f3ed",
     "tooltip_text": "#2f2a22",
     "tooltip_border": "#c2b39f",
@@ -54,14 +55,13 @@ KC = {
 
 
 def _style_axis(fig, row: int = None, col: int = None):
-    """统一坐标轴样式（含十字光标线）"""
+    """统一坐标轴样式（十字光标由 JS 渲染，禁用 Plotly 原生 spike）"""
     kw = dict(row=row, col=col) if row else {}
     fig.update_xaxes(
         gridcolor=KC['grid'], showgrid=True, griddash='dot',
         zeroline=False, showline=False,
         tickfont=dict(size=9, color=KC['axis']),
-        showspikes=True, spikemode='across+toaxis', spikethickness=1,
-        spikecolor=KC['crosshair'], spikesnap='cursor',
+        showspikes=False,
         **kw,
     )
     fig.update_yaxes(
@@ -69,8 +69,7 @@ def _style_axis(fig, row: int = None, col: int = None):
         zeroline=False, showline=False, side='right',
         tickfont=dict(size=9, color=KC['axis']),
         tickformat='.2f',
-        showspikes=True, spikemode='across+toaxis', spikethickness=1,
-        spikecolor=KC['crosshair'], spikesnap='cursor',
+        showspikes=False,
         **kw,
     )
 
@@ -107,6 +106,13 @@ def _set_no_hover(*traces):
         trace.hoverinfo = 'skip'
         trace.hovertemplate = None
     return traces[0] if len(traces) == 1 else traces
+
+
+def _hover_participate(trace, n: int):
+    """让 trace 参与 hover 事件（出现在 evt.points 中），但 tooltip 不可见。"""
+    trace.hoverinfo = 'text'
+    trace.hovertext = [''] * n
+    trace.hovertemplate = None
 
 
 def plot_kline_with_signals(
@@ -175,11 +181,14 @@ def plot_kline_with_signals(
         row_heights=row_heights,
     )
 
-    # ── K线蜡烛（用 Scatter 画影线 + Bar 画实体） ──
-    bar_width_ms = 51_840_000  # 0.6 天
+    # ── 动态柱宽：按数据密度计算，确保柱线可辨识 ──
+    n_bars = len(bars)
+    date_range_ms = (bars['trade_date'].iloc[-1] - bars['trade_date'].iloc[0]).total_seconds() * 1000 if n_bars > 1 else 86_400_000
+    bar_width_ms = max(43_200_000, min(86_400_000, date_range_ms / max(n_bars, 1) * 0.75))
 
-    # 只保留一个主图 TIP 锚点参与 hover；实体/影线/均线关闭 hover。
-    # 否则 Plotly x unified 会把同一天的所有 trace 都塞进 TIP，造成大块重复空白。
+    # K线 hover 锚点：保留最小 hoverinfo 确保 plotly_hover 事件触发。
+    # 原生 TIP 通过透明 hoverlabel + hovermode='x' 设为不可见。
+    # JS 顶部数据框替代显示 OHLCV。
     fig.add_trace(go.Scatter(
         x=bars['trade_date'],
         y=c,
@@ -188,29 +197,24 @@ def plot_kline_with_signals(
         name='K线',
         showlegend=False,
         customdata=hover_cd,
-        hovertemplate=(
-            '日期：%{customdata[0]}<br>'
-            '开盘：%{customdata[1]:.2f}<br>'
-            '最高：%{customdata[2]:.2f}<br>'
-            '最低：%{customdata[3]:.2f}<br>'
-            '收盘：%{customdata[4]:.2f}<br>'
-            '涨跌幅：%{customdata[5]:+.2f}%<br>'
-            '成交量：%{customdata[6]}'
-            '<extra></extra>'
-        ),
+        hoverinfo='text',
+        hovertext=[''] * n,
     ), row=1, col=1)
 
-    # 影线：上下影线用一条竖线（从 low 到 high）
+    # 影线：合并为单条 trace（NaN 分隔），替代 n 条独立 trace 避免渲染性能问题
+    x_wick = []
+    y_wick = []
     for i in range(n):
-        color = KC['up'] if c.iloc[i] >= o.iloc[i] else KC['down']
-        fig.add_trace(go.Scatter(
-            x=[bars['trade_date'].iloc[i], bars['trade_date'].iloc[i]],
-            y=[l.iloc[i], h.iloc[i]],
-            mode='lines',
-            line=dict(color=color, width=1),
-            showlegend=False,
-            hoverinfo='skip',
-        ), row=1, col=1)
+        x_wick.extend([bars['trade_date'].iloc[i], bars['trade_date'].iloc[i], None])
+        y_wick.extend([l.iloc[i], h.iloc[i], None])
+    fig.add_trace(go.Scatter(
+        x=x_wick, y=y_wick,
+        mode='lines',
+        line=dict(color=KC['wick'], width=1),
+        showlegend=False,
+        hoverinfo='skip',
+        connectgaps=False,
+    ), row=1, col=1)
 
     # 实体：阳线
     up_mask = c >= o
@@ -273,7 +277,7 @@ def plot_kline_with_signals(
             for p, price in zip(buy_pts, buy_prices)
         ]
         # 只保留透明散点做 hover/legend；可见 B 图标强制用 annotation 绘制，避免 Plotly text 被吞
-        fig.add_trace(go.Scatter(
+        buy_hover = go.Scatter(
             x=buy_dates,
             y=buy_marker_y,
             mode='markers',
@@ -282,8 +286,9 @@ def plot_kline_with_signals(
             name='买入B',
             cliponaxis=False,
             customdata=[[p.reason, price] for p, price in zip(buy_pts, buy_prices)],
-            hoverinfo='skip',
-        ), row=1, col=1)
+        )
+        _hover_participate(buy_hover, len(buy_pts))
+        fig.add_trace(buy_hover, row=1, col=1)
         # 可见图标与价格使用 Scatter 文本强制绘制，比 annotation 更不容易被 Streamlit 复用/吞掉
         fig.add_trace(go.Scatter(
             x=buy_dates, y=buy_marker_y,
@@ -329,7 +334,7 @@ def plot_kline_with_signals(
             sell_lane_y
             for p, price in zip(sell_pts, sell_prices)
         ]
-        fig.add_trace(go.Scatter(
+        sell_hover = go.Scatter(
             x=sell_dates,
             y=sell_marker_y,
             mode='markers',
@@ -338,8 +343,9 @@ def plot_kline_with_signals(
             name='卖出S',
             cliponaxis=False,
             customdata=[[p.reason, price] for p, price in zip(sell_pts, sell_prices)],
-            hoverinfo='skip',
-        ), row=1, col=1)
+        )
+        _hover_participate(sell_hover, len(sell_pts))
+        fig.add_trace(sell_hover, row=1, col=1)
         fig.add_trace(go.Scatter(
             x=sell_dates,
             y=[sell_price_lane_y for _ in sell_marker_y],
@@ -382,7 +388,7 @@ def plot_kline_with_signals(
     if show_volume:
         vol_colors = [KC['vol_up'] if ci >= oi else KC['vol_down']
                       for oi, ci in zip(o, c)]
-        fig.add_trace(go.Bar(
+        vol_trace = go.Bar(
             x=bars['trade_date'], y=v,
             marker_color=vol_colors,
             marker_line_color=vol_colors,
@@ -392,8 +398,9 @@ def plot_kline_with_signals(
             name='成交量',
             showlegend=False,
             customdata=np.column_stack([_format_cn_datetime(bars['trade_date']), _volume_unit_text(v)]),
-            hovertemplate='日期：%{customdata[0]}<br>成交量：%{customdata[1]}<extra></extra>',
-        ), row=current_row, col=1)
+        )
+        _hover_participate(vol_trace, n)
+        fig.add_trace(vol_trace, row=current_row, col=1)
         fig.update_yaxes(tickformat='.2s', row=current_row, col=1)
         _style_axis(fig, row=current_row)
         current_row += 1
@@ -413,7 +420,7 @@ def plot_kline_with_signals(
             mode='lines', name='RSI14',
             line=dict(width=1.2, color=KC['rsi']),
             customdata=np.column_stack([_format_cn_datetime(bars['trade_date']), rsi.fillna(0)]),
-            hovertemplate='RSI14：%{customdata[1]:.2f}<extra></extra>',
+            hoverinfo='skip',
         ), row=indicator_row, col=1)
         fig.add_hline(y=70, line_dash="dot", line_color=KC['up'], line_width=0.5,
                       row=indicator_row, col=1)
@@ -433,13 +440,14 @@ def plot_kline_with_signals(
         j = 3 * k - 2 * d
 
         for vals, color, name in [(k, KC['kdj_k'], 'K'), (d, KC['kdj_d'], 'D'), (j, KC['kdj_j'], 'J')]:
-            fig.add_trace(go.Scatter(
+            t = go.Scatter(
                 x=bars['trade_date'], y=vals,
                 mode='lines', name=name,
                 line=dict(width=1.2, color=color),
                 customdata=np.column_stack([_format_cn_datetime(bars['trade_date']), vals.fillna(0)]),
-                hovertemplate=f'{name}：%{{customdata[1]:.2f}}<extra></extra>',
-            ), row=indicator_row, col=1)
+            )
+            _hover_participate(t, n)
+            fig.add_trace(t, row=indicator_row, col=1)
         fig.add_hline(y=80, line_dash="dot", line_color=KC['up'], line_width=0.5,
                       row=indicator_row, col=1)
         fig.add_hline(y=20, line_dash="dot", line_color=KC['down'], line_width=0.5,
@@ -463,29 +471,32 @@ def plot_kline_with_signals(
             dea.fillna(0),
             hist.fillna(0),
         ])
-        fig.add_trace(go.Bar(
+        macd_bar = go.Bar(
             x=bars['trade_date'], y=hist,
             marker_color=hist_colors,
             marker_line_width=0,
             width=bar_width_ms,
             name='MACD柱',
             customdata=macd_cd,
-            hovertemplate='MACD柱：%{customdata[3]:.4f}<extra></extra>',
-        ), row=macd_row, col=1)
-        fig.add_trace(go.Scatter(
+        )
+        _hover_participate(macd_bar, n)
+        fig.add_trace(macd_bar, row=macd_row, col=1)
+        dif_t = go.Scatter(
             x=bars['trade_date'], y=dif,
             mode='lines', name='DIF',
             line=dict(width=1.1, color=KC['macd']),
             customdata=macd_cd,
-            hovertemplate='DIF：%{customdata[1]:.4f}<extra></extra>',
-        ), row=macd_row, col=1)
-        fig.add_trace(go.Scatter(
+        )
+        _hover_participate(dif_t, n)
+        fig.add_trace(dif_t, row=macd_row, col=1)
+        dea_t = go.Scatter(
             x=bars['trade_date'], y=dea,
             mode='lines', name='DEA',
             line=dict(width=1.1, color=KC['macd_signal']),
             customdata=macd_cd,
-            hovertemplate='DEA：%{customdata[2]:.4f}<extra></extra>',
-        ), row=macd_row, col=1)
+        )
+        _hover_participate(dea_t, n)
+        fig.add_trace(dea_t, row=macd_row, col=1)
         fig.add_hline(y=0, line_dash="dot", line_color=KC['grid'], line_width=0.6,
                       row=macd_row, col=1)
         fig.update_yaxes(tickformat='.3f', row=macd_row, col=1)
@@ -508,18 +519,17 @@ def plot_kline_with_signals(
         ),
         margin=dict(l=55, r=15, t=30, b=25),
         hovermode="x unified",
-        hoversubplots="axis",
         hoverdistance=50,
         spikedistance=-1,
         hoverlabel=dict(
-            bgcolor=KC['tooltip_bg'],
-            bordercolor=KC['tooltip_border'],
-            font=dict(size=10, family="monospace", color=KC['tooltip_text']),
+            bgcolor='rgba(0,0,0,0)',
+            bordercolor='rgba(0,0,0,0)',
+            font=dict(size=1, color='rgba(0,0,0,0)'),
         ),
         bargap=0.15,
     )
     _style_axis(fig, row=1)
-    fig.update_xaxes(matches='x', showspikes=True, spikemode='across+toaxis')
+    fig.update_xaxes(matches='x', showspikes=False)
     fig.update_xaxes(showticklabels=True, row=rows, col=1)
     for axis_name in [name for name in fig.layout if str(name).startswith('xaxis')]:
         axis = fig.layout[axis_name]
@@ -657,10 +667,73 @@ CROSSHAIR_JS = r"""
             return;
         }
 
-        var line = document.createElement('div');
-        line.className = 'custom-crosshair-v';
-        line.style.cssText = 'position:absolute;width:1px;background:rgba(136,136,136,0.5);pointer-events:none;display:none;z-index:999;top:0;';
-        gd.appendChild(line);
+        // ── 十字光标竖线 ──
+        var vLine = document.createElement('div');
+        vLine.style.cssText = 'position:absolute;width:1px;background:rgba(138,127,109,0.55);pointer-events:none;display:none;z-index:999;top:0;';
+        gd.appendChild(vLine);
+
+        // ── 十字光标横线（K线子图） ──
+        var hLine = document.createElement('div');
+        hLine.style.cssText = 'position:absolute;height:1px;background:rgba(138,127,109,0.55);pointer-events:none;display:none;z-index:999;left:0;';
+        gd.appendChild(hLine);
+
+        // ── 顶部 OHLCV 数据框 ──
+        var dataBox = document.createElement('div');
+        dataBox.style.cssText =
+            'position:absolute;top:0;left:50%;transform:translateX(-50%);' +
+            'background:rgba(237,231,224,0.96);border:1px solid #c2b39f;border-radius:4px;' +
+            'padding:4px 10px;font-family:monospace;font-size:11px;color:#2f2a22;' +
+            'pointer-events:none;display:none;z-index:1000;white-space:nowrap;' +
+            'box-shadow:0 1px 3px rgba(0,0,0,0.08);';
+        gd.appendChild(dataBox);
+
+        // ── 成交量子图数据框 ──
+        var volBox = document.createElement('div');
+        volBox.style.cssText =
+            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
+            'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
+            'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(volBox);
+
+        // ── KDJ 子图数据框 ──
+        var kdjBox = document.createElement('div');
+        kdjBox.style.cssText =
+            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
+            'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
+            'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(kdjBox);
+
+        // ── MACD 子图数据框 ──
+        var macdBox = document.createElement('div');
+        macdBox.style.cssText =
+            'position:absolute;left:50%;transform:translateX(-50%);' +
+            'background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;' +
+            'padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;' +
+            'pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(macdBox);
+
+        // ── X 轴日期标签 ──
+        var xLabel = document.createElement('div');
+        xLabel.style.cssText =
+            'position:absolute;bottom:0;transform:translateX(-50%);' +
+            'background:rgba(138,127,109,0.90);color:#fff;font-family:monospace;font-size:9px;' +
+            'padding:2px 6px;border-radius:2px;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(xLabel);
+
+        // ── Y 轴价格标签 ──
+        var yLabel = document.createElement('div');
+        yLabel.style.cssText =
+            'position:absolute;right:2px;transform:translateY(-50%);' +
+            'background:rgba(138,127,109,0.90);color:#fff;font-family:monospace;font-size:9px;' +
+            'padding:2px 6px;border-radius:2px;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(yLabel);
+
+        function fmtNum(v, dec) {
+            if (v == null || isNaN(v)) return '--';
+            return parseFloat(v).toFixed(dec || 2);
+        }
 
         gd.on('plotly_hover', function(evt) {
             if (!evt || !evt.points || !evt.points.length) return;
@@ -669,19 +742,151 @@ CROSSHAIR_JS = r"""
             var xaxis = fullLayout.xaxis;
             if (!xaxis || typeof xaxis.d2p !== 'function') return;
 
+            var margin = fullLayout.margin || {t:30, b:25, l:55, r:15};
             var xPixel = xaxis.d2p(xval);
             var xOffset = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
-            var margin = fullLayout.margin || {t:0, b:0};
             var containerH = gd.offsetHeight || gd.clientHeight || 0;
+            var containerW = gd.offsetWidth || gd.clientWidth || 0;
 
-            line.style.left = (xOffset + xPixel) + 'px';
-            line.style.top = margin.t + 'px';
-            line.style.height = (containerH - margin.t - margin.b) + 'px';
-            line.style.display = 'block';
+            // 竖线
+            vLine.style.left = (xOffset + xPixel) + 'px';
+            vLine.style.top = margin.t + 'px';
+            vLine.style.height = (containerH - margin.t - margin.b) + 'px';
+            vLine.style.display = 'block';
+
+            // X 轴日期标签
+            var xDate = new Date(xval);
+            var xDateStr = xDate.getFullYear() + '-' +
+                ('0' + (xDate.getMonth() + 1)).slice(-2) + '-' +
+                ('0' + xDate.getDate()).slice(-2);
+            xLabel.textContent = xDateStr;
+            xLabel.style.left = (xOffset + xPixel) + 'px';
+            xLabel.style.bottom = '0px';
+            xLabel.style.display = 'block';
+
+            // 横线 + Y轴标签（K线子图）
+            var yaxis = fullLayout.yaxis;
+            var yVal = null;
+            for (var i = 0; i < evt.points.length; i++) {
+                if (evt.points[i].data.name === 'K线') {
+                    yVal = evt.points[i].y; break;
+                }
+            }
+            if (yVal == null && evt.points[0].y !== undefined) yVal = evt.points[0].y;
+            if (yVal != null && yaxis && typeof yaxis.d2p === 'function') {
+                var yPixel = yaxis.d2p(yVal);
+                var yOffset = (typeof yaxis._offset === 'number') ? yaxis._offset : 0;
+                hLine.style.top = (yOffset + yPixel) + 'px';
+                hLine.style.left = margin.l + 'px';
+                hLine.style.width = (containerW - margin.l - margin.r) + 'px';
+                hLine.style.display = 'block';
+                yLabel.textContent = fmtNum(yVal);
+                yLabel.style.top = (yOffset + yPixel) + 'px';
+                yLabel.style.display = 'block';
+            }
+
+            // ── 顶部 OHLCV 数据框 ──
+            var cd = null, pointIdx = -1;
+            for (var i = 0; i < evt.points.length; i++) {
+                var pt = evt.points[i];
+                if (pt.data && pt.data.name === 'K线' && pt.data.customdata && pt.data.customdata.length > pt.pointIndex) {
+                    pointIdx = pt.pointIndex; var row = pt.data.customdata[pointIdx];
+                    if (row && row.length >= 6) { cd = row; break; }
+                }
+            }
+            if (cd) {
+                var chgColor = parseFloat(cd[5]) >= 0 ? '#ef5350' : '#26a69a';
+                var chgSign = parseFloat(cd[5]) >= 0 ? '+' : '';
+                dataBox.innerHTML =
+                    '<span style="color:#5f5648;">' + cd[0] + '</span>' +
+                    '&nbsp; O <b>' + fmtNum(cd[1]) + '</b>' +
+                    '&nbsp; H <b style="color:#ef5350;">' + fmtNum(cd[2]) + '</b>' +
+                    '&nbsp; L <b style="color:#26a69a;">' + fmtNum(cd[3]) + '</b>' +
+                    '&nbsp; C <b>' + fmtNum(cd[4]) + '</b>' +
+                    '&nbsp; <b style="color:' + chgColor + ';">' + chgSign + fmtNum(cd[5]) + '%</b>' +
+                    '&nbsp; <span style="color:#8a7f6d;font-size:10px;">' + (cd[6] || '') + '</span>';
+                dataBox.style.display = 'block';
+            }
+
+            // ── 子图数据框：从 gd.data 数组取值（trace hoverinfo='skip' 不会出现在 evt.points 中）──
+            var volY = null, kY = null, dY = null, jY = null;
+            var difY = null, deaY = null, macdY = null;
+            var buyInfo = null, sellInfo = null;
+            if (pointIdx >= 0) {
+                for (var i = 0; i < gd.data.length; i++) {
+                    var d = gd.data[i], nm = d.name || '';
+                    if (nm === '成交量' && d.y && pointIdx < d.y.length) volY = d.y[pointIdx];
+                    if (nm === 'K' && d.y && pointIdx < d.y.length) kY = d.y[pointIdx];
+                    if (nm === 'D' && d.y && pointIdx < d.y.length) dY = d.y[pointIdx];
+                    if (nm === 'J' && d.y && pointIdx < d.y.length) jY = d.y[pointIdx];
+                    if (nm === 'DIF' && d.y && pointIdx < d.y.length) difY = d.y[pointIdx];
+                    if (nm === 'DEA' && d.y && pointIdx < d.y.length) deaY = d.y[pointIdx];
+                    if (nm === 'MACD柱' && d.y && pointIdx < d.y.length) macdY = d.y[pointIdx];
+                    if (nm === '买入B' && d.customdata && pointIdx < d.customdata.length) {
+                        var cd2 = d.customdata[pointIdx];
+                        if (cd2 && cd2.length >= 2) buyInfo = {reason: cd2[0], price: cd2[1]};
+                    }
+                    if (nm === '卖出S' && d.customdata && pointIdx < d.customdata.length) {
+                        var cd3 = d.customdata[pointIdx];
+                        if (cd3 && cd3.length >= 2) sellInfo = {reason: cd3[0], price: cd3[1]};
+                    }
+                }
+            }
+
+            // ── 顶部数据框追加买卖点信息 ──
+            if (buyInfo) {
+                dataBox.innerHTML += '<br><span style="color:#d4a017;">▶ 买入 @ ' + fmtNum(buyInfo.price) + '</span>' +
+                    ' <span style="color:#8a7f6d;font-size:10px;">' + (buyInfo.reason || '') + '</span>';
+            }
+            if (sellInfo) {
+                dataBox.innerHTML += '<br><span style="color:#ab47bc;">▶ 卖出 @ ' + fmtNum(sellInfo.price) + '</span>' +
+                    ' <span style="color:#8a7f6d;font-size:10px;">' + (sellInfo.reason || '') + '</span>';
+            }
+
+            // 成交量框（yaxis2 顶部）
+            if (fullLayout.yaxis2 && typeof fullLayout.yaxis2._offset === 'number') {
+                volBox.style.top = (fullLayout.yaxis2._offset + 2) + 'px';
+                if (volY != null) {
+                    volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手';
+                    volBox.style.display = 'block';
+                }
+            }
+
+            // KDJ 框（yaxis3 顶部）
+            if (fullLayout.yaxis3 && typeof fullLayout.yaxis3._offset === 'number') {
+                kdjBox.style.top = (fullLayout.yaxis3._offset + 2) + 'px';
+                if (kY != null || dY != null || jY != null) {
+                    kdjBox.innerHTML =
+                        '<span style="color:#f0b90b;">K ' + fmtNum(kY, 2) + '</span>' +
+                        '&nbsp; <span style="color:#1e88e5;">D ' + fmtNum(dY, 2) + '</span>' +
+                        '&nbsp; <span style="color:#ab47bc;">J ' + fmtNum(jY, 2) + '</span>';
+                    kdjBox.style.display = 'block';
+                }
+            }
+
+            // MACD 框（yaxis4 顶部）
+            if (fullLayout.yaxis4 && typeof fullLayout.yaxis4._offset === 'number') {
+                macdBox.style.top = (fullLayout.yaxis4._offset + 2) + 'px';
+                if (difY != null || deaY != null || macdY != null) {
+                    var histColor = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a';
+                    macdBox.innerHTML =
+                        '<span style="color:#5f5648;">DIF ' + fmtNum(difY, 4) + '</span>' +
+                        '&nbsp; <span style="color:#1e88e5;">DEA ' + fmtNum(deaY, 4) + '</span>' +
+                        '&nbsp; <span style="color:' + histColor + ';">MACD ' + fmtNum(macdY, 4) + '</span>';
+                    macdBox.style.display = 'block';
+                }
+            }
         });
 
         gd.on('plotly_unhover', function() {
-            line.style.display = 'none';
+            vLine.style.display = 'none';
+            hLine.style.display = 'none';
+            dataBox.style.display = 'none';
+            volBox.style.display = 'none';
+            kdjBox.style.display = 'none';
+            macdBox.style.display = 'none';
+            xLabel.style.display = 'none';
+            yLabel.style.display = 'none';
         });
     }
 
@@ -695,17 +900,164 @@ CROSSHAIR_JS = r"""
 """
 
 
+# ── 十字光标 JS（通过 st.markdown 直接注入主页面 DOM）──
+_CROSSHAIR_INJECT = r"""
+<style>
+.js-plotly-plot .hoverlayer { display: none !important; }
+</style>
+<script>
+(function() {
+    var attempts = 0;
+    function init() {
+        attempts++;
+        // 查找所有尚未注入十字光标的 Plotly 图表
+        var allCharts = document.querySelectorAll('.js-plotly-plot');
+        var found = false;
+        for (var c = 0; c < allCharts.length; c++) {
+            var gd = allCharts[c];
+            if (gd.__crosshairInited) continue;
+            try { if (!gd._fullLayout || !gd._fullLayout.xaxis) continue; }
+            catch(e) { continue; }
+            gd.__crosshairInited = true;
+            found = true;
+            _initChart(gd);
+        }
+        if (attempts < 100 && !found) setTimeout(init, 200);
+    }
+
+    function _initChart(gd) {
+
+        var D = document;
+        var margin = gd._fullLayout.margin || {t:30, b:25, l:55, r:15};
+
+        function fmtNum(v, dec) { if (v == null || isNaN(v)) return '--'; return parseFloat(v).toFixed(dec || 2); }
+
+        function makeBox() {
+            var b = D.createElement('div');
+            b.style.cssText = 'position:absolute;left:50%;transform:translateX(-50%);background:rgba(237,231,224,0.90);border:1px solid #c2b39f;border-radius:3px;padding:2px 7px;font-family:monospace;font-size:10px;color:#5f5648;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+            gd.appendChild(b); return b;
+        }
+
+        var vLine = D.createElement('div');
+        vLine.style.cssText = 'position:absolute;width:1px;background:rgba(138,127,109,0.55);pointer-events:none;display:none;z-index:999;top:0;';
+        gd.appendChild(vLine);
+        var hLine = D.createElement('div');
+        hLine.style.cssText = 'position:absolute;height:1px;background:rgba(138,127,109,0.55);pointer-events:none;display:none;z-index:999;left:0;';
+        gd.appendChild(hLine);
+
+        var dataBox = D.createElement('div');
+        dataBox.style.cssText = 'position:absolute;top:0;left:50%;transform:translateX(-50%);background:rgba(237,231,224,0.96);border:1px solid #c2b39f;border-radius:4px;padding:4px 10px;font-family:monospace;font-size:11px;color:#2f2a22;pointer-events:none;display:none;z-index:1000;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.08);';
+        gd.appendChild(dataBox);
+        var volBox = makeBox(), kdjBox = makeBox(), macdBox = makeBox();
+
+        var xLabel = D.createElement('div');
+        xLabel.style.cssText = 'position:absolute;bottom:0;transform:translateX(-50%);background:rgba(138,127,109,0.90);color:#fff;font-family:monospace;font-size:9px;padding:2px 6px;border-radius:2px;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(xLabel);
+        var yLabel = D.createElement('div');
+        yLabel.style.cssText = 'position:absolute;right:2px;transform:translateY(-50%);background:rgba(138,127,109,0.90);color:#fff;font-family:monospace;font-size:9px;padding:2px 6px;border-radius:2px;pointer-events:none;display:none;z-index:1000;white-space:nowrap;';
+        gd.appendChild(yLabel);
+
+        function onHover(evt) {
+            if (!evt || !evt.points || !evt.points.length) return;
+            var xval = evt.points[0].x;
+            var fl = gd._fullLayout;
+            var xaxis = fl.xaxis;
+            if (!xaxis || typeof xaxis.d2p !== 'function') return;
+            margin = fl.margin || margin;
+
+            var xPixel = xaxis.d2p(xval);
+            var xOff = (typeof xaxis._offset === 'number') ? xaxis._offset : 0;
+            var cH = gd.offsetHeight || gd.clientHeight || 0;
+            var cW = gd.offsetWidth || gd.clientWidth || 0;
+
+            vLine.style.left = (xOff + xPixel) + 'px';
+            vLine.style.top = margin.t + 'px';
+            vLine.style.height = (cH - margin.t - margin.b) + 'px';
+            vLine.style.display = 'block';
+
+            var xDate = new Date(xval);
+            xLabel.textContent = xDate.getFullYear() + '-' + ('0'+(xDate.getMonth()+1)).slice(-2) + '-' + ('0'+xDate.getDate()).slice(-2);
+            xLabel.style.left = (xOff + xPixel) + 'px';
+            xLabel.style.display = 'block';
+
+            var yaxis = fl.yaxis, yVal = null;
+            for (var i = 0; i < evt.points.length; i++) { if (evt.points[i].data.name === 'K线') { yVal = evt.points[i].y; break; } }
+            if (yVal == null && evt.points[0].y !== undefined) yVal = evt.points[0].y;
+            if (yVal != null && yaxis && typeof yaxis.d2p === 'function') {
+                var yPx = yaxis.d2p(yVal), yOff = (typeof yaxis._offset === 'number') ? yaxis._offset : 0;
+                hLine.style.top = (yOff + yPx) + 'px';
+                hLine.style.left = margin.l + 'px';
+                hLine.style.width = (cW - margin.l - margin.r) + 'px';
+                hLine.style.display = 'block';
+                yLabel.textContent = fmtNum(yVal);
+                yLabel.style.top = (yOff + yPx) + 'px';
+                yLabel.style.display = 'block';
+            }
+
+            var cd = null;
+            for (var i = 0; i < evt.points.length; i++) {
+                var pt = evt.points[i];
+                if (pt.data && pt.data.name === 'K线' && pt.data.customdata && pt.data.customdata.length > pt.pointIndex) {
+                    var row = pt.data.customdata[pt.pointIndex];
+                    if (row && row.length >= 6) { cd = row; break; }
+                }
+            }
+            // 买卖点与副图指标从 evt.points 取值
+            var buyInfo = null, sellInfo = null;
+            var volY = null, kY = null, dY = null, jY = null, difY = null, deaY = null, macdY = null;
+            for (var i = 0; i < evt.points.length; i++) {
+                var p2 = evt.points[i], nm2 = p2.data ? p2.data.name : '';
+                if (nm2 === '买入B' && p2.data.customdata && p2.data.customdata.length > p2.pointIndex) {
+                    var cd2 = p2.data.customdata[p2.pointIndex]; if (cd2 && cd2.length >= 2) buyInfo = {reason: cd2[0], price: cd2[1]};
+                }
+                if (nm2 === '卖出S' && p2.data.customdata && p2.data.customdata.length > p2.pointIndex) {
+                    var cd3 = p2.data.customdata[p2.pointIndex]; if (cd3 && cd3.length >= 2) sellInfo = {reason: cd3[0], price: cd3[1]};
+                }
+                if (nm2 === '成交量') volY = p2.y;
+                if (nm2 === 'K') kY = p2.y;
+                if (nm2 === 'D') dY = p2.y;
+                if (nm2 === 'J') jY = p2.y;
+                if (nm2 === 'DIF') difY = p2.y;
+                if (nm2 === 'DEA') deaY = p2.y;
+                if (nm2 === 'MACD柱') macdY = p2.y;
+            }
+            if (cd) {
+                var chgC = parseFloat(cd[5]) >= 0 ? '#ef5350' : '#26a69a';
+                var chgS = parseFloat(cd[5]) >= 0 ? '+' : '';
+                dataBox.innerHTML = '<span style="color:#5f5648;">' + cd[0] + '</span>&nbsp; O <b>' + fmtNum(cd[1]) + '</b>&nbsp; H <b style="color:#ef5350;">' + fmtNum(cd[2]) + '</b>&nbsp; L <b style="color:#26a69a;">' + fmtNum(cd[3]) + '</b>&nbsp; C <b>' + fmtNum(cd[4]) + '</b>&nbsp; <b style="color:' + chgC + ';">' + chgS + fmtNum(cd[5]) + '%</b>&nbsp; <span style="color:#8a7f6d;font-size:10px;">' + (cd[6] || '') + '</span>';
+                if (buyInfo) dataBox.innerHTML += '<br><span style="color:#d4a017;">▶ 买入 @ ' + fmtNum(buyInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (buyInfo.reason || '') + '</span>';
+                if (sellInfo) dataBox.innerHTML += '<br><span style="color:#ab47bc;">▶ 卖出 @ ' + fmtNum(sellInfo.price) + '</span> <span style="color:#8a7f6d;font-size:10px;">' + (sellInfo.reason || '') + '</span>';
+                dataBox.style.display = 'block';
+            }
+
+            if (fl.yaxis2 && typeof fl.yaxis2._offset === 'number') { volBox.style.top = (fl.yaxis2._offset + 2) + 'px'; if (volY != null) { volBox.innerHTML = '<b>VOL</b> ' + fmtNum(volY, 0) + ' 手'; volBox.style.display = 'block'; } }
+            if (fl.yaxis3 && typeof fl.yaxis3._offset === 'number') { kdjBox.style.top = (fl.yaxis3._offset + 2) + 'px'; if (kY != null || dY != null || jY != null) { kdjBox.innerHTML = '<span style="color:#f0b90b;">K ' + fmtNum(kY,2) + '</span>&nbsp; <span style="color:#1e88e5;">D ' + fmtNum(dY,2) + '</span>&nbsp; <span style="color:#ab47bc;">J ' + fmtNum(jY,2) + '</span>'; kdjBox.style.display = 'block'; } }
+            if (fl.yaxis4 && typeof fl.yaxis4._offset === 'number') { macdBox.style.top = (fl.yaxis4._offset + 2) + 'px'; if (difY != null || deaY != null || macdY != null) { var hc = (macdY != null && parseFloat(macdY) >= 0) ? '#ef5350' : '#26a69a'; macdBox.innerHTML = '<span style="color:#5f5648;">DIF ' + fmtNum(difY,4) + '</span>&nbsp; <span style="color:#1e88e5;">DEA ' + fmtNum(deaY,4) + '</span>&nbsp; <span style="color:' + hc + ';">MACD ' + fmtNum(macdY,4) + '</span>'; macdBox.style.display = 'block'; } }
+        }
+
+        function onUnhover() {
+            vLine.style.display = 'none'; hLine.style.display = 'none';
+            dataBox.style.display = 'none'; volBox.style.display = 'none';
+            kdjBox.style.display = 'none'; macdBox.style.display = 'none';
+            xLabel.style.display = 'none'; yLabel.style.display = 'none';
+        }
+
+        gd.on('plotly_hover', onHover);
+        gd.on('plotly_unhover', onUnhover);
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function() { setTimeout(init, 300); });
+    else setTimeout(init, 100);
+})();
+</script>
+"""
+
+
 def render_kline_chart(fig: go.Figure, key: str = "", height: int = 760):
     """
     渲染 K 线图（带 JS 十字光标跨子图同步）。
 
-    替代 st.plotly_chart()，注入 JavaScript 监听 plotly_hover 事件，
-    在所有子图（K线/成交量/KDJ/MACD）上同步绘制十字光标竖线。
-
-    原理：
-    - Plotly 内置 spikemode='across' 仅作用于当前 hover 子图
-    - JS 方案监听 plotly_hover，获取 x 值后在全图高度绘制竖线
-    - 使用 xaxis.d2p() 将数据坐标转为像素坐标，精确定位
+    使用 components.html + CDN Plotly.js 方案（浏览器首次加载后 CDN 缓存，后续极快）。
+    K线影线已合并为单条 trace（NaN 分隔），trace 数从 48→19。
     """
     import streamlit.components.v1 as components
 
@@ -721,6 +1073,6 @@ def render_kline_chart(fig: go.Figure, key: str = "", height: int = 760):
     )
 
     # 在 </body> 前注入 JS
-    fig_html = fig_html.replace('</body>', CROSSHAIR_JS + '\n</body>')
+    fig_html = fig_html.replace('</body>', _CROSSHAIR_INJECT + '\n</body>')
 
     components.html(fig_html, height=height, scrolling=False)

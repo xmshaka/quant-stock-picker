@@ -34,6 +34,7 @@ class TradePoint:
     avg_cost: float = 0.0        # 持仓均价
     stop_loss: float = 0.0       # 止损价
     take_profit: float = 0.0     # 止盈价
+    trailing_stop: float = 0.0   # 跟踪止盈价（初始=止损价，随股价上涨上移）
     pnl: float = 0.0             # 盈亏金额（仅SELL）
     pnl_pct: float = 0.0         # 盈亏比例（仅SELL）
     holding_days: int = 0        # 持仓天数（仅SELL）

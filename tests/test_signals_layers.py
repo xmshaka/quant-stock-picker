@@ -44,7 +44,8 @@ def make_bars(n=120, trend="up", volatility=0.02, seed=42):
 class TestTrendFilter:
     def test_up_trend_passes(self):
         bars = make_bars(120, trend="up")
-        tf = TrendFilter()
+        # 使用 trend_momentum 策略（严格模式 Price>MA20），评分可达 0.5+
+        tf = TrendFilter(strategy_type="trend_momentum")
         passed, reason, score = tf.check(bars, 119)
         assert passed, f"上升趋势应通过: {reason}"
         assert score >= 0.5

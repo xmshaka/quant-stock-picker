@@ -66,10 +66,11 @@ class StockRepository(BaseRepository):
         if "adjust" not in df_clean.columns:
             df_clean["adjust"] = "raw"
 
-        # 去重新唯一键 + NaN -> None
-        df_clean = (df[cols]
+        # 去重新唯一键 + NaN -> None（用 df_clean 而非 df，确保 source/adjust 存在）
+        cols_clean = [c for c in df_clean.columns if c in table_cols]
+        df_clean = (df_clean[cols_clean]
                     .drop_duplicates(subset=["symbol", "trade_date", "source", "adjust"], keep="last")
-                    .where(pd.notna(df[cols]), None))
+                    .where(pd.notna(df_clean[cols_clean]), None))
         # 日期转成 python date
         df_clean = df_clean.copy()
         df_clean["trade_date"] = pd.to_datetime(df_clean["trade_date"]).dt.date

@@ -42,13 +42,25 @@ class ConditionResult:
 # Layer 1: 趋势过滤器
 # ═══════════════════════════════════════════
 class TrendFilter:
-    """检查：MA20>MA60, Price>MA20, ADX>20, 非持续下跌"""
+    """检查：MA20>MA40, Price>MA20, ADX>20, 非持续下跌
 
-    def __init__(self, ma_short=20, ma_long=60, adx_period=14, adx_threshold=20.0):
+    ma_long=40 适配 ≤20 日短线持仓周期。
+    strategy_type 影响评分逻辑：
+    - pullback/balanced: 回调策略允许 Price<MA20，重点看 MA20>MA40 确认上升趋势
+    - trend_momentum/breakout: 维持原有严格逻辑，必须 Price>MA20
+    """
+
+    # 策略类型对评分的影响
+    PULLBACK_LIKE = {"pullback", "balanced"}
+
+    def __init__(self, ma_short=20, ma_long=40, adx_period=14, adx_threshold=20.0,
+                 strategy_type: str = "balanced"):
         self.ma_short = ma_short
         self.ma_long = ma_long
         self.adx_period = adx_period
         self.adx_threshold = adx_threshold
+        self.strategy_type = strategy_type
+        self._is_pullback = strategy_type in self.PULLBACK_LIKE
 
     def check(self, bars: pd.DataFrame, idx: int) -> Tuple[bool, str, float]:
         if idx < self.ma_long:
@@ -59,32 +71,63 @@ class TrendFilter:
         low = window['low'].astype(float) if 'low' in window.columns else close
 
         ma20 = close.rolling(self.ma_short).mean().iloc[-1]
-        ma60 = close.rolling(self.ma_long).mean().iloc[-1] if len(close) >= self.ma_long else np.nan
+        ma_long_val = close.rolling(self.ma_long).mean().iloc[-1] if len(close) >= self.ma_long else np.nan
         score = 0.0
         reasons = []
 
-        if close.iloc[-1] > ma20:
-            score += 0.4
-            reasons.append("价格>MA20")
-        else:
-            reasons.append("价格<MA20")
-
-        if not np.isnan(ma60):
-            if ma20 > ma60:
+        if self._is_pullback:
+            # 回调策略：检查回调前是否存在上升趋势（近10日内有过 Price>MA20）
+            # FIX: close.iloc[-10:].rolling(20) 只有10个元素 → 全NaN
+            # 必须用完整 close 算 rolling(20)，再取最后10个
+            recent_ma20 = close.rolling(self.ma_short).mean().iloc[-10:] if len(close) >= 10 else None
+            had_uptrend = False
+            if recent_ma20 is not None and len(recent_ma20) > 0:
+                recent_close = close.iloc[-10:]
+                for j in range(len(recent_close)):
+                    if not pd.isna(recent_ma20.iloc[j]) and recent_close.iloc[j] > recent_ma20.iloc[j]:
+                        had_uptrend = True
+                        break
+            if had_uptrend:
                 score += 0.3
-                reasons.append("MA20>MA60")
+                reasons.append("近10日有过上升趋势")
+            else:
+                reasons.append("近10日无上升趋势")
+            # MA20>MA_long 作为加分项而非必须
+            if not np.isnan(ma_long_val) and ma20 > ma_long_val:
+                score += 0.15
+                reasons.append("MA20>MA" + str(self.ma_long))
+            # 价格相对 MA20 位置仅作参考
+            if close.iloc[-1] > ma20:
+                reasons.append("价格>MA20")
+            else:
+                reasons.append("价格<MA20(回调中)")
+        else:
+            # 追涨/突破策略：必须 Price>MA20
+            if close.iloc[-1] > ma20:
+                score += 0.4
+                reasons.append("价格>MA20")
+            else:
+                reasons.append("价格<MA20")
+
+            if not np.isnan(ma_long_val):
+                if ma20 > ma_long_val:
+                    score += 0.3
+                    reasons.append("MA20>MA" + str(self.ma_long))
 
         adx_val = self._calc_adx(high, low, close, self.adx_period)
         if adx_val > self.adx_threshold:
-            score += 0.2
+            score += 0.25 if self._is_pullback else 0.2
             reasons.append(f"ADX={adx_val:.0f}")
         else:
             reasons.append(f"ADX弱={adx_val:.0f}")
 
-        if len(close) >= 20 and close.iloc[-1] > low.iloc[-20:].min() * 1.02:
-            score += 0.1
+        if len(close) >= 20 and close.iloc[-1] > low.iloc[-20:].min() * 1.03:
+            score += 0.15 if self._is_pullback else 0.1
+            reasons.append("非20日最低")
 
-        passed = score >= 0.5
+        # FIX: 降低通过阈值，适配短线交易（原0.5过严导致回调策略几乎无信号）
+        threshold = 0.4
+        passed = score >= threshold
         reason = "✓ " + ", ".join(reasons) if passed else "✗ " + ", ".join(reasons)
         return passed, reason, score
 
@@ -428,7 +471,7 @@ def evaluate_layered(
     if bars.empty or len(bars) < 20:
         return []
 
-    tf = trend_filter or TrendFilter()
+    tf = trend_filter or TrendFilter(strategy_type=strategy_type)
     sm = strategy_matcher or StrategyMatcher(StrategyType(strategy_type))
     rc = resonance_checker or ResonanceChecker(min_confirmations)
 

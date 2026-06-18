@@ -358,7 +358,13 @@ class SchemeBacktester:
             signal_mode = scheme.signal_mode if scheme else "layered"
             scheme_type = scheme.scheme_id if scheme else "balanced"
             if signal_mode == "layered":
-                points = evaluate_layered(sym_bars, strategy_type=scheme_type)
+                # FIX: 必须用 sym_bars_full（含前置60天数据）否则 TrendFilter(ma_long=40) 永远失败
+                points = evaluate_layered(sym_bars_full, strategy_type=scheme_type)
+                # 过滤到回测区间内
+                start_ts = pd.Timestamp(start_date)
+                end_ts = pd.Timestamp(end_date)
+                points = [p for p in points
+                          if start_ts <= pd.Timestamp(p.date) <= end_ts]
             else:
                 points = evaluate_all_rules(sym_bars, signal_rules)
             if points:
@@ -578,6 +584,7 @@ class SchemeBacktester:
                 avg_cost=pos['avg_cost'],
                 stop_loss=pos['stop_loss'],
                 take_profit=pos['take_profit'],
+                trailing_stop=pos['trailing_stop'],
             )
             actual_trades.append((sym, tp_out))
             trade_details.append({
@@ -594,12 +601,13 @@ class SchemeBacktester:
                 'avg_cost': pos['avg_cost'],
                 'stop_loss': pos['stop_loss'],
                 'take_profit': pos['take_profit'],
+                'trailing_stop': pos['trailing_stop'],
             })
             if verbose:
                 tag = '加仓' if is_add else '买入'
                 logger.info(f"  [{dt_key}] {tag} {sym} {shares}股 @ {price:.2f} "
                            f"持仓={pos['shares']} 均价={pos['avg_cost']:.2f} "
-                           f"止损={pos['stop_loss']:.2f} 止盈={pos['take_profit']:.2f}")
+                           f"止损={pos['stop_loss']:.2f} 跟止={pos['trailing_stop']:.2f} 止盈={pos['take_profit']:.2f}")
             return tp_out
 
         # ── 主循环 ──
@@ -995,6 +1003,8 @@ class SchemeBacktester:
                 else:
                     sym_bars = price_df[price_df['symbol'] == sym].copy()
                 sym_bars = sym_bars.sort_values('trade_date')
+                # 保留完整数据用于信号生成（TrendFilter 需要 ≥60 根 bar）
+                sym_bars_full = sym_bars.copy()
                 sym_bars = sym_bars[
                     (sym_bars['trade_date'] >= start_date) &
                     (sym_bars['trade_date'] <= end_date)
@@ -1004,10 +1014,18 @@ class SchemeBacktester:
                 for col in ('open', 'high', 'low', 'volume'):
                     if col not in sym_bars.columns:
                         sym_bars[col] = sym_bars['close']
+                    if col not in sym_bars_full.columns:
+                        sym_bars_full[col] = sym_bars_full['close']
                 sym_bars = _prepare_execution_bars(sym_bars, fallback_source="scheme_backtest")
+                sym_bars_full = _prepare_execution_bars(sym_bars_full, fallback_source="scheme_backtest")
                 signal_mode = getattr(scheme, 'signal_mode', 'layered')
                 if signal_mode == "layered":
-                    points = evaluate_layered(sym_bars, strategy_type=scheme.scheme_id)
+                    # FIX: 用完整数据生成信号（前置60天），然后过滤到回测区间
+                    points = evaluate_layered(sym_bars_full, strategy_type=scheme.scheme_id)
+                    start_ts = pd.Timestamp(start_date)
+                    end_ts = pd.Timestamp(end_date)
+                    points = [p for p in points
+                              if start_ts <= pd.Timestamp(p.date) <= end_ts]
                 else:
                     points = evaluate_all_rules(sym_bars, scheme.signal_rules)
                 if points:
