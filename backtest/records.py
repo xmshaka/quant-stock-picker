@@ -42,6 +42,30 @@ LIQUIDITY_BUCKET_LABELS = {
     "": "未记录",
 }
 
+EXIT_TYPE_LABELS = {
+    "stop_loss": "止损",
+    "take_profit": "止盈",
+    "signal_exit": "信号退出",
+    "final_liquidation": "末日清仓",
+    "other_exit": "其他退出",
+    "": "未记录",
+}
+
+EXIT_SUBTYPE_LABELS = {
+    "atr_hard_stop": "ATR硬止损",
+    "atr_trailing_profit": "ATR跟踪止盈",
+    "atr_trailing_profit_failed": "ATR跟踪回撤止损",
+    "atr_fixed_profit": "ATR固定止盈",
+    "atr_profit_failed": "ATR止盈失败回撤",
+    "rule_signal": "规则信号卖出",
+    "end_of_backtest": "回测末日清仓",
+    "generic_stop_loss": "通用止损",
+    "generic_take_profit": "通用止盈",
+    "generic_signal": "通用信号退出",
+    "manual_or_unknown": "手动/未知",
+    "": "未记录",
+}
+
 RUN_LIST_COLUMNS = [
     "run_id", "scheme_name", "scheme_id", "pool_mode", "symbols", "start_date", "end_date",
     "total_return", "annual_return", "max_drawdown", "sharpe_ratio", "win_rate",
@@ -260,6 +284,70 @@ def summarize_liquidity_slippage(trades: pd.DataFrame) -> Dict[str, Any]:
         "total_slippage": total_slippage,
         "weighted_slippage_rate": weighted_rate,
         "buckets": grouped.sort_values("成交额", ascending=False).reset_index(drop=True),
+    }
+
+
+def summarize_exit_audit(trades: pd.DataFrame) -> Dict[str, Any]:
+    """汇总卖出成交的退出审计字段。
+
+    P0：历史记录页必须能直接审计一笔 SELL 是止损、止盈、信号退出还是末日清仓，
+    并展示触发价/预估净收益，避免只靠 reason 文本人工判断。
+    """
+    if trades is None or trades.empty:
+        empty = pd.DataFrame(columns=["exit_type", "退出类型", "笔数", "总盈亏", "平均盈亏", "平均触发价", "平均预估盈亏"])
+        return {"ok": False, "is_legacy_exit_audit": False, "missing_exit_columns": [], "rows": 0, "sell_rows": 0, "summary": empty, "details": pd.DataFrame()}
+
+    df = trades.copy()
+    required = ["exit_type", "exit_subtype", "trigger_price", "projected_pnl"]
+    missing = [c for c in required if c not in df.columns]
+    is_legacy = bool(missing)
+    for col in required:
+        if col not in df.columns:
+            df[col] = "" if col in {"exit_type", "exit_subtype"} else 0.0
+
+    if "action" not in df.columns:
+        df["action"] = ""
+    sell_df = df[df["action"].fillna("").astype(str).str.upper() == "SELL"].copy()
+    if sell_df.empty:
+        empty = pd.DataFrame(columns=["exit_type", "退出类型", "笔数", "总盈亏", "平均盈亏", "平均触发价", "平均预估盈亏"])
+        return {"ok": False, "is_legacy_exit_audit": is_legacy, "missing_exit_columns": missing, "rows": int(len(df)), "sell_rows": 0, "summary": empty, "details": sell_df}
+
+    for col in ("pnl", "pnl_pct", "trigger_price", "projected_pnl"):
+        if col not in sell_df.columns:
+            sell_df[col] = 0.0
+        sell_df[col] = pd.to_numeric(sell_df[col], errors="coerce").fillna(0.0).astype(float)
+    sell_df["exit_type"] = sell_df["exit_type"].fillna("").astype(str)
+    sell_df["exit_subtype"] = sell_df["exit_subtype"].fillna("").astype(str)
+    sell_df["退出类型"] = sell_df["exit_type"].map(lambda x: EXIT_TYPE_LABELS.get(str(x), str(x) or "未记录"))
+    sell_df["退出子类"] = sell_df["exit_subtype"].map(lambda x: EXIT_SUBTYPE_LABELS.get(str(x), str(x) or "未记录"))
+
+    summary = (
+        sell_df.groupby(["exit_type", "退出类型"], dropna=False)
+        .agg(
+            笔数=("symbol", "count"),
+            总盈亏=("pnl", "sum"),
+            平均盈亏=("pnl", "mean"),
+            平均触发价=("trigger_price", "mean"),
+            平均预估盈亏=("projected_pnl", "mean"),
+        )
+        .reset_index()
+        .sort_values(["笔数", "总盈亏"], ascending=[False, False])
+    )
+
+    return {
+        "ok": True,
+        "is_legacy_exit_audit": is_legacy,
+        "missing_exit_columns": missing,
+        "rows": int(len(df)),
+        "sell_rows": int(len(sell_df)),
+        "take_profit_rows": int((sell_df["exit_type"] == "take_profit").sum()),
+        "stop_loss_rows": int((sell_df["exit_type"] == "stop_loss").sum()),
+        "signal_exit_rows": int((sell_df["exit_type"] == "signal_exit").sum()),
+        "final_liquidation_rows": int((sell_df["exit_type"] == "final_liquidation").sum()),
+        "total_pnl": float(sell_df["pnl"].sum()),
+        "projected_pnl_total": float(sell_df["projected_pnl"].sum()),
+        "summary": summary.reset_index(drop=True),
+        "details": sell_df,
     }
 
 

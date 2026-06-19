@@ -14,6 +14,7 @@ from backtest.records import (
     load_backtest_run,
     delete_backtest_run,
     persist_backtest_run,
+    summarize_exit_audit,
     validate_backtest_consistency,
     validate_trade_schema,
     make_run_id,
@@ -231,6 +232,51 @@ def test_classify_exit_reason_maps_common_exit_types():
     assert classify_exit_reason("ATR跟踪回撤止损", "跟踪止盈失效") == ("stop_loss", "atr_trailing_profit_failed")
     assert classify_exit_reason("信号卖出", "规则卖出") == ("signal_exit", "rule_signal")
     assert classify_exit_reason("末日清仓", "末日清仓") == ("final_liquidation", "end_of_backtest")
+
+
+def test_summarize_exit_audit_for_history_page():
+    """历史记录页退出审计必须汇总 exit_type 与触发价/预估盈亏。"""
+    df = trade_details_to_frame([
+        {
+            "symbol": "000001", "date": date(2025, 5, 8), "action": "SELL",
+            "exec_price": 10.8, "shares": 1000, "pnl": 760.0,
+            "exit_type": "take_profit", "exit_subtype": "atr_trailing_profit",
+            "trigger_price": 10.75, "projected_pnl": 760.0,
+        },
+        {
+            "symbol": "000002", "date": date(2025, 5, 9), "action": "SELL",
+            "exec_price": 9.8, "shares": 1000, "pnl": -260.0,
+            "exit_type": "stop_loss", "exit_subtype": "atr_hard_stop",
+            "trigger_price": 9.9, "projected_pnl": -260.0,
+        },
+        {
+            "symbol": "000003", "date": date(2025, 5, 10), "action": "BUY",
+            "exec_price": 11.0, "shares": 1000,
+        },
+    ], run_id="run_exit_summary")
+
+    summary = summarize_exit_audit(df)
+
+    assert summary["ok"] is True
+    assert summary["sell_rows"] == 2
+    assert summary["take_profit_rows"] == 1
+    assert summary["stop_loss_rows"] == 1
+    assert summary["total_pnl"] == pytest.approx(500.0)
+    assert set(summary["summary"]["exit_type"]) == {"take_profit", "stop_loss"}
+    assert {"退出类型", "退出子类"}.issubset(summary["details"].columns)
+
+
+def test_summarize_exit_audit_marks_legacy_records():
+    """旧记录缺退出审计字段时只提示旧口径，不反推篡改历史。"""
+    df = pd.DataFrame([
+        {"symbol": "000001", "date": "2025-05-08", "action": "SELL", "exec_price": 10.0, "shares": 1000, "pnl": 100.0}
+    ])
+    summary = summarize_exit_audit(df)
+    assert summary["ok"] is True
+    assert summary["is_legacy_exit_audit"] is True
+    assert set(summary["missing_exit_columns"]) == {"exit_type", "exit_subtype", "trigger_price", "projected_pnl"}
+    assert summary["sell_rows"] == 1
+    assert summary["details"].iloc[0]["退出类型"] == "未记录"
 
 
 def test_trade_detail_preserves_p1_liquidity_slippage_fields():

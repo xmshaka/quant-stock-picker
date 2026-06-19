@@ -10,6 +10,7 @@ from backtest.records import (
     delete_backtest_run,
     list_backtest_runs,
     load_backtest_run,
+    summarize_exit_audit,
     summarize_liquidity_slippage,
     validate_trade_schema,
 )
@@ -272,7 +273,7 @@ if schema_check["ok"] and consistency.get("ok", False):
 else:
     st.warning(f"⚠️ 审计检查异常: schema={schema_check}, consistency={consistency}")
 
-tab_summary, tab_trades, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
+tab_summary, tab_trades, tab_exit, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "退出审计", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
 
 with tab_summary:
     c1, c2, c3 = st.columns(3)
@@ -293,16 +294,56 @@ with tab_trades:
         for col in ["exec_price", "amount", "commission", "stamp_duty", "transfer_fee", "slippage", "slippage_rate", "turnover_amount", "avg_cost", "pnl"]:
             if col in display_trades.columns:
                 display_trades[col] = pd.to_numeric(display_trades[col], errors="coerce").round(4)
+        for col in ["trigger_price", "projected_pnl"]:
+            if col in display_trades.columns:
+                display_trades[col] = pd.to_numeric(display_trades[col], errors="coerce").round(4)
         preferred_cols = [
             "symbol", "date", "action", "event_type", "exec_price", "shares", "amount",
             "slippage_rate", "slippage", "流动性分层", "turnover_amount",
-            "commission", "stamp_duty", "transfer_fee", "avg_cost", "pnl", "pnl_pct", "reason",
+            "commission", "stamp_duty", "transfer_fee", "avg_cost", "pnl", "pnl_pct",
+            "exit_type", "exit_subtype", "trigger_price", "projected_pnl", "reason",
         ]
         preferred_cols = [c for c in preferred_cols if c in display_trades.columns]
         rest_cols = [c for c in display_trades.columns if c not in preferred_cols]
         display_trades = display_trades[preferred_cols + rest_cols]
         st.dataframe(display_trades, width="stretch", hide_index=True)
         st.caption(f"共 {len(trades)} 笔成交；字段数 {len(trades.columns)}")
+
+with tab_exit:
+    exit_summary = summarize_exit_audit(trades)
+    if not exit_summary.get("ok"):
+        empty_state("🚪", "暂无卖出退出审计数据")
+    else:
+        if exit_summary.get("is_legacy_exit_audit"):
+            missing_cols = ", ".join(exit_summary.get("missing_exit_columns", []))
+            st.warning(
+                f"旧口径记录：缺少新版退出审计字段 {missing_cols}。"
+                "当前只展示已有 SELL 记录；如需准确退出类型/触发价/预估盈亏，请重新运行回测生成新版记录。",
+                icon="⚠️",
+            )
+        metric_row([
+            {"label": "卖出笔数", "value": f"{exit_summary['sell_rows']}笔"},
+            {"label": "止盈", "value": f"{exit_summary.get('take_profit_rows', 0)}笔", "color": "green"},
+            {"label": "止损", "value": f"{exit_summary.get('stop_loss_rows', 0)}笔", "color": "red" if exit_summary.get('stop_loss_rows', 0) else ""},
+            {"label": "信号退出", "value": f"{exit_summary.get('signal_exit_rows', 0)}笔"},
+            {"label": "末日清仓", "value": f"{exit_summary.get('final_liquidation_rows', 0)}笔"},
+            {"label": "退出总盈亏", "value": f"¥{exit_summary.get('total_pnl', 0):,.0f}", "color": "green" if exit_summary.get('total_pnl', 0) > 0 else "red"},
+        ], cols=6)
+        summary_df = exit_summary["summary"].copy()
+        for col in ["总盈亏", "平均盈亏", "平均触发价", "平均预估盈亏"]:
+            if col in summary_df.columns:
+                summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce").round(4)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
+        with st.expander("卖出明细审计", expanded=False):
+            details = exit_summary["details"].copy()
+            detail_cols = [
+                "symbol", "date", "signal_date", "exec_date", "退出类型", "退出子类",
+                "trigger_price", "exec_price", "projected_pnl", "pnl", "pnl_pct",
+                "holding_days", "reason", "rule_name",
+            ]
+            detail_cols = [c for c in detail_cols if c in details.columns]
+            st.dataframe(details[detail_cols], width="stretch", hide_index=True)
+        st.caption("退出审计字段来自新版 trades：exit_type / exit_subtype / trigger_price / projected_pnl；旧记录不会被静默改写。")
 
 with tab_liquidity:
     summary = summarize_liquidity_slippage(trades)
