@@ -21,7 +21,7 @@ from backtest.records import (
     trade_details_to_frame,
     trade_points_to_frame,
 )
-from backtest.scheme_backtest import SchemeBacktestResult
+from backtest.scheme_backtest import SchemeBacktestResult, classify_exit_reason
 from signals.rules import TradePoint
 from strategy.schemes import StrategyScheme
 
@@ -185,6 +185,52 @@ def test_trade_detail_contains_p0_cost_and_pnl_fields():
     assert row["slippage_rate"] == 0.002
     assert row["liquidity_bucket"] == "large_cap_gt_5e"
     assert row["turnover_amount"] == 600_000_000
+
+
+def test_trade_detail_contains_p0_exit_audit_fields():
+    """P0: 卖出成交明细必须具备机器可检索的退出审计字段。"""
+    rows = [{
+        "symbol": "000001",
+        "date": date(2025, 5, 8),
+        "action": "SELL",
+        "reason": "跟踪止盈(最高11.20)",
+        "rule_name": "ATR跟踪止盈",
+        "exec_price": 10.8,
+        "shares": 1000,
+        "avg_cost": 10.0,
+        "pnl": 760.0,
+        "exit_type": "take_profit",
+        "exit_subtype": "atr_trailing_profit",
+        "trigger_price": 10.75,
+        "projected_pnl": 760.0,
+    }]
+    df = trade_details_to_frame(rows, run_id="run_exit", source="executed")
+    assert validate_trade_schema(df)["ok"] is True
+    row = df.iloc[0]
+    assert row["exit_type"] == "take_profit"
+    assert row["exit_subtype"] == "atr_trailing_profit"
+    assert row["trigger_price"] == pytest.approx(10.75)
+    assert row["projected_pnl"] == pytest.approx(760.0)
+
+
+def test_trade_detail_defaults_exit_audit_fields_for_legacy_rows():
+    """旧记录缺字段时仅补空字段，不静默改写退出分类。"""
+    df = trade_details_to_frame([
+        {"symbol": "000001", "date": date(2025, 5, 8), "action": "SELL", "exec_price": 10.0, "shares": 100}
+    ], run_id="legacy")
+    row = df.iloc[0]
+    assert row["exit_type"] == ""
+    assert row["exit_subtype"] == ""
+    assert row["trigger_price"] == pytest.approx(10.0)
+    assert row["projected_pnl"] == pytest.approx(0.0)
+
+
+def test_classify_exit_reason_maps_common_exit_types():
+    assert classify_exit_reason("ATR止损", "止损(10.0)") == ("stop_loss", "atr_hard_stop")
+    assert classify_exit_reason("ATR跟踪止盈", "跟踪止盈") == ("take_profit", "atr_trailing_profit")
+    assert classify_exit_reason("ATR跟踪回撤止损", "跟踪止盈失效") == ("stop_loss", "atr_trailing_profit_failed")
+    assert classify_exit_reason("信号卖出", "规则卖出") == ("signal_exit", "rule_signal")
+    assert classify_exit_reason("末日清仓", "末日清仓") == ("final_liquidation", "end_of_backtest")
 
 
 def test_trade_detail_preserves_p1_liquidity_slippage_fields():

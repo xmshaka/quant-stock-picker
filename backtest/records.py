@@ -29,7 +29,8 @@ STANDARD_TRADE_COLUMNS = [
     "liquidity_bucket", "turnover_amount",
     "avg_cost", "cost", "pnl", "pnl_pct", "holding_days",
     "cash_after", "position_after", "position_shares",
-    "stop_loss", "take_profit",
+    "stop_loss", "take_profit", "exit_type", "exit_subtype",
+    "trigger_price", "projected_pnl",
 ]
 
 LIQUIDITY_BUCKET_LABELS = {
@@ -168,6 +169,10 @@ def trade_details_to_frame(
         row.setdefault("position_shares", row.get("position_after", 0))
         row.setdefault("stop_loss", 0.0)
         row.setdefault("take_profit", 0.0)
+        row.setdefault("exit_type", "")
+        row.setdefault("exit_subtype", "")
+        row.setdefault("trigger_price", row.get("price", 0.0) if action == "SELL" else 0.0)
+        row.setdefault("projected_pnl", row.get("pnl", 0.0) if action == "SELL" else 0.0)
         row.setdefault("reason", "")
         row.setdefault("rule_name", "")
         row["date"] = _date_str(row.get("date"))
@@ -181,7 +186,7 @@ def trade_details_to_frame(
     # 确保标准列在前，额外审计字段保留在后。
     for col in STANDARD_TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = "" if col in {"run_id", "symbol", "date", "signal_date", "exec_date", "action", "event_type", "source", "reason", "rule_name", "liquidity_bucket"} else 0
+            df[col] = "" if col in {"run_id", "symbol", "date", "signal_date", "exec_date", "action", "event_type", "source", "reason", "rule_name", "liquidity_bucket", "exit_type", "exit_subtype"} else 0
     extra_cols = [c for c in df.columns if c not in STANDARD_TRADE_COLUMNS]
     return df[STANDARD_TRADE_COLUMNS + extra_cols]
 

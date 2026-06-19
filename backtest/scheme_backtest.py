@@ -110,6 +110,37 @@ def _prepare_execution_bars(df: pd.DataFrame, *, fallback_source: str = "snapsho
     return out
 
 
+EXIT_REASON_MAP = {
+    'ATR止损': ('stop_loss', 'atr_hard_stop'),
+    'ATR跟踪止盈': ('take_profit', 'atr_trailing_profit'),
+    'ATR跟踪回撤止损': ('stop_loss', 'atr_trailing_profit_failed'),
+    'ATR止盈': ('take_profit', 'atr_fixed_profit'),
+    'ATR回撤止损': ('stop_loss', 'atr_profit_failed'),
+    '信号卖出': ('signal_exit', 'rule_signal'),
+    '末日清仓': ('final_liquidation', 'end_of_backtest'),
+}
+
+
+def classify_exit_reason(rule_name: str = "", reason: str = "") -> tuple[str, str]:
+    """将自由文本退出原因归一到审计字段。
+
+    P0 要求回测记录里有可机器检索的 exit_type / exit_subtype；UI 仍保留
+    reason/rule_name 供人工阅读。
+    """
+    rn = str(rule_name or "")
+    rs = str(reason or "")
+    for key, value in EXIT_REASON_MAP.items():
+        if key in rn or key in rs:
+            return value
+    if '止损' in rn or '止损' in rs:
+        return 'stop_loss', 'generic_stop_loss'
+    if '止盈' in rn or '止盈' in rs:
+        return 'take_profit', 'generic_take_profit'
+    if '信号' in rn or '信号' in rs:
+        return 'signal_exit', 'generic_signal'
+    return 'other_exit', 'manual_or_unknown'
+
+
 @dataclass
 class SchemeBacktestResult:
     """方案回测结果"""
@@ -492,7 +523,7 @@ class SchemeBacktester:
             denom = max(1.0 - variable_sell_cost, 1e-9)
             return (cost_value / shares + fixed_commission_per_share) / denom
 
-        def _sell(sym, dt_key, price, reason, rule_name, signal_date=None):
+        def _sell(sym, dt_key, price, reason, rule_name, signal_date=None, trigger_price=None, projected_pnl=None):
             """统一卖出逻辑"""
             nonlocal cash, sell_count
             pos = positions.pop(sym)
@@ -515,6 +546,9 @@ class SchemeBacktester:
                 else:
                     reason = f'止盈触发失败-回撤止损({price:.2f})'
                     rule_name = 'ATR回撤止损'
+            exit_type, exit_subtype = classify_exit_reason(rule_name, reason)
+            trigger_price = price if trigger_price is None else trigger_price
+            projected_pnl = pnl if projected_pnl is None else projected_pnl
             trades_pnl.append(pnl)
             cash += net
             sell_count += 1
@@ -541,6 +575,11 @@ class SchemeBacktester:
                 'liquidity_bucket': liquidity_bucket,
                 'turnover_amount': turnover_amount,
                 'cash_after': cash, 'reason': reason,
+                'rule_name': rule_name,
+                'exit_type': exit_type,
+                'exit_subtype': exit_subtype,
+                'trigger_price': trigger_price,
+                'projected_pnl': projected_pnl,
                 'holding_days': holding_days,
                 'entries': list(pos.get('entries', [])),
             })
@@ -680,20 +719,24 @@ class SchemeBacktester:
 
                 # 止损优先
                 if open_price <= pos['stop_loss']:
-                    _sell(sym, dt_key, open_price, f'止损({pos["stop_loss"]:.2f})', 'ATR止损')
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
+                    _sell(sym, dt_key, open_price, f'止损({pos["stop_loss"]:.2f})', 'ATR止损',
+                          trigger_price=pos['stop_loss'], projected_pnl=projected_pnl)
                     continue
                 # 跟踪止盈：只有 trailing_stop 已进入扣成本后的盈利保护区，且当日实际
                 # 开盘撮合价预估净收益仍为正，才允许触发“止盈”。否则等待硬止损/信号卖出。
                 if open_price <= pos['trailing_stop'] and pos['highest'] > pos['avg_cost']:
                     projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
                     if pos['trailing_stop'] > _breakeven_sell_price(sym, dt_key, pos) and projected_pnl > 0:
-                        _sell(sym, dt_key, open_price, f'跟踪止盈(最高{pos["highest"]:.2f})', 'ATR跟踪止盈')
+                        _sell(sym, dt_key, open_price, f'跟踪止盈(最高{pos["highest"]:.2f})', 'ATR跟踪止盈',
+                              trigger_price=pos['trailing_stop'], projected_pnl=projected_pnl)
                     continue
                 # 固定止盈
                 if open_price >= pos['take_profit']:
                     projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
                     if projected_pnl > 0:
-                        _sell(sym, dt_key, open_price, f'止盈({pos["take_profit"]:.2f})', 'ATR止盈')
+                        _sell(sym, dt_key, open_price, f'止盈({pos["take_profit"]:.2f})', 'ATR止盈',
+                              trigger_price=pos['take_profit'], projected_pnl=projected_pnl)
                     continue
 
             # 2. 执行今日的待处理信号
@@ -706,7 +749,9 @@ class SchemeBacktester:
                     continue
 
                 if tp.action == 'SELL' and sym in positions:
-                    _sell(sym, dt_key, price, tp.reason or '信号卖出', tp.rule_name or '信号卖出', signal_date=getattr(tp, 'date', None))
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, price, positions[sym])
+                    _sell(sym, dt_key, price, tp.reason or '信号卖出', tp.rule_name or '信号卖出',
+                          signal_date=getattr(tp, 'date', None), trigger_price=getattr(tp, 'price', price), projected_pnl=projected_pnl)
 
                 elif tp.action == 'BUY':
                     if sym in positions:
@@ -734,7 +779,8 @@ class SchemeBacktester:
         final_dt = date_list[-1].date() if hasattr(date_list[-1], 'date') else date_list[-1]
         for sym in list(positions.keys()):
             price = close_lookup.get(sym, {}).get(final_dt, positions[sym]['avg_cost'])
-            _sell(sym, final_dt, price, '末日清仓', '末日清仓')
+            projected_pnl, _, _ = _project_sell_pnl(sym, final_dt, price, positions[sym])
+            _sell(sym, final_dt, price, '末日清仓', '末日清仓', trigger_price=price, projected_pnl=projected_pnl)
 
         # 原始规则信号仅作为可选叠加层，不能参与默认 K线/绩效统计
         raw_signal_details = copy.deepcopy(stock_signal_details)
