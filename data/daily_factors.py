@@ -107,6 +107,37 @@ def load_daily_factors(date_str: Optional[str] = None) -> Tuple[pd.DataFrame, pd
     return factor_df, price_df, factor_names
 
 
+def snapshot_coverage_report(date_str: Optional[str] = None) -> dict:
+    """返回每日因子快照覆盖质量摘要。
+
+    注意：快照文件日期不等于所有股票的最新交易日。某些个股可能因停牌、
+    数据源缓存未补尾、临时接口异常而只保留自身较早的最新 K 线。
+    该报告供数据状态页区分“扫描日志更新数量”和“快照实际最新覆盖度”。
+    """
+    d = date_str or latest_snapshot_date()
+    if not d or not _factor_path(d).exists():
+        return {}
+
+    factor_df = pd.read_parquet(_factor_path(d), columns=["symbol", "trade_date"])
+    if factor_df.empty:
+        return {"snapshot_date": d, "symbols": 0, "global_latest_date": None, "fresh_symbols": 0, "stale_symbols": 0}
+
+    latest_by_symbol = factor_df.groupby("symbol")["trade_date"].max()
+    global_latest = latest_by_symbol.max()
+    fresh = int((latest_by_symbol == global_latest).sum())
+    stale = int((latest_by_symbol < global_latest).sum())
+    dist = latest_by_symbol.astype(str).value_counts().sort_index(ascending=False)
+    return {
+        "snapshot_date": d,
+        "symbols": int(latest_by_symbol.size),
+        "global_latest_date": str(global_latest)[:10],
+        "fresh_symbols": fresh,
+        "stale_symbols": stale,
+        "coverage_pct": round(fresh / max(int(latest_by_symbol.size), 1) * 100, 2),
+        "date_distribution": {str(k)[:10]: int(v) for k, v in dist.head(10).items()},
+    }
+
+
 def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """计算今日全池因子并保存。
 

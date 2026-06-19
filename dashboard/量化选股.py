@@ -15,6 +15,7 @@ from datetime import datetime
 
 from data_loader import load_data, FACTOR_NAME_MAP, NAME_MAP
 from signals.engine import SignalEngine, SignalFormatter
+from signals.scanner import scan_signals
 from signals.portfolio import PortfolioManager, PoolItem
 from theme import (
     inject_theme, metric_row, section_header, badge, badge_html,
@@ -59,12 +60,16 @@ hotspot = st.session_state.hotspot
 
 # ── 信号缓存（避免每次 rerun 重算）──
 @st.cache_data(ttl=120, show_spinner=False)
-def compute_signals(factor_df_key, price_df_key, factor_names_key, weights_key):
-    """用 hashable key 触发缓存，实际数据从 session_state 取。"""
-    engine = SignalEngine(buy_threshold=0.7, sell_threshold=2.0, min_strength=2.0)
-    buy, sell = engine.generate_signals(
-        st.session_state._factor_df, st.session_state._price_df,
-        st.session_state._factor_names, st.session_state._signal_weights, top_n=20,
+def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key):
+    """按新短线方案扫描信号；用 hashable key 触发缓存，实际数据从 session_state 取。"""
+    buy, sell = scan_signals(
+        st.session_state._factor_df,
+        st.session_state._price_df,
+        st.session_state._factor_names,
+        scheme_id=scheme_id,
+        market_score=market_score,
+        top_n=20,
+        include_sell_symbols=list(portfolio_symbols_key),
     )
     return buy, sell
 
@@ -82,17 +87,32 @@ st.session_state._factor_names = factor_names
 
 latest_date = pd.to_datetime(factor_df['trade_date'].max()).strftime('%Y-%m-%d')
 
-# ── 默认权重 ──
-DEFAULT_WEIGHTS = {
-    'rsi14': -0.1, 'macd_hist': 0.2, 'boll_position': 0.1,
-    'volatility_20d': -0.1, 'max_dd_60d': -0.1,
-    'north_hold_change': 0.4, 'turnover_ratio': 0.15, 'volume_ratio': 0.15,
-    'pe_ttm': -0.2, 'pb': -0.1, 'ep': 0.1,
-    'roe': 0.3, 'gross_margin': 0.2, 'revenue_growth': 0.2, 'profit_growth': 0.2,
-    'momentum_5d': -0.15, 'momentum_20d': -0.1, 'momentum_60d': 0.0, 'liquidity': 0.1, 'reversal': 0.3,
-}
-if "signal_weights" not in st.session_state:
-    st.session_state._signal_weights = DEFAULT_WEIGHTS.copy()
+def _date_key(value) -> str:
+    """统一日期比较口径，避免 date/Timestamp/字符串混用导致详情为空。"""
+    if pd.isna(value):
+        return ""
+    return pd.to_datetime(value).strftime('%Y-%m-%d')
+
+
+def _build_data_key(factor_df: pd.DataFrame, price_df: pd.DataFrame, latest_date: str):
+    """生成稳定缓存key；禁止用 id(df)，否则切页 rerun 会反复重扫。"""
+    factor_symbols = factor_df['symbol'].astype(str) if 'symbol' in factor_df.columns else pd.Series(dtype=str)
+    price_symbols = price_df['symbol'].astype(str) if 'symbol' in price_df.columns else pd.Series(dtype=str)
+    return (
+        latest_date,
+        int(len(factor_df)),
+        int(len(price_df)),
+        int(factor_symbols.nunique()),
+        int(price_symbols.nunique()),
+        tuple(sorted(factor_symbols.unique())[:10]),
+        tuple(sorted(price_symbols.unique())[:10]),
+    )
+
+# ── 新方案默认状态 ──
+if "signal_scheme_id" not in st.session_state:
+    st.session_state.signal_scheme_id = "balanced"
+if "market_score_override" not in st.session_state:
+    st.session_state.market_score_override = 50.0
 
 # ========== 顶部 ==========
 left_info = f"🎯 <strong>量化选股</strong>"
@@ -127,19 +147,31 @@ def show_factor_detail(symbol, factor_df, price_df, latest_date):
     """个股因子详情面板。"""
     from signals.engine import SignalEngine
 
-    detail = factor_df[(factor_df['symbol'] == symbol) & (factor_df['trade_date'] == latest_date)]
-    day_data = factor_df[factor_df['trade_date'] == latest_date].copy()
+    fdf = factor_df.copy()
+    fdf['_date_key'] = fdf['trade_date'].map(_date_key)
+    latest_key = _date_key(latest_date)
+    symbol_data = fdf[fdf['symbol'].astype(str) == str(symbol)].copy()
+    day_data = fdf[fdf['_date_key'] == latest_key].copy()
+
+    # 优先展示全局最新交易日；若该股票当天无快照，则回退到该股票自身最新日并明确提示。
+    detail = symbol_data[symbol_data['_date_key'] == latest_key]
+    if detail.empty and not symbol_data.empty:
+        symbol_latest = symbol_data['_date_key'].max()
+        detail = symbol_data[symbol_data['_date_key'] == symbol_latest]
+        st.warning(f"该股票缺少全局最新日 {latest_key} 快照，当前展示该股票自身最新日 {symbol_latest}。")
+        day_data = fdf[fdf['_date_key'] == symbol_latest].copy()
     if detail.empty:
         st.warning("无该股票最新数据")
         return
 
     row = detail.iloc[0]
-    factors = {k: v for k, v in row.items() if k not in ['symbol', 'trade_date'] and pd.notna(v)}
+    factors = {k: v for k, v in row.items() if k not in ['symbol', 'trade_date', '_date_key'] and pd.notna(v)}
 
     engine = SignalEngine()
     regime = engine._detect_regime(symbol, price_df, day_data)
 
     st.markdown(f"**{fmt_name(symbol)}** {badge(regime, 'regime')}", unsafe_allow_html=True)
+    st.caption(f"因子日期：{row['_date_key']}；全局最新交易日：{latest_key}")
 
     FACTOR_DIRS = {
         'rsi14': -1, 'macd_hist': 1, 'boll_position': 1, 'volatility_20d': -1, 'max_dd_60d': -1,
@@ -201,48 +233,65 @@ def show_factor_detail(symbol, factor_df, price_df, latest_date):
 
 # ========== 页面 0: 信号 ==========
 if page_idx == 0:
-    # ── 权重面板 ──
-    with st.expander("⚙ 因子权重调节", expanded=False):
-        FACTOR_GROUPS = {
-            '技术': ['rsi14', 'macd_hist', 'boll_position', 'volatility_20d', 'max_dd_60d'],
-            '情绪': ['north_hold_change', 'turnover_ratio', 'volume_ratio'],
-            '估值': ['pe_ttm', 'pb', 'ep'],
-            '质量': ['roe', 'gross_margin', 'revenue_growth', 'profit_growth'],
-            '动量': ['momentum_5d', 'momentum_20d', 'momentum_60d', 'liquidity', 'reversal'],
-        }
-        weights = {}
-        cols = st.columns(2)
-        col_idx = 0
-        for gname, gfactors in FACTOR_GROUPS.items():
-            available = [f for f in gfactors if f in factor_names]
-            if not available:
-                continue
-            with cols[col_idx % 2]:
-                st.caption(f"**{gname}**")
-                for f in available:
-                    default = st.session_state._signal_weights.get(f, DEFAULT_WEIGHTS.get(f, 0.0))
-                    cn = FACTOR_NAME_MAP.get(f, f)
-                    weights[f] = st.slider(cn, -1.0, 1.0, default, 0.05, key=f"ws_{f}")
-            col_idx += 1
-
-        if st.button("应用权重", type="primary", width="stretch"):
-            st.session_state._signal_weights = weights
-            # 清除信号缓存
+    # ── 新方案扫描控制 ──
+    with st.expander("⚙ 新方案信号扫描", expanded=True):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            scheme_options = {
+                "balanced": "全部策略/组合器",
+                "trend_momentum": "强势追涨",
+                "pullback": "回调低吸",
+                "breakout": "横盘突破",
+            }
+            selected_scheme = st.selectbox(
+                "扫描策略",
+                list(scheme_options.keys()),
+                format_func=lambda k: scheme_options[k],
+                index=list(scheme_options.keys()).index(st.session_state.signal_scheme_id),
+            )
+        with c2:
+            market_score_input = st.slider(
+                "大盘评分",
+                0.0, 100.0, float(st.session_state.market_score_override), 1.0,
+                help="临时使用手动评分；后续接入 market/timing.py 实时评分。",
+            )
+        st.caption("当前扫描路径：大盘评分 → 股票池过滤 → 三策略独立候选 → L1趋势过滤 → L2形态匹配 → L3共振确认。信号日为T日收盘，建议成交日为T+1。")
+        if selected_scheme != st.session_state.signal_scheme_id or market_score_input != st.session_state.market_score_override:
+            st.session_state.signal_scheme_id = selected_scheme
+            st.session_state.market_score_override = market_score_input
             compute_signals.clear()
             st.rerun()
 
     # ── 计算信号 ──
-    buy_signals, sell_signals = compute_signals(
-        id(factor_df), id(price_df), tuple(factor_names),
-        tuple(sorted(st.session_state._signal_weights.items())),
+    portfolio_symbols = tuple(sorted({item.symbol for item in (pm.watch_list + pm.hold_list)}))
+    data_key = _build_data_key(factor_df, price_df, latest_date)
+    signal_cache_key = (
+        data_key,
+        tuple(factor_names),
+        st.session_state.signal_scheme_id,
+        float(st.session_state.market_score_override),
+        portfolio_symbols,
     )
+    if st.session_state.get("_latest_signal_cache_key") == signal_cache_key:
+        buy_signals, sell_signals = st.session_state.get("_latest_signal_result", ([], []))
+    else:
+        buy_signals, sell_signals = compute_signals(
+            data_key,
+            tuple(factor_names),
+            st.session_state.signal_scheme_id,
+            float(st.session_state.market_score_override),
+            portfolio_symbols,
+        )
+        st.session_state._latest_signal_cache_key = signal_cache_key
+        st.session_state._latest_signal_result = (buy_signals, sell_signals)
+        st.session_state._latest_signal_map = {s.symbol: s for s in (buy_signals + sell_signals)}
 
     # ── 顶部指标 ──
     metric_row([
-        {"label": "强力买入", "value": str(len([s for s in buy_signals if s.strength >= 4])), "color": "green"},
-        {"label": "一般买入", "value": str(len([s for s in buy_signals if s.strength < 4])), "color": "yellow"},
-        {"label": "强力卖出", "value": str(len([s for s in sell_signals if s.strength >= 4])), "color": "red"},
-        {"label": "一般卖出", "value": str(len([s for s in sell_signals if s.strength < 4])), "color": "orange"},
+        {"label": "大盘评分", "value": f"{st.session_state.market_score_override:.0f}"},
+        {"label": "买入候选", "value": str(len(buy_signals)), "color": "green"},
+        {"label": "风险退出", "value": str(len(sell_signals)), "color": "red" if sell_signals else ""},
+        {"label": "扫描策略", "value": scheme_options.get(st.session_state.signal_scheme_id, st.session_state.signal_scheme_id)},
     ])
 
     # ── 手动加入 ──
@@ -282,9 +331,15 @@ if page_idx == 0:
             with col_info:
                 signal_card(
                     name=f"<strong>{fmt_name(s.symbol)}</strong>",
-                    meta=f"{s.strategy_name} · 强度 {s.strength} · 得分 {s.score:.2f}",
+                    meta=(
+                        f"{s.strategy_name} · 总分 {s.score:.2f} · 共振 {getattr(s, 'layer3_confirmations', '-')}/6 · "
+                        f"信号日 {getattr(s, 'signal_date', latest_date)} · T+1 {getattr(s, 'suggested_exec_date', '-') or '-'} · "
+                        f"建议仓位 {getattr(s, 'suggested_position_pct', 0) * 100:.1f}%"
+                    ),
                     badges_html=badges_html,
                 )
+                if getattr(s, 'entry_reason', ''):
+                    st.caption(s.entry_reason)
             with col_action:
                 if in_hold:
                     st.markdown(f'<div style="text-align:center;padding-top:12px;">{badge("持仓", "hold")}</div>', unsafe_allow_html=True)
@@ -314,9 +369,14 @@ if page_idx == 0:
             with col_info:
                 signal_card(
                     name=f"<strong>{fmt_name(s.symbol)}</strong>",
-                    meta=f"{s.strategy_name} · 强度 {s.strength}",
+                    meta=(
+                        f"{s.strategy_name} · 风险分 {s.score:.2f} · "
+                        f"信号日 {getattr(s, 'signal_date', latest_date)} · T+1 {getattr(s, 'suggested_exec_date', '-') or '-'}"
+                    ),
                     badges_html=f"{regime_b} {risk_b}",
                 )
+                if getattr(s, 'entry_reason', ''):
+                    st.caption(s.entry_reason)
             with col_action:
                 if in_hold:
                     if st.button("卖出", key=f"sell_{s.symbol}", type="primary", width="stretch"):
@@ -338,8 +398,16 @@ elif page_idx == 1:
 
             col_info, col_btns = st.columns([3, 2])
             with col_info:
+                live_sig = st.session_state.get("_latest_signal_map", {}).get(item.symbol)
+                live_meta = (
+                    f"最新扫描：{live_sig.strategy_name} · 总分 {live_sig.score:.2f} · 共振 {live_sig.layer3_confirmations}/6 · {live_sig.signal_date}"
+                    if live_sig else
+                    f"入池记录：{item.add_reason} · 强度 {item.signal_strength} · {item.add_date}"
+                )
                 st.markdown(f'<div style="font-size:0.88rem;font-weight:600;">{fmt_name(item.symbol)} {hot_b}</div>', unsafe_allow_html=True)
-                st.caption(f"{item.add_reason} · 强度 {item.signal_strength} · {item.add_date}")
+                st.caption(live_meta)
+                if live_sig and getattr(live_sig, 'entry_reason', ''):
+                    st.caption(live_sig.entry_reason)
             with col_btns:
                 b1, b2, b3 = st.columns(3)
                 with b1:
@@ -384,6 +452,12 @@ elif page_idx == 2:
 
             col_info, col_btns = st.columns([3, 2])
             with col_info:
+                live_sig = st.session_state.get("_latest_signal_map", {}).get(item.symbol)
+                live_meta = (
+                    f"最新扫描：{live_sig.strategy_name} · 风险分 {live_sig.score:.2f} · {live_sig.signal_date}"
+                    if live_sig else
+                    f"入池记录：{item.add_reason} · 强度 {item.signal_strength} · {item.add_date}"
+                )
                 st.markdown(f'<div style="font-size:0.88rem;font-weight:600;">{fmt_name(item.symbol)} {hot_b}</div>', unsafe_allow_html=True)
                 sent_label = ""
                 if hot.get("has_hot"):
@@ -392,7 +466,9 @@ elif page_idx == 2:
                         sent_label = badge("利好", "buy")
                     elif avg_s < -0.2:
                         sent_label = badge("利空", "sell")
-                st.caption(f"{item.add_reason} · 强度 {item.signal_strength} · {item.add_date} {sent_label}")
+                st.caption(f"{live_meta} {sent_label}")
+                if live_sig and getattr(live_sig, 'entry_reason', ''):
+                    st.caption(live_sig.entry_reason)
             with col_btns:
                 b1, b2 = st.columns(2)
                 with b1:

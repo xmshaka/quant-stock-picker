@@ -459,7 +459,40 @@ class SchemeBacktester:
             rate, bucket = get_liquidity_slippage_rate(turnover_amount, DEFAULT_SLIPPAGE)
             return rate, bucket, turnover_amount
 
-        def _sell(sym, dt_key, price, reason, rule_name):
+        def _project_sell_pnl(sym, dt_key, price, pos):
+            """按当前撮合价预估卖出净盈亏，含滑点/佣金/印花税/过户费。
+
+            用于止盈类规则触发前的业务条件校验：只有真实成交后仍能覆盖成本，
+            才允许归因为“止盈/跟踪止盈”。
+            """
+            slippage_rate, _, _ = _slippage_info(sym, dt_key)
+            exec_price = price * (1 - slippage_rate)
+            revenue = pos['shares'] * exec_price
+            commission = max(revenue * COMMISSION, MIN_COMMISSION)
+            stamp = revenue * STAMP_DUTY
+            transfer_fee = revenue * TRANSFER_FEE
+            net = revenue - commission - stamp - transfer_fee
+            pnl = net - pos['shares'] * pos['avg_cost']
+            pnl_pct = pnl / (pos['shares'] * pos['avg_cost']) if pos['avg_cost'] > 0 else 0
+            return pnl, pnl_pct, exec_price
+
+        def _breakeven_sell_price(sym, dt_key, pos):
+            """卖出侧盈亏平衡价近似值，含卖出佣金下限、印花税、过户费、默认滑点。
+
+            这里用于判断 trailing_stop 是否已经抬升到“盈利保护区”。实际成交前仍会
+            用 _project_sell_pnl 做最终净收益校验，避免把亏损交易归因为止盈。
+            """
+            shares = max(int(pos.get('shares', 0) or 0), 0)
+            if shares <= 0:
+                return float('inf')
+            cost_value = shares * float(pos.get('avg_cost', 0.0) or 0.0)
+            slippage_rate, _, _ = _slippage_info(sym, dt_key)
+            fixed_commission_per_share = MIN_COMMISSION / shares
+            variable_sell_cost = STAMP_DUTY + TRANSFER_FEE + slippage_rate
+            denom = max(1.0 - variable_sell_cost, 1e-9)
+            return (cost_value / shares + fixed_commission_per_share) / denom
+
+        def _sell(sym, dt_key, price, reason, rule_name, signal_date=None):
             """统一卖出逻辑"""
             nonlocal cash, sell_count
             pos = positions.pop(sym)
@@ -473,6 +506,15 @@ class SchemeBacktester:
             net = revenue - commission - stamp - transfer_fee
             pnl = net - pos['shares'] * pos['avg_cost']
             pnl_pct = pnl / (pos['shares'] * pos['avg_cost']) if pos['avg_cost'] > 0 else 0
+            # FIX: 止盈类规则必须以扣除完整交易成本后的净收益为准。
+            # 若跳空/滑点/费用导致实际亏损，不能把交易归因为“止盈”。
+            if pnl <= 0 and ('止盈' in str(reason) or '止盈' in str(rule_name)):
+                if '跟踪' in str(reason) or '跟踪' in str(rule_name):
+                    reason = f'跟踪止盈失效-回撤止损(最高{pos.get("highest", price):.2f})'
+                    rule_name = 'ATR跟踪回撤止损'
+                else:
+                    reason = f'止盈触发失败-回撤止损({price:.2f})'
+                    rule_name = 'ATR回撤止损'
             trades_pnl.append(pnl)
             cash += net
             sell_count += 1
@@ -485,9 +527,12 @@ class SchemeBacktester:
                 avg_cost=pos['avg_cost'],
                 pnl=pnl, pnl_pct=pnl_pct, holding_days=holding_days,
             )
+            setattr(tp_out, 'signal_date', signal_date or '')
+            setattr(tp_out, 'exec_date', dt_key)
             actual_trades.append((sym, tp_out))
             trade_details.append({
                 'symbol': sym, 'date': dt_key, 'action': 'SELL',
+                'exec_date': dt_key, 'signal_date': signal_date or '',
                 'price': exec_price, 'exec_price': exec_price, 'shares': pos['shares'],
                 'cost': pos['avg_cost'], 'pnl': pnl, 'pnl_pct': pnl_pct,
                 'commission': commission, 'stamp_duty': stamp,
@@ -503,7 +548,7 @@ class SchemeBacktester:
                 logger.info(f"  [{dt_key}] 卖出 {sym} {pos['shares']}股 @ {price:.2f} 盈亏={pnl:+.0f} ({reason})")
             return tp_out
 
-        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False):
+        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False, signal_date=None):
             """统一买入/加仓逻辑，含资金校验"""
             nonlocal cash, buy_count
             total_value = cash + sum(
@@ -586,10 +631,13 @@ class SchemeBacktester:
                 take_profit=pos['take_profit'],
                 trailing_stop=pos['trailing_stop'],
             )
+            setattr(tp_out, 'signal_date', signal_date or '')
+            setattr(tp_out, 'exec_date', dt_key)
             actual_trades.append((sym, tp_out))
             trade_details.append({
                 # FIX:P0: 加仓也属于 BUY 执行事件，K线/明细/统计必须一致
                 'symbol': sym, 'date': dt_key, 'action': 'BUY', 'event_type': 'ADD' if is_add else 'BUY',
+                'exec_date': dt_key, 'signal_date': signal_date or '',
                 'price': exec_price, 'exec_price': exec_price, 'shares': shares,
                 'commission': commission, 'stamp_duty': 0.0,
                 'transfer_fee': transfer_fee, 'slippage': slippage_cost,
@@ -634,31 +682,38 @@ class SchemeBacktester:
                 if open_price <= pos['stop_loss']:
                     _sell(sym, dt_key, open_price, f'止损({pos["stop_loss"]:.2f})', 'ATR止损')
                     continue
-                # 跟踪止盈
+                # 跟踪止盈：只有 trailing_stop 已进入扣成本后的盈利保护区，且当日实际
+                # 开盘撮合价预估净收益仍为正，才允许触发“止盈”。否则等待硬止损/信号卖出。
                 if open_price <= pos['trailing_stop'] and pos['highest'] > pos['avg_cost']:
-                    _sell(sym, dt_key, open_price, f'跟踪止盈(最高{pos["highest"]:.2f})', 'ATR跟踪止盈')
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
+                    if pos['trailing_stop'] > _breakeven_sell_price(sym, dt_key, pos) and projected_pnl > 0:
+                        _sell(sym, dt_key, open_price, f'跟踪止盈(最高{pos["highest"]:.2f})', 'ATR跟踪止盈')
                     continue
                 # 固定止盈
                 if open_price >= pos['take_profit']:
-                    _sell(sym, dt_key, open_price, f'止盈({pos["take_profit"]:.2f})', 'ATR止盈')
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
+                    if projected_pnl > 0:
+                        _sell(sym, dt_key, open_price, f'止盈({pos["take_profit"]:.2f})', 'ATR止盈')
                     continue
 
             # 2. 执行今日的待处理信号
             actions = pending_actions.get(dt_key, {})
             for sym, tp in actions.items():
-                price = close_lookup.get(sym, {}).get(dt_key, 0)
+                # FIX: 信号在 T 日收盘后产生，只能在 T+1 开盘/撮合价执行；
+                # 禁止使用 T+1 收盘价回看成交，避免未来函数和成交价失真。
+                price = open_lookup.get(sym, {}).get(dt_key, 0)
                 if price <= 0:
                     continue
 
                 if tp.action == 'SELL' and sym in positions:
-                    _sell(sym, dt_key, price, tp.reason or '信号卖出', tp.rule_name or '信号卖出')
+                    _sell(sym, dt_key, price, tp.reason or '信号卖出', tp.rule_name or '信号卖出', signal_date=getattr(tp, 'date', None))
 
                 elif tp.action == 'BUY':
                     if sym in positions:
                         # 已持仓 → 加仓（检查次数上限）
                         if positions[sym].get('add_count', 0) < max_add_times:
                             result_tp = _buy(sym, dt_key, price, tp.reason or '加仓', tp.rule_name or '加仓',
-                                            confidence=tp.confidence, is_add=True)
+                                            confidence=tp.confidence, is_add=True, signal_date=getattr(tp, 'date', None))
                             if result_tp:
                                 positions[sym]['add_count'] = positions[sym].get('add_count', 0) + 1
                         elif verbose:
@@ -666,7 +721,7 @@ class SchemeBacktester:
                     else:
                         # 新建仓
                         _buy(sym, dt_key, price, tp.reason or '信号买入', tp.rule_name or '信号买入',
-                             confidence=tp.confidence)
+                             confidence=tp.confidence, signal_date=getattr(tp, 'date', None))
 
             # 3. 计算当日总权益
             total_value = cash

@@ -23,6 +23,7 @@ from backtest.records import (
 )
 from backtest.scheme_backtest import SchemeBacktestResult
 from signals.rules import TradePoint
+from strategy.schemes import StrategyScheme
 
 
 def test_executed_signals_trade_details_consistency():
@@ -269,6 +270,103 @@ def test_summarize_liquidity_slippage_marks_legacy_audit_records():
     assert summary["is_legacy_audit"] is True
     assert set(summary["missing_audit_columns"]) == {"slippage_rate", "liquidity_bucket", "turnover_amount"}
     assert summary["total_amount"] == pytest.approx(200_604.0)
+
+
+def test_single_stock_signal_executes_next_day_open_and_records_signal_date(monkeypatch):
+    """单股信号必须 T+1 开盘成交，并保留 signal_date/exec_date 审计链路。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": dates,
+        "open": [10.00, 10.50, 10.80],
+        "high": [10.20, 10.80, 11.00],
+        "low": [9.90, 10.40, 10.70],
+        "close": [10.10, 10.70, 10.90],
+        "volume": [1_000_000] * 3,
+        "amount": [1_000_000_000] * 3,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv", lambda symbols, lookback_days: bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="测试信号", confidence=1.0, price=10.10, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="test_open_exec",
+        name="T+1开盘成交测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+    )
+    factor_df = bars[["symbol", "trade_date"]].copy()
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=factor_df, price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+    )
+
+    buy = next(t for t in result.trade_details if t["action"] == "BUY")
+    assert buy["signal_date"] == dates[0].date()
+    assert buy["exec_date"] == dates[1].date()
+    assert buy["date"] == dates[1].date()
+    assert buy["exec_price"] == pytest.approx(10.50 * 1.002)
+
+
+def test_trailing_take_profit_requires_cost_adjusted_profit(monkeypatch):
+    """trailing_stop 未进入扣成本盈利保护区时，不能触发 ATR跟踪止盈。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 4,
+        "trade_date": dates,
+        "open": [10.00, 10.00, 10.40, 9.95],
+        "high": [10.20, 10.20, 10.60, 9.98],
+        "low": [9.80, 9.80, 10.00, 9.50],
+        "close": [10.00, 10.00, 10.50, 9.70],
+        "volume": [1_000_000] * 4,
+        "amount": [1_000_000_000] * 4,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv", lambda symbols, lookback_days: bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="测试买入", confidence=1.0, price=10.00, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="test_trailing_guard",
+        name="跟踪止盈条件测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        stop_loss_atr_mult=10.0,
+        take_profit_atr_mult=100.0,
+        trailing_atr_mult=1.5,
+    )
+    factor_df = bars[["symbol", "trade_date"]].copy()
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=factor_df, price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=4, initial_capital=1_000_000,
+    )
+
+    sell_reasons = [t["reason"] for t in result.trade_details if t["action"] == "SELL"]
+    assert sell_reasons
+    assert all("跟踪止盈" not in reason for reason in sell_reasons)
+    assert sell_reasons[-1] == "末日清仓"
 
 
 def test_list_and_load_backtest_runs(tmp_path):

@@ -41,6 +41,20 @@ def _record_table_height(row_count: int) -> int:
     height = header_height + max(int(row_count), 1) * row_height + padding
     return min(max(height, min_height), max_height)
 
+
+def _first_valid_date(*values):
+    """按优先级取第一个有效日期，避免 pandas NaN/NaT 把 exec_date 覆盖掉。"""
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        return pd.Timestamp(value).date()
+    raise ValueError("缺少有效交易日期")
+
 section_header("历史回测记录")
 st.caption("读取 data/backtest_runs/*：metrics/config/trades/equity/signals，用于复盘和审计。")
 ensure_history_state(st.session_state)
@@ -337,7 +351,8 @@ with tab_kline:
         for _, row in sym_sigs.iterrows():
             try:
                 points.append(TradePoint(
-                    date=pd.Timestamp(row.get("date") or row.get("exec_date")).date(),
+                    # K线买卖点必须落在实际成交日；date 仅作为旧记录兼容回退。
+                    date=_first_valid_date(row.get("exec_date"), row.get("date"), row.get("signal_date")),
                     action=str(row.get("action", "")),
                     reason=str(row.get("reason", "")),
                     confidence=float(row.get("confidence", 1.0) or 1.0),
@@ -352,6 +367,10 @@ with tab_kline:
                     pnl_pct=float(row.get("pnl_pct", 0.0) or 0.0),
                     holding_days=int(row.get("holding_days", 0) or 0),
                 ))
+                signal_date = row.get("signal_date", "")
+                if signal_date is not None and signal_date != "" and not pd.isna(signal_date):
+                    setattr(points[-1], "signal_date", pd.Timestamp(signal_date).date())
+                setattr(points[-1], "exec_date", _first_valid_date(row.get("exec_date"), row.get("date"), row.get("signal_date")))
             except Exception:
                 continue
         lookback_days = int(config.get("lookback_days", 80) or 80)

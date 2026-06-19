@@ -5,6 +5,7 @@
 这里只管业务组件：信号卡、指标卡、徽章、进度条等。
 """
 import re
+from html import escape
 
 import streamlit as st
 from typing import List, Dict, Optional, Any
@@ -281,7 +282,7 @@ def section_header(title: str, subtitle: str = ""):
 
 def badge_html(text: str, kind: str = "neutral") -> str:
     """返回徽章 HTML（仅用于 unsafe_allow_html=True 场景）"""
-    return f'<span class="qsp-badge {kind}">{text}</span>'
+    return f'<span class="qsp-badge {escape(str(kind), quote=True)}">{escape(str(text))}</span>'
 
 
 def badge(text: str, kind: str = "neutral") -> str:
@@ -306,10 +307,11 @@ def empty_state(icon: str, message: str):
 
 def signal_card(name: str, meta: str, badges_html: str = ""):
     """信号卡。badges_html 应使用 badge_html() 生成。"""
+    safe_meta = escape(str(meta))
     st.markdown(f"""
     <div class="qsp-signal">
         <div class="name">{name} {badges_html}</div>
-        <div class="meta">{meta}</div>
+        <div class="meta">{safe_meta}</div>
     </div>
     """, unsafe_allow_html=True)
 

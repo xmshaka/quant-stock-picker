@@ -98,6 +98,12 @@ class TushareFetcher(BaseFetcher):
 
         def _fetch():
             df = self.pro.daily(ts_code=ts_code, start_date=sd, end_date=ed)
+            if df is None or df.empty:
+                logger.debug(f"[Tushare] daily {ts_code} {sd}-{ed} 返回空")
+                return pd.DataFrame()
+            if "trade_date" not in df.columns:
+                logger.warning(f"[Tushare] daily {ts_code} 缺少 trade_date 列: {list(df.columns)}")
+                return pd.DataFrame()
             df = df.rename(columns={
                 "trade_date": "trade_date",
                 "open": "open",
@@ -165,10 +171,7 @@ class TushareFetcher(BaseFetcher):
                 logger.info(f"[Tushare] daily_basic 命中本地缓存 {td}: {len(cached)} 条")
                 return cached
 
-            def _fetch(_td=td):
-                return self.pro.daily_basic(trade_date=_td)
-
-            result = self._safe_fetch(_fetch)
+            result = self._fetch_daily_basic_once(td)
             if result is not None and not result.empty:
                 result = result.copy()
                 result.attrs["trade_date"] = td
@@ -176,8 +179,35 @@ class TushareFetcher(BaseFetcher):
                 cache.l2.set_snapshot(cache_key, result)
                 logger.info(f"[Tushare] daily_basic 已缓存 {td}: {len(result)} 条")
                 return result
-            logger.debug(f"[Tushare] daily_basic {td} 为空，尝试前一日")
+            if trade_date:
+                logger.debug(f"[Tushare] daily_basic {td} 为空")
+            else:
+                logger.debug(f"[Tushare] daily_basic {td} 为空，尝试前一日")
 
+        return pd.DataFrame()
+
+    def _fetch_daily_basic_once(self, trade_date: str) -> pd.DataFrame:
+        """拉取单日 daily_basic。
+
+        Tushare 对尚未发布/非交易日的 daily_basic 会正常返回空表，
+        这不是接口异常，不能走 BaseFetcher._safe_fetch，否则会被误记为 ERROR。
+        """
+        max_retries = 3
+        for i in range(max_retries):
+            try:
+                df = self.pro.daily_basic(trade_date=trade_date)
+                if df is None or df.empty:
+                    logger.debug(f"[Tushare] daily_basic {trade_date} 返回空")
+                    return pd.DataFrame()
+                if "trade_date" not in df.columns:
+                    # 部分 Tushare/Mock 返回不带 trade_date；daily_basic 的日期由请求参数唯一确定。
+                    logger.debug(f"[Tushare] daily_basic {trade_date} 缺少 trade_date 列，使用请求日期补齐")
+                    df = df.copy()
+                    df["trade_date"] = trade_date
+                return df
+            except Exception as e:
+                logger.warning(f"[Tushare] daily_basic {trade_date} 第{i + 1}次获取异常: {e}")
+        logger.error(f"[Tushare] daily_basic {trade_date} 获取异常，已达最大重试次数")
         return pd.DataFrame()
 
     def get_financial_indicator(self, symbol: str) -> pd.DataFrame:
@@ -252,6 +282,12 @@ class TushareFetcher(BaseFetcher):
 
         def _fetch():
             df = self.pro.index_daily(ts_code=ts_code, start_date=sd, end_date=ed)
+            if df is None or df.empty:
+                logger.debug(f"[Tushare] index_daily {ts_code} {sd}-{ed} 返回空")
+                return pd.DataFrame()
+            if "trade_date" not in df.columns:
+                logger.warning(f"[Tushare] index_daily {ts_code} 缺少 trade_date 列: {list(df.columns)}")
+                return pd.DataFrame()
             df["trade_date"] = pd.to_datetime(df["trade_date"])
             df["symbol"] = index_code
             return df

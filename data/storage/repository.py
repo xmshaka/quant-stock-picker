@@ -125,6 +125,19 @@ class StockRepository(BaseRepository):
             out[sym] = (dt, ca)
         return out
 
+    def get_latest_dates_with_created_at(self, symbols: List[str]) -> dict:
+        """兼容增量扫描器的批量最新日期接口。
+
+        增量扫描需要同时知道每只股票的最新 ``trade_date`` 和该记录的
+        ``created_at``，用于判断收盘后是否要重刷盘中临时数据。
+        旧实现只有 ``get_latest_dates_bulk``，导致每日扫描进入异常兜底路径，
+        容易把全池都当作待处理任务，进而造成扫描历史口径失真。
+
+        Returns:
+            {symbol: (trade_date or None, created_at or None)}
+        """
+        return self.get_latest_dates_bulk(symbols)
+
     def count_bars(self, symbol: Optional[str] = None) -> int:
         with self.session() as s:
             q = s.query(func.count(StockBar.id))

@@ -149,6 +149,56 @@ def test_tushare_daily_basic_uses_l2_cache(monkeypatch, tmp_path):
     assert df.attrs["source"] == "tushare_daily_basic_cache"
 
 
+def test_tushare_daily_basic_fills_missing_trade_date_from_request(monkeypatch, tmp_path):
+    from data.fetchers import tushare_fetcher as mod
+    from data.cache_manager import CacheManager, ParquetCache
+
+    class FakePro:
+        def daily_basic(self, trade_date: str):
+            # 模拟 Tushare/Mock 返回没有 trade_date 列，不能触发 KeyError。
+            return pd.DataFrame({"ts_code": ["000001.SZ"], "pe_ttm": [5.0]})
+
+    class FakeTs:
+        @staticmethod
+        def pro_api(token: str):
+            return FakePro()
+
+    cache = CacheManager.get()
+    monkeypatch.setattr(cache, "l2", ParquetCache(tmp_path))
+    monkeypatch.setattr(mod, "ts", FakeTs())
+    monkeypatch.setattr(mod, "_get_tushare_token", lambda: "token")
+
+    fetcher = mod.TushareFetcher()
+    df = fetcher.get_daily_basic(trade_date="20260618")
+
+    assert not df.empty
+    assert "trade_date" in df.columns
+    assert df["trade_date"].iloc[0] == "20260618"
+    assert df.attrs["trade_date"] == "20260618"
+    assert df.attrs["source"] == "tushare_daily_basic_api"
+
+
+def test_tushare_daily_bars_missing_trade_date_returns_empty(monkeypatch):
+    from data.fetchers import tushare_fetcher as mod
+
+    class FakePro:
+        def daily(self, ts_code: str, start_date: str, end_date: str):
+            return pd.DataFrame({"ts_code": [ts_code], "close": [10.0]})
+
+    class FakeTs:
+        @staticmethod
+        def pro_api(token: str):
+            return FakePro()
+
+    monkeypatch.setattr(mod, "ts", FakeTs())
+    monkeypatch.setattr(mod, "_get_tushare_token", lambda: "token")
+
+    fetcher = mod.TushareFetcher()
+    df = fetcher.get_daily_bars("000001", "20260618", "20260618")
+
+    assert df.empty
+
+
 def test_universe_preserves_source_meta(monkeypatch):
     from data import universe as uni
 

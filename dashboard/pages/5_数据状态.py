@@ -15,7 +15,7 @@ section_header("数据状态")
 
 # ========== 快照状态 ==========
 try:
-    from data.daily_factors import latest_snapshot_date, load_snapshot_meta, latest_data_source_meta
+    from data.daily_factors import latest_snapshot_date, load_snapshot_meta, latest_data_source_meta, snapshot_coverage_report
     HAS_DAILY_FACTORS = True
 except ImportError as e:
     print(f"Warning: Failed to import from data.daily_factors: {e}")
@@ -27,6 +27,8 @@ except ImportError as e:
         return None
     def latest_data_source_meta():
         return {"snapshot_date": "", "snapshot_source": "none", "primary_source": "", "quote_source": "", "daily_basic_source": "", "daily_basic_date": "", "computed_at": ""}
+    def snapshot_coverage_report(date_str=None):
+        return {}
 
 snap_date = latest_snapshot_date()
 if snap_date:
@@ -45,6 +47,22 @@ if snap_date:
             section_header("因子列表", f"({len(fnames)})")
             tags = " ".join([badge(f, "hold") for f in fnames])
             st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:4px;">{tags}</div>', unsafe_allow_html=True)
+
+        coverage = snapshot_coverage_report(snap_date)
+        if coverage:
+            section_header("快照覆盖度")
+            metric_row([
+                {"label": "全局最新交易日", "value": coverage.get("global_latest_date") or "—"},
+                {"label": "最新覆盖", "value": f"{coverage.get('fresh_symbols', 0):,} 只"},
+                {"label": "滞后个股", "value": f"{coverage.get('stale_symbols', 0):,} 只"},
+                {"label": "覆盖率", "value": f"{coverage.get('coverage_pct', 0):.2f}%"},
+            ], cols=4)
+            dist = coverage.get("date_distribution", {})
+            if dist:
+                dist_text = " · ".join([f"{d}: {n}只" for d, n in dist.items()])
+                st.caption(f"各股票自身最新交易日分布：{dist_text}")
+                if coverage.get("stale_symbols", 0):
+                    st.warning("存在个股快照落后于全局最新交易日；观察页会回退展示该股票自身最新日。请重新跑增量扫描 + 全池因子预计算补齐后再用于正式信号。")
 else:
     empty_state("🩺", "暂无快照数据")
 
@@ -166,7 +184,9 @@ try:
         for idx, (_, row) in enumerate(reports.head(10).iterrows()):
             ts = str(row.get("ts", ""))[:16]
             total = row.get("total_symbols", 0)
+            skipped = row.get("skipped_up_to_date", 0)
             updated = row.get("updated_count", 0)
+            new_rows = row.get("new_rows", 0)
             failed = row.get("failed_count", 0)
             elapsed = row.get("elapsed_seconds", 0)
             row_bg = C['surface2'] if idx % 2 == 0 else C['surface']
@@ -177,9 +197,10 @@ try:
             <div style="background:{row_bg};border:1px solid {C['border']};border-left:4px solid {tone_color};border-radius:0.375rem;margin-bottom:7px;padding:9px 12px;display:flex;align-items:center;gap:14px;">
                 <span style="font-size:0.78rem;font-weight:600;min-width:140px;color:{C['text']};">{ts}</span>
                 <span style="min-width:58px;">{status_b}</span>
-                <span style="font-size:0.72rem;color:{C['text2']};">股票池 {total} · 更新 {updated} · 耗时 {elapsed:.0f}s</span>
+                <span style="font-size:0.72rem;color:{C['text2']};">股票池 {total} · 已最新 {skipped} · 拉取更新 {updated} · 新增行 {new_rows} · 耗时 {elapsed:.0f}s</span>
             </div>
             """, unsafe_allow_html=True)
+        st.caption("说明：扫描历史的“拉取更新”来自增量扫描日志，表示本次实际请求并写入过的股票数；它不等于每日因子快照中覆盖到全局最新交易日的股票数。")
     else:
         empty_state("📋", "暂无扫描记录")
 except Exception as e:

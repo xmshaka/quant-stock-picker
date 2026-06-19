@@ -95,24 +95,24 @@ class TrendFilter:
             # MA20>MA_long 作为加分项而非必须
             if not np.isnan(ma_long_val) and ma20 > ma_long_val:
                 score += 0.15
-                reasons.append("MA20>MA" + str(self.ma_long))
+                reasons.append("MA20高于MA" + str(self.ma_long))
             # 价格相对 MA20 位置仅作参考
             if close.iloc[-1] > ma20:
-                reasons.append("价格>MA20")
+                reasons.append("价格高于MA20")
             else:
-                reasons.append("价格<MA20(回调中)")
+                reasons.append("价格低于MA20(回调中)")
         else:
             # 追涨/突破策略：必须 Price>MA20
             if close.iloc[-1] > ma20:
                 score += 0.4
-                reasons.append("价格>MA20")
+                reasons.append("价格高于MA20")
             else:
-                reasons.append("价格<MA20")
+                reasons.append("价格低于MA20")
 
             if not np.isnan(ma_long_val):
                 if ma20 > ma_long_val:
                     score += 0.3
-                    reasons.append("MA20>MA" + str(self.ma_long))
+                    reasons.append("MA20高于MA" + str(self.ma_long))
 
         adx_val = self._calc_adx(high, low, close, self.adx_period)
         if adx_val > self.adx_threshold:

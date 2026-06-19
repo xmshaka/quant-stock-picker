@@ -15,11 +15,32 @@ lightweight-charts 原生解决以上所有问题：
 from __future__ import annotations
 
 import json
+import time
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from typing import List, Optional
 
 from signals.rules import TradePoint
+
+_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
+_LWC_JS_PATH = _ASSET_DIR / "lightweight-charts-5.2.0.standalone.production.js"
+_ECHARTS_JS_PATH = _ASSET_DIR / "echarts-5.5.1.min.js"
+_KLINE_VIEW_VERSION = "echarts-multigrid-polish-v20260619-1910"
+
+
+def _load_lwc_js() -> str:
+    """读取本地 lightweight-charts，避免 CDN/CSP/外网波动导致 K线空白。"""
+    if not _LWC_JS_PATH.exists():
+        raise FileNotFoundError(f"lightweight-charts 本地资源缺失: {_LWC_JS_PATH}")
+    return _LWC_JS_PATH.read_text(encoding="utf-8")
+
+
+def _load_echarts_js() -> str:
+    """读取本地 ECharts，避免 CDN/CSP/外网波动导致 K线空白。"""
+    if not _ECHARTS_JS_PATH.exists():
+        raise FileNotFoundError(f"ECharts 本地资源缺失: {_ECHARTS_JS_PATH}")
+    return _ECHARTS_JS_PATH.read_text(encoding="utf-8")
 
 # ══════════════════════════════════════════════════════════════════
 # 配色（保持原来白配色一致）
@@ -47,9 +68,23 @@ KC = {
 }
 
 
-def _ts(dt) -> int:
-    """日期 → Unix 秒。"""
-    return int(pd.Timestamp(dt).timestamp())
+def _ts(dt) -> str:
+    """日期 → YYYY-MM-DD。日线图统一用业务日期，避免坐标 tooltip 显示时分秒。"""
+    return pd.Timestamp(dt).strftime("%Y-%m-%d")
+
+
+def _safe_ts(dt) -> str:
+    """可空日期 → YYYY-MM-DD；用于 signal_date 等审计字段。"""
+    if dt is None:
+        return ""
+    if isinstance(dt, str) and dt.strip() == "":
+        return ""
+    try:
+        if pd.isna(dt):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return _ts(dt)
 
 
 def plot_kline_with_signals(
@@ -155,20 +190,49 @@ def plot_kline_with_signals(
 
     # ── 买卖点 ──
     markers = []
+    bar_by_ts = {
+        _ts(bars['trade_date'].iloc[i]): {"high": float(h.iloc[i]), "low": float(l.iloc[i])}
+        for i in range(n)
+    }
+    price_span = max(float(h.max() - l.min()), float(c.mean()) * 0.05, 0.01)
+    marker_gap = price_span * 0.14
     for p in trade_points:
-        ts = _ts(p.date)
+        exec_dt = getattr(p, 'exec_date', None) or getattr(p, 'date', None)
+        signal_dt = getattr(p, 'signal_date', None) or ''
+        ts = _ts(exec_dt)
         price = float(getattr(p, 'exec_price', 0) or p.price)
-        if p.action == "BUY":
+        action = str(getattr(p, 'action', '')).upper()
+        bar = bar_by_ts.get(ts, {})
+        anchor_high = float(bar.get("high", price))
+        anchor_low = float(bar.get("low", price))
+        label_price = anchor_low - marker_gap if action == "BUY" else anchor_high + marker_gap
+        anchor_price = anchor_low if action == "BUY" else anchor_high
+        marker_base = {
+            "time": ts,
+            "signalDate": _safe_ts(signal_dt),
+            "execDate": ts,
+            "price": price,
+            "anchorPrice": anchor_price,
+            "labelPrice": label_price,
+            "reason": str(getattr(p, 'reason', '') or ''),
+            "rule": str(getattr(p, 'rule_name', '') or ''),
+            "confidence": float(getattr(p, 'confidence', 0) or 0),
+            "shares": int(getattr(p, 'shares', 0) or 0),
+            "pnl": float(getattr(p, 'pnl', 0) or 0),
+            "pnlPct": float(getattr(p, 'pnl_pct', 0) or 0),
+            "holdingDays": int(getattr(p, 'holding_days', 0) or 0),
+        }
+        if action == "BUY":
             markers.append({
-                "time": ts, "position": "belowBar",
+                **marker_base, "position": "belowBar", "action": "BUY",
                 "color": KC["buy"], "shape": "arrowUp",
-                "text": f"B {price:.2f}", "size": 2,
+                "text": "", "size": 1,
             })
-        elif p.action == "SELL":
+        elif action == "SELL":
             markers.append({
-                "time": ts, "position": "aboveBar",
+                **marker_base, "position": "aboveBar", "action": "SELL",
                 "color": KC["sell"], "shape": "arrowDown",
-                "text": f"S {price:.2f}", "size": 2,
+                "text": "", "size": 1,
             })
 
     html = _build_lwc_html(symbol, ohlcv_data, ma_series, vol_data,
@@ -182,132 +246,241 @@ def plot_kline_with_signals(
 
 _LWC_HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:__BG__;overflow:hidden;">
-<div id="chart" style="width:100%;height:__HEIGHT__px;"></div>
-<div id="tooltip" style="position:absolute;top:4px;left:50%;transform:translateX(-50%);background:rgba(237,231,224,0.96);border:1px solid #c2b39f;border-radius:4px;padding:4px 10px;font-family:monospace;font-size:11px;color:#2f2a22;pointer-events:none;display:none;z-index:1000;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.08);"></div>
-
-<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<head><meta charset="utf-8"><style>html,body{width:100%;height:100%;}</style></head>
+<body style="margin:0;padding:0;background:__BG__;overflow:hidden;min-height:__HEIGHT__px;">
+<div id="chartWrap" style="position:relative;width:100%;height:__HEIGHT__px;background:__BG__;">
+  <div id="klineVersion" style="position:absolute;left:6px;bottom:2px;z-index:1001;font-size:9px;color:rgba(95,86,72,0.45);font-family:monospace;pointer-events:none;">__VIEW_VERSION__</div>
+  <div id="echartsKline" style="width:100%;height:__HEIGHT__px;"></div>
+</div>
+<div id="lwc-error" style="display:none;color:#ef5350;background:#fff3f3;border:1px solid #ef5350;margin:12px;padding:12px;font-family:monospace;font-size:13px;white-space:pre-wrap;"></div>
+<script>
+__ECHARTS_JS__
+</script>
 <script>
 (function() {
-  var D = __DATA__;
-  var container = document.getElementById('chart');
-  var chart = LightweightCharts.createChart(container, {
-    layout: { background: { color: '__BG__' }, textColor: '__TEXT__' },
-    grid: { vertLines: { color: '__GRID__', style: 3 }, horzLines: { color: '__GRID__', style: 3 } },
-    crosshair: {
-      mode: 0,
-      vertLine: { color: '__CROSSHAIR__', width: 1, style: 0, labelBackgroundColor: 'rgba(138,127,109,0.9)' },
-      horzLine: { color: '__CROSSHAIR__', width: 1, style: 0, labelBackgroundColor: 'rgba(138,127,109,0.9)' },
-    },
-    rightPriceScale: { borderColor: '__GRID__' },
-    timeScale: { borderColor: '__GRID__', timeVisible: true, secondsVisible: false },
-  });
-
-  // 主图 pane
-  var klineSeries = chart.addCandlestickSeries({
-    upColor: '__UP__', downColor: '__DOWN__',
-    borderUpColor: '__UP__', borderDownColor: '__DOWN__',
-    wickUpColor: '__UP__', wickDownColor: '__DOWN__',
-  });
-  klineSeries.setData(D.ohlcv);
-  if (D.markers.length) klineSeries.setMarkers(D.markers);
-
-  // 均线
-  var maColors = D.maColors || {};
-  Object.keys(D.ma).forEach(function(p) {
-    if (p === 'maColors') return;
-    var s = chart.addLineSeries({ color: maColors[p] || '#888', lineWidth: 1 });
-    s.setData(D.ma[p]);
-  });
-
-  // 成交量 pane
-  var volPane = chart.addPane({ height: __VOL_H__ });
-  var volSeries = volPane.addHistogramSeries({ priceFormat: { type: 'volume' } });
-  volSeries.setData(D.vol);
-
-  // KDJ pane
-  if (D.kdj.k && D.kdj.k.length) {
-    var kdjPane = chart.addPane({ height: __KDJ_H__ });
-    kdjPane.addLineSeries({ color: '__KDJ_K__', lineWidth: 1 }).setData(D.kdj.k);
-    kdjPane.addLineSeries({ color: '__KDJ_D__', lineWidth: 1 }).setData(D.kdj.d);
-    kdjPane.addLineSeries({ color: '__KDJ_J__', lineWidth: 1 }).setData(D.kdj.j);
-    kdjPane.addLineSeries({ color: '__GRID__', lineWidth: 1, lineStyle: 2 }).setData(
-      [{ time: D.ohlcv[0].time, value: 80 }, { time: D.ohlcv[D.ohlcv.length-1].time, value: 80 }]
-    );
-    kdjPane.addLineSeries({ color: '__GRID__', lineWidth: 1, lineStyle: 2 }).setData(
-      [{ time: D.ohlcv[0].time, value: 20 }, { time: D.ohlcv[D.ohlcv.length-1].time, value: 20 }]
-    );
+  var errEl = document.getElementById('lwc-error');
+  function fail(e) {
+    errEl.style.display = 'block';
+    errEl.textContent = 'K线渲染失败: ' + (e && e.message ? e.message : e);
+    if (window.console && console.error) console.error(e);
   }
-
-  // MACD pane
-  if (D.macd.hist && D.macd.hist.length) {
-    var macdPane = chart.addPane({ height: __MACD_H__ });
-    macdPane.addHistogramSeries().setData(D.macd.hist);
-    macdPane.addLineSeries({ color: '__MACD__', lineWidth: 1 }).setData(D.macd.dif);
-    macdPane.addLineSeries({ color: '__MACD_SIGNAL__', lineWidth: 1 }).setData(D.macd.dea);
-  }
-
-  // 十字光标 tooltip
-  function fmtNum(v, dec) {
-    if (v == null || isNaN(v)) return '--';
-    return parseFloat(v).toFixed(dec || 2);
-  }
-  function fmtVol(v) {
-    if (v == null || isNaN(v)) return '--';
-    return fmtNum(v / 10000, 0) + ' 万手';
-  }
-
-  var tooltip = document.getElementById('tooltip');
-  chart.subscribeCrosshairMove(function(param) {
-    if (!param.time || !param.point) { tooltip.style.display = 'none'; return; }
-    var ts = param.time, idx = -1;
-    for (var i = 0; i < D.ohlcv.length; i++) {
-      if (D.ohlcv[i].time === ts) { idx = i; break; }
+  try {
+    if (typeof echarts === 'undefined') { fail('ECharts is undefined'); return; }
+    var D = __DATA__;
+    var wrap = document.getElementById('chartWrap');
+    var el = document.getElementById('echartsKline');
+    var chart = echarts.init(el, null, { renderer: 'canvas' });
+    var categories = D.ohlcv.map(function(d) { return d.time; });
+    var kData = D.ohlcv.map(function(d) { return [d.open, d.close, d.low, d.high]; });
+    var volumes = D.vol.map(function(d) { return { value: d.value, itemStyle: { color: d.color } }; });
+    function alignValues(arr) {
+      var mp = {};
+      (arr || []).forEach(function(p) { mp[p.time] = p.value; });
+      return categories.map(function(t) { return Object.prototype.hasOwnProperty.call(mp, t) ? mp[t] : null; });
     }
-    if (idx < 0) { tooltip.style.display = 'none'; return; }
-    var d = D.ohlcv[idx];
-    var prevClose = idx > 0 ? D.ohlcv[idx - 1].close : d.open;
-    var chgPct = prevClose > 0 ? ((d.close - prevClose) / prevClose * 100) : 0;
-    var chgColor = chgPct >= 0 ? '__UP__' : '__DOWN__';
-    var chgSign = chgPct >= 0 ? '+' : '';
-    var dt = new Date(d.time * 1000);
-    var dateLabel = dt.getFullYear() + '-' + ('0'+(dt.getMonth()+1)).slice(-2) + '-' + ('0'+dt.getDate()).slice(-2);
-
-    var html = '<span style="color:#5f5648;">' + dateLabel + '</span>'
-      + '&nbsp; O <b>' + fmtNum(d.open) + '</b>'
-      + '&nbsp; H <b style="color:__UP__;">' + fmtNum(d.high) + '</b>'
-      + '&nbsp; L <b style="color:__DOWN__;">' + fmtNum(d.low) + '</b>'
-      + '&nbsp; C <b>' + fmtNum(d.close) + '</b>'
-      + '&nbsp; <b style="color:' + chgColor + ';">' + chgSign + fmtNum(chgPct) + '%</b>'
-      + '&nbsp; <span style="color:#8a7f6d;font-size:10px;">' + fmtVol(d.volume) + '</span>';
-
-    for (var j = 0; j < D.markers.length; j++) {
-      if (D.markers[j].time === ts) {
-        var m = D.markers[j];
-        if (m.shape === 'arrowUp')
-          html += '<br><span style="color:#d4a017;">&#9654; 买入 @ ' + fmtNum(parseFloat(m.text.replace('B ',''))) + '</span>';
-        else
-          html += '<br><span style="color:#ab47bc;">&#9654; 卖出 @ ' + fmtNum(parseFloat(m.text.replace('S ',''))) + '</span>';
+    function fmtNum(v, dec) {
+      if (v == null || isNaN(v)) return '--';
+      return parseFloat(v).toFixed(dec == null ? 2 : dec);
+    }
+    function fmtVol(v) {
+      if (v == null || isNaN(v)) return '--';
+      if (Math.abs(v) >= 100000000) return fmtNum(v / 100000000, 2) + '亿';
+      if (Math.abs(v) >= 10000) return fmtNum(v / 10000, 1) + '万';
+      return fmtNum(v, 0);
+    }
+    function esc(s) {
+      return String(s || '').replace(/[&<>"']/g, function(c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+      });
+    }
+    var markerByTime = {};
+    (D.markers || []).forEach(function(m) {
+      if (!markerByTime[m.time]) markerByTime[m.time] = [];
+      markerByTime[m.time].push(m);
+    });
+    var signalScatter = (D.markers || []).map(function(m) {
+      var isBuy = m.action === 'BUY';
+      return {
+        value: [m.time, m.labelPrice],
+        action: m.action,
+        price: m.price,
+        itemStyle: { color: isBuy ? '__BUY__' : '__SELL__' },
+        label: {
+          show: true,
+          formatter: isBuy ? 'B' : 'S',
+          color: isBuy ? '__BUY__' : '__SELL__',
+          backgroundColor: '__BG__',
+          borderColor: isBuy ? '__BUY__' : '__SELL__',
+          borderWidth: 1,
+          borderRadius: 3,
+          padding: [2, 5],
+          fontWeight: 800,
+          fontSize: 11,
+        },
+        symbolSize: 1
+      };
+    });
+    var signalLines = (D.markers || []).map(function(m) {
+      var isBuy = m.action === 'BUY';
+      return {
+        coords: [[m.time, m.anchorPrice], [m.time, m.labelPrice]],
+        lineStyle: { color: isBuy ? '__BUY__' : '__SELL__', type: 'dashed', width: 1, opacity: 0.9 }
+      };
+    });
+    var activeGridIndex = 0;
+    var gridRanges = [
+      { idx: 0, top: __MAIN_TOP__, bottom: __MAIN_TOP__ + __MAIN_H__ },
+      { idx: 1, top: __VOL_TOP__, bottom: __VOL_TOP__ + __VOL_H__ },
+      { idx: 2, top: __KDJ_TOP__, bottom: __KDJ_TOP__ + __KDJ_H__ },
+      { idx: 3, top: __MACD_TOP__, bottom: __MACD_TOP__ + __MACD_H__ }
+    ];
+    function updateActiveGridByY(y) {
+      for (var gi = 0; gi < gridRanges.length; gi++) {
+        if (y >= gridRanges[gi].top && y <= gridRanges[gi].bottom) {
+          activeGridIndex = gridRanges[gi].idx;
+          return;
+        }
       }
     }
-    tooltip.innerHTML = html;
-    tooltip.style.display = 'block';
-  });
-
-  // resize
-  var rt;
-  window.addEventListener('resize', function() {
-    clearTimeout(rt);
-    rt = setTimeout(function() {
-      chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-    }, 100);
-  });
+    function valuesAt(idx) {
+      return {
+        k: D.kdj.k ? alignValues(D.kdj.k)[idx] : null,
+        d: D.kdj.d ? alignValues(D.kdj.d)[idx] : null,
+        j: D.kdj.j ? alignValues(D.kdj.j)[idx] : null,
+        dif: D.macd.dif ? alignValues(D.macd.dif)[idx] : null,
+        dea: D.macd.dea ? alignValues(D.macd.dea)[idx] : null,
+        hist: D.macd.hist ? alignValues(D.macd.hist)[idx] : null
+      };
+    }
+    var option = {
+      animation: false,
+      backgroundColor: '__BG__',
+      color: ['__KDJ_K__','__KDJ_D__','__KDJ_J__','__MACD__','__MACD_SIGNAL__'],
+      axisPointer: {
+        link: [{ xAxisIndex: 'all' }],
+        label: { backgroundColor: 'rgba(138,127,109,0.9)' }
+      },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'cross' },
+        confine: true,
+        backgroundColor: 'rgba(237,231,224,0.92)',
+        borderColor: '#c2b39f',
+        textStyle: { color: '#2f2a22', fontSize: 10, fontFamily: 'monospace' },
+        extraCssText: 'text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.06);',
+        formatter: function(params) {
+          var axis = params && params.length ? params[0].axisValue : '';
+          var idx = categories.indexOf(axis);
+          if (idx < 0) return axis;
+          var d = D.ohlcv[idx];
+          var vals = valuesAt(idx);
+          if (activeGridIndex === 1) {
+            return '<span style="color:#5f5648;">' + axis + '</span><br>'
+              + '<b>成交量</b>&nbsp;' + fmtVol(d.volume);
+          }
+          if (activeGridIndex === 2) {
+            return '<span style="color:#5f5648;">' + axis + '</span><br>'
+              + '<b style="color:__KDJ_K__;">K</b> ' + fmtNum(vals.k)
+              + '&nbsp; <b style="color:__KDJ_D__;">D</b> ' + fmtNum(vals.d)
+              + '&nbsp; <b style="color:__KDJ_J__;">J</b> ' + fmtNum(vals.j);
+          }
+          if (activeGridIndex === 3) {
+            return '<span style="color:#5f5648;">' + axis + '</span><br>'
+              + '<b style="color:__MACD__;">DIF</b> ' + fmtNum(vals.dif, 3)
+              + '&nbsp; <b style="color:__MACD_SIGNAL__;">DEA</b> ' + fmtNum(vals.dea, 3)
+              + '&nbsp; <b>MACD</b> ' + fmtNum(vals.hist, 3);
+          }
+          var prevClose = idx > 0 ? D.ohlcv[idx - 1].close : d.open;
+          var chgPct = prevClose > 0 ? ((d.close - prevClose) / prevClose * 100) : 0;
+          var chgColor = chgPct >= 0 ? '__UP__' : '__DOWN__';
+          var html = '<span style="color:#5f5648;">' + axis + '</span>'
+            + '&nbsp; O <b>' + fmtNum(d.open) + '</b>'
+            + '&nbsp; H <b style="color:__UP__;">' + fmtNum(d.high) + '</b>'
+            + '&nbsp; L <b style="color:__DOWN__;">' + fmtNum(d.low) + '</b>'
+            + '&nbsp; C <b>' + fmtNum(d.close) + '</b>'
+            + '&nbsp; <b style="color:' + chgColor + ';">' + (chgPct >= 0 ? '+' : '') + fmtNum(chgPct) + '%</b>'
+            + '&nbsp; <span style="color:#8a7f6d;font-size:10px;">' + fmtVol(d.volume) + '</span>';
+          (markerByTime[axis] || []).forEach(function(m) {
+            var isBuy = m.action === 'BUY';
+            var color = isBuy ? '#d4a017' : '#ab47bc';
+            html += '<br><span style="color:' + color + ';font-weight:bold;">&#9654; '
+              + (isBuy ? '买入' : '卖出') + ' @ ' + fmtNum(m.price) + '</span>';
+            if (m.shares) html += '&nbsp; <span style="color:#5f5648;">' + m.shares + '股</span>';
+            if (m.signalDate && m.signalDate !== m.execDate) html += '&nbsp; <span style="color:#8a7f6d;">信号:' + esc(m.signalDate) + '</span>';
+            if (m.pnl || m.pnlPct) html += '&nbsp; <span style="color:' + ((m.pnl || 0) >= 0 ? '__UP__' : '__DOWN__') + ';">' + fmtNum((m.pnlPct || 0) * 100, 2) + '%</span>';
+            var shortReason = esc(m.reason || m.rule || '');
+            if (shortReason.length > 32) shortReason = shortReason.slice(0, 32) + '...';
+            if (shortReason) html += '<br><span style="color:#8a7f6d;">' + shortReason + '</span>';
+          });
+          return html;
+        }
+      },
+      grid: [
+        { left: 48, right: 58, top: __MAIN_TOP__, height: __MAIN_H__, containLabel: false },
+        { left: 48, right: 58, top: __VOL_TOP__, height: __VOL_H__, containLabel: false },
+        { left: 48, right: 58, top: __KDJ_TOP__, height: __KDJ_H__, containLabel: false },
+        { left: 48, right: 58, top: __MACD_TOP__, height: __MACD_H__, containLabel: false }
+      ],
+      xAxis: [0,1,2,3].map(function(i) {
+        return {
+          type: 'category',
+          data: categories,
+          gridIndex: i,
+          boundaryGap: true,
+          axisLine: { lineStyle: { color: '__GRID__' } },
+          axisPointer: { label: { show: i === 3 } },
+          axisTick: { show: false },
+          axisLabel: { show: i === 3, color: '__TEXT__', fontSize: 10 },
+          splitLine: { show: false },
+          min: 'dataMin',
+          max: 'dataMax'
+        };
+      }),
+      yAxis: [
+        { scale: true, gridIndex: 0, position: 'right', axisLine: { lineStyle: { color: '__GRID__' } }, axisLabel: { color: '__TEXT__', fontSize: 10 }, splitLine: { lineStyle: { color: '__GRID__', type: 'dashed' } } },
+        { scale: true, gridIndex: 1, position: 'right', axisLine: { lineStyle: { color: '__GRID__' } }, axisLabel: { color: '__TEXT__', fontSize: 9, formatter: fmtVol }, splitLine: { lineStyle: { color: '__GRID__', type: 'dashed' } } },
+        { scale: true, gridIndex: 2, position: 'right', min: 0, max: 120, axisLine: { lineStyle: { color: '__GRID__' } }, axisLabel: { color: '__TEXT__', fontSize: 9 }, splitLine: { lineStyle: { color: '__GRID__', type: 'dashed' } } },
+        { scale: true, gridIndex: 3, position: 'right', axisLine: { lineStyle: { color: '__GRID__' } }, axisLabel: { color: '__TEXT__', fontSize: 9 }, splitLine: { lineStyle: { color: '__GRID__', type: 'dashed' } } }
+      ],
+      dataZoom: [
+        { type: 'inside', xAxisIndex: [0,1,2,3], start: 0, end: 100, zoomOnMouseWheel: true, moveOnMouseMove: true }
+      ],
+      series: [
+        { name: 'K线', type: 'candlestick', xAxisIndex: 0, yAxisIndex: 0, data: kData,
+          itemStyle: { color: '__UP__', color0: '__DOWN__', borderColor: '__UP__', borderColor0: '__DOWN__' } },
+        { name: 'MA5', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: alignValues(D.ma['5']), smooth: false, showSymbol: false, lineStyle: { width: 1, color: D.maColors['5'] }, emphasis: { disabled: true } },
+        { name: 'MA10', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: alignValues(D.ma['10']), smooth: false, showSymbol: false, lineStyle: { width: 1, color: D.maColors['10'] }, emphasis: { disabled: true } },
+        { name: 'MA20', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: alignValues(D.ma['20']), smooth: false, showSymbol: false, lineStyle: { width: 1, color: D.maColors['20'] }, emphasis: { disabled: true } },
+        { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumes, barWidth: '60%' },
+        { name: 'K', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: alignValues(D.kdj.k), showSymbol: false, lineStyle: { width: 1, color: '__KDJ_K__' } },
+        { name: 'D', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: alignValues(D.kdj.d), showSymbol: false, lineStyle: { width: 1, color: '__KDJ_D__' } },
+        { name: 'J', type: 'line', xAxisIndex: 2, yAxisIndex: 2, data: alignValues(D.kdj.j), showSymbol: false, lineStyle: { width: 1, color: '__KDJ_J__' } },
+        { name: 'MACD柱', type: 'bar', xAxisIndex: 3, yAxisIndex: 3, data: alignValues(D.macd.hist).map(function(v, i) { return { value: v, itemStyle: { color: v >= 0 ? '#ef5350' : '#26a69a' } }; }), barWidth: '60%' },
+        { name: 'DIF', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: alignValues(D.macd.dif), showSymbol: false, lineStyle: { width: 1, color: '__MACD__' } },
+        { name: 'DEA', type: 'line', xAxisIndex: 3, yAxisIndex: 3, data: alignValues(D.macd.dea), showSymbol: false, lineStyle: { width: 1, color: '__MACD_SIGNAL__' } },
+        { name: '信号连线', type: 'lines', coordinateSystem: 'cartesian2d', xAxisIndex: 0, yAxisIndex: 0, data: signalLines, polyline: false, symbol: ['none','none'], silent: true, z: 10 },
+        { name: '买卖点', type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, data: signalScatter, symbol: 'circle', z: 11, tooltip: { show: false } }
+      ]
+    };
+    chart.setOption(option, true);
+    chart.getZr().on('mousemove', function(e) { updateActiveGridByY(e.offsetY); });
+    function resizeChart() {
+      chart.resize({ width: wrap.clientWidth || document.body.clientWidth || window.innerWidth, height: __HEIGHT__ });
+    }
+    window.addEventListener('resize', resizeChart);
+    if (typeof ResizeObserver !== 'undefined') {
+      var ro = new ResizeObserver(function() { resizeChart(); });
+      ro.observe(wrap);
+      ro.observe(el);
+    }
+    setTimeout(resizeChart, 0);
+    setTimeout(resizeChart, 120);
+    setTimeout(resizeChart, 360);
+  } catch (e) { fail(e); }
 })();
 </script>
 </body>
 </html>"""
-
 
 def _build_lwc_html(
     symbol: str,
@@ -333,6 +506,7 @@ def _build_lwc_html(
         "symbol": symbol,
         "maColors": ma_colors,
     }, ensure_ascii=False)
+    echarts_js = _load_echarts_js()
 
     html = _LWC_HTML_TEMPLATE
     html = html.replace("__BG__", KC["bg"])
@@ -341,16 +515,37 @@ def _build_lwc_html(
     html = html.replace("__CROSSHAIR__", KC["crosshair"])
     html = html.replace("__UP__", KC["up"])
     html = html.replace("__DOWN__", KC["down"])
+    html = html.replace("__BUY__", KC["buy"])
+    html = html.replace("__SELL__", KC["sell"])
     html = html.replace("__KDJ_K__", KC["kdj_k"])
     html = html.replace("__KDJ_D__", KC["kdj_d"])
     html = html.replace("__KDJ_J__", KC["kdj_j"])
     html = html.replace("__MACD__", KC["macd"])
     html = html.replace("__MACD_SIGNAL__", KC["macd_signal"])
+    html = f"<!-- kline-view-version:{_KLINE_VIEW_VERSION};nonce:{int(time.time() * 1000)} -->\n" + html
     html = html.replace("__HEIGHT__", str(height))
-    html = html.replace("__VOL_H__", str(int(height * 0.12)))
-    html = html.replace("__KDJ_H__", str(int(height * 0.14)))
-    html = html.replace("__MACD_H__", str(int(height * 0.16)))
+    gap = 6
+    main_top = 6
+    bottom_pad = 8
+    main_h = int(height * 0.49)
+    vol_h = int(height * 0.15)
+    kdj_h = int(height * 0.16)
+    macd_h = max(80, height - main_top - bottom_pad - main_h - vol_h - kdj_h - gap * 3)
+    vol_top = main_top + main_h + gap
+    kdj_top = vol_top + vol_h + gap
+    macd_top = kdj_top + kdj_h + gap
+    html = html.replace("__MAIN_TOP__", str(main_top))
+    html = html.replace("__MAIN_H__", str(main_h))
+    html = html.replace("__VIEW_VERSION__", _KLINE_VIEW_VERSION)
+    # 默认布局：主图约占 1/2，副图合计约占 1/2；grid 间留 6px 防止 KDJ/MACD 裁切。
+    html = html.replace("__VOL_H__", str(vol_h))
+    html = html.replace("__KDJ_H__", str(kdj_h))
+    html = html.replace("__MACD_H__", str(macd_h))
+    html = html.replace("__VOL_TOP__", str(vol_top))
+    html = html.replace("__KDJ_TOP__", str(kdj_top))
+    html = html.replace("__MACD_TOP__", str(macd_top))
     html = html.replace("__DATA__", data_json)
+    html = html.replace("__ECHARTS_JS__", echarts_js)
     return html
 
 
@@ -362,7 +557,15 @@ def render_kline_chart(result, key: str = "", height: int = 760):
     import streamlit.components.v1 as components
 
     html = result.get("html", "")
-    actual_height = result.get("height", height)
+    result_height = int(result.get("height", height) or height)
+    actual_height = max(result_height, int(height or result_height))
+    # 调用方常传 height=760；lightweight 图表高度写在 HTML 内部，需同步替换，
+    # 否则 iframe 足够高但 canvas 仍按默认 580px 布局，副图会被压缩。
+    if actual_height != result_height:
+        html = html.replace(f"height:{result_height}px", f"height:{actual_height}px")
+        html = html.replace(f"min-height:{result_height}px", f"min-height:{actual_height}px")
+    # 每次渲染追加 nonce，避免 Streamlit/frontend 复用旧 iframe HTML。
+    html = html + f"\n<!-- render-key:{key};render-nonce:{int(time.time() * 1000)} -->"
     components.html(html, height=actual_height, scrolling=False)
 
 
