@@ -45,7 +45,7 @@ def _parse_factor_names(raw: str | None):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="运行 P4 参数网格轻量回测")
-    parser.add_argument("--strategy-id", required=True, choices=["trend_momentum", "pullback", "breakout"])
+    parser.add_argument("--strategy-id", required=True, choices=["trend_momentum", "pullback", "breakout", "balanced"])
     parser.add_argument("--factor-path", required=True, help="因子数据 csv/parquet，需包含 symbol/trade_date")
     parser.add_argument("--price-path", required=True, help="不复权价格数据 csv/parquet，需包含 symbol/trade_date/open/high/low/close")
     parser.add_argument("--output", required=True, help="输出 csv/parquet 路径")

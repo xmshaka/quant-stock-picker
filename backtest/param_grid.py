@@ -59,6 +59,17 @@ DEFAULT_PARAM_SPACE: Dict[str, Dict[str, Sequence[object]]] = {
         "resonance_config.min_confirmations": [3, 4],
         "exit_config.market_defense_score": [20.0, 30.0],
     },
+    "balanced": {
+        "stop_loss_atr_mult": [1.8, 2.0, 2.2],
+        "take_profit_atr_mult": [2.5, 3.0],
+        "trailing_atr_mult": [1.8, 2.0],
+        "exit_config.trailing_activation_pct": [0.05, 0.08],
+        "exit_config.trailing_activation_atr_mult": [1.0, 1.5],
+        "exit_config.market_defense_score": [20.0, 30.0],
+        # 放在末尾，确保 CLI 默认/小样本 max_runs 能优先覆盖 15/20 与 7/10 的短线退出组合。
+        "exit_config.max_holding_days": [15, 20],
+        "exit_config.time_stop_days": [7, 10],
+    },
 }
 
 

@@ -60,6 +60,19 @@ def test_default_param_grid_contains_p4_core_fields():
     assert "exit_config.market_defense_score" in params
 
 
+def test_default_param_grid_supports_balanced_exit_activation_fields():
+    """P4: balanced 也必须纳入小样本网格，验证 10/20 与跟踪止盈激活语义。"""
+    grid = default_param_grid("balanced", max_runs=4)
+    assert len(grid) == 4
+    params = grid[0]
+    assert params["exit_config.max_holding_days"] == 15
+    assert params["exit_config.time_stop_days"] == 7
+    assert "exit_config.trailing_activation_pct" in params
+    assert "exit_config.trailing_activation_atr_mult" in params
+    combos = {(row["exit_config.max_holding_days"], row["exit_config.time_stop_days"]) for row in grid}
+    assert combos == {(15, 7), (15, 10), (20, 7), (20, 10)}
+
+
 def test_rank_grid_results_prioritizes_lower_drawdown_over_higher_return():
     low_dd = normalize_grid_result(
         scheme_id="trend_momentum",

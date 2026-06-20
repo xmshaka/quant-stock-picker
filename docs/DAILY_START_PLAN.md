@@ -525,6 +525,9 @@ ExitDecision:
   take_profit_atr_mult
   trailing_atr_mult
   max_holding_days
+  time_stop_days
+  trailing_activation_pct
+  trailing_activation_atr_mult
   min_confirmations
   market_score_threshold
 
@@ -537,6 +540,8 @@ ExitDecision:
   单票集中度
   换手率
 ```
+
+2026-06-20 补充：`balanced` 已纳入参数网格 CLI 白名单和默认参数空间。小样本 `max_runs=4` 会优先覆盖 `(max_holding_days, time_stop_days)` 的 `(15,7)/(15,10)/(20,7)/(20,10)` 四组组合，并包含 `trailing_activation_pct` 与 `trailing_activation_atr_mult` 审计字段。已生成审计目录 `data/grid_results/20260620_150523_balanced`。
 
 ---
 
