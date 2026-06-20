@@ -2,14 +2,16 @@
 import sys
 sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
 
+from copy import deepcopy
+from dataclasses import fields
 import streamlit as st
 import pandas as pd
 
 from data_loader import load_data, FACTOR_NAME_MAP, NAME_MAP
 from strategy.registry import SchemeRegistry
-from strategy.schemes import StrategyScheme
+from strategy.schemes import StrategyScheme, ExitConfig
 from backtest.scheme_backtest import SchemeBacktester, run_multi_scheme_backtest
-from backtest.records import BacktestRunConfig, load_backtest_run, summarize_liquidity_slippage
+from backtest.records import BacktestRunConfig, load_backtest_run, summarize_liquidity_slippage, scheme_audit_snapshot
 from dashboard.backtest_state import backtest_context_signature, clear_stale_compare
 from dashboard.components.kline_chart import plot_kline_with_signals, plot_equity_curve, render_kline_chart
 from signals.rules import TradePoint
@@ -40,12 +42,26 @@ def _save_widget_state(widget_key: str, durable_key: str):
     st.session_state[durable_key] = st.session_state.get(widget_key)
 
 
-_restore_widget_state("bt_scheme_name", "bt_pref_scheme_name", list(scheme_names.keys())[0])
+default_scheme_name = next((name for name, scheme in scheme_names.items() if scheme.scheme_id == "balanced"), list(scheme_names.keys())[0])
+_restore_widget_state("bt_scheme_name", "bt_pref_scheme_name", default_scheme_name)
 _restore_widget_state("bt_top_n", "bt_pref_top_n", 10)
 _restore_widget_state("bt_lookback", "bt_pref_lookback", 60)
 _restore_widget_state("bt_capital_wan", "bt_pref_capital_wan", 100)
 _restore_widget_state("bt_pool_mode", "bt_pref_pool_mode", "全A")
 _restore_widget_state("bt_custom_codes", "bt_pref_custom_codes", "")
+
+
+def _scheme_with_exit_overrides(base: StrategyScheme, exit_cfg: ExitConfig) -> StrategyScheme:
+    """复制策略并应用页面上的退出规则覆盖，避免修改全局内置策略。"""
+    cloned = StrategyScheme.from_dict(base.to_dict()) if hasattr(base, "to_dict") else deepcopy(base)
+    cloned.exit_config = exit_cfg
+    return cloned
+
+
+def _make_exit_config(**kwargs) -> ExitConfig:
+    """构造退出配置；过滤旧运行态未加载的新字段，避免 Streamlit 热重载半新半旧时报错。"""
+    valid = {f.name for f in fields(ExitConfig)}
+    return ExitConfig(**{k: v for k, v in kwargs.items() if k in valid})
 
 section_header("策略回测")
 st.caption("选择方案 → 选股池 → 回测区间 → 查看绩效和K线买卖点")
@@ -67,6 +83,80 @@ with c3:
     lookback = st.slider("回测天数", 20, 120, key="bt_lookback", on_change=_save_widget_state, args=("bt_lookback", "bt_pref_lookback"))
 with c4:
     capital = st.number_input("初始资金(万)", 10, 1000, step=10, key="bt_capital_wan", on_change=_save_widget_state, args=("bt_capital_wan", "bt_pref_capital_wan")) * 10000
+
+resonance_cfg = getattr(selected_scheme, "resonance_config", None)
+if resonance_cfg is not None:
+    with st.expander("策略共振配置", expanded=False):
+        st.caption("P1：不同策略使用独立 L3 条件集和最低确认数；该配置会随回测记录落盘，便于复盘审计。")
+        st.json(resonance_cfg.to_dict())
+
+base_exit_cfg = getattr(selected_scheme, "exit_config", ExitConfig()) or ExitConfig()
+exit_defaults_version = "20260620_exit_defaults_v3"
+if (
+    st.session_state.get("_bt_exit_scheme_id") != selected_scheme.scheme_id
+    or st.session_state.get("_bt_exit_defaults_version") != exit_defaults_version
+):
+    st.session_state["bt_enable_market_defense_exit"] = bool(getattr(base_exit_cfg, "enable_market_defense_exit", True))
+    st.session_state["bt_enable_strategy_failure_exit"] = bool(getattr(base_exit_cfg, "enable_strategy_failure_exit", True))
+    st.session_state["bt_enable_trailing_exit"] = bool(getattr(base_exit_cfg, "enable_trailing_exit", True))
+    st.session_state["bt_enable_time_stop"] = bool(getattr(base_exit_cfg, "enable_time_stop", True))
+    st.session_state["bt_enable_max_holding_exit"] = bool(getattr(base_exit_cfg, "enable_max_holding_exit", True))
+    st.session_state["bt_exit_max_holding_days_v3"] = int(getattr(base_exit_cfg, "max_holding_days", 20) or 20)
+    st.session_state["bt_exit_time_stop_days_v3"] = int(getattr(base_exit_cfg, "time_stop_days", 7) or 7)
+    st.session_state["bt_exit_time_stop_min_profit_pct_v3"] = float(getattr(base_exit_cfg, "time_stop_min_profit_pct", 0.0) or 0.0) * 100
+    st.session_state["bt_exit_market_defense_score_v3"] = float(getattr(base_exit_cfg, "market_defense_score", 20.0) or 20.0)
+    st.session_state["bt_exit_failure_window_days_v3"] = int(getattr(base_exit_cfg, "failure_window_days", 3) or 3)
+    st.session_state["bt_trailing_activation_pct_v3"] = float(getattr(base_exit_cfg, "trailing_activation_pct", 0.05) or 0.0) * 100
+    st.session_state["bt_trailing_activation_atr_mult_v3"] = float(getattr(base_exit_cfg, "trailing_activation_atr_mult", 1.0) or 1.0)
+    st.session_state["_bt_exit_scheme_id"] = selected_scheme.scheme_id
+    st.session_state["_bt_exit_defaults_version"] = exit_defaults_version
+with st.expander("短线退出规则", expanded=False):
+    st.caption("P2：新增短线退出体系。可在这里关闭某类退出，或调整阈值；本次设置会随回测记录落盘。")
+    e1, e2, e3, e4, e5 = st.columns(5)
+    with e1:
+        enable_market_defense_exit = st.checkbox("大盘防御减仓", value=bool(getattr(base_exit_cfg, "enable_market_defense_exit", True)), key="bt_enable_market_defense_exit")
+    with e2:
+        enable_strategy_failure_exit = st.checkbox("策略失败退出", value=bool(getattr(base_exit_cfg, "enable_strategy_failure_exit", True)), key="bt_enable_strategy_failure_exit")
+    with e3:
+        enable_trailing_exit = st.checkbox("跟踪止盈/回撤", value=bool(getattr(base_exit_cfg, "enable_trailing_exit", True)), key="bt_enable_trailing_exit")
+    with e4:
+        enable_time_stop = st.checkbox("时间止损", value=bool(getattr(base_exit_cfg, "enable_time_stop", True)), key="bt_enable_time_stop")
+    with e5:
+        enable_max_holding_exit = st.checkbox("最长持仓退出", value=bool(getattr(base_exit_cfg, "enable_max_holding_exit", True)), key="bt_enable_max_holding_exit")
+
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        max_holding_days = st.number_input("最长持仓天数", min_value=1, max_value=60, value=int(getattr(base_exit_cfg, "max_holding_days", 20) or 20), step=1, key="bt_exit_max_holding_days_v3")
+    with p2:
+        time_stop_days = st.number_input("时间止损天数", min_value=1, max_value=60, value=int(getattr(base_exit_cfg, "time_stop_days", 7) or 7), step=1, key="bt_exit_time_stop_days_v3")
+    with p3:
+        time_stop_min_profit_pct = st.number_input("时间止损最低收益%", min_value=-20.0, max_value=50.0, value=float(getattr(base_exit_cfg, "time_stop_min_profit_pct", 0.0) or 0.0) * 100, step=0.5, key="bt_exit_time_stop_min_profit_pct_v3") / 100
+    with p4:
+        market_defense_score = st.number_input("大盘防御分数", min_value=0.0, max_value=100.0, value=float(getattr(base_exit_cfg, "market_defense_score", 20.0) or 20.0), step=1.0, key="bt_exit_market_defense_score_v3")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        failure_window_days = st.slider("策略失败观察窗口(交易日)", min_value=0, max_value=20, value=int(getattr(base_exit_cfg, "failure_window_days", 3) or 3), key="bt_exit_failure_window_days_v3")
+    with f2:
+        trailing_activation_pct = st.number_input("跟踪止盈激活浮盈%", min_value=0.0, max_value=50.0, value=float(getattr(base_exit_cfg, "trailing_activation_pct", 0.05) or 0.0) * 100, step=0.5, key="bt_trailing_activation_pct_v3") / 100
+    with f3:
+        trailing_activation_atr_mult = st.number_input("跟踪止盈激活ATR倍数", min_value=0.0, max_value=10.0, value=float(getattr(base_exit_cfg, "trailing_activation_atr_mult", 1.0) or 1.0), step=0.1, key="bt_trailing_activation_atr_mult_v3")
+
+exit_cfg_override = _make_exit_config(
+    enable_market_defense_exit=enable_market_defense_exit,
+    enable_strategy_failure_exit=enable_strategy_failure_exit,
+    enable_trailing_exit=enable_trailing_exit,
+    enable_time_stop=enable_time_stop,
+    enable_max_holding_exit=enable_max_holding_exit,
+    max_holding_days=int(max_holding_days),
+    time_stop_days=int(time_stop_days),
+    time_stop_min_profit_pct=float(time_stop_min_profit_pct),
+    failure_window_days=int(failure_window_days),
+    market_defense_score=float(market_defense_score),
+    trailing_activation_pct=float(trailing_activation_pct),
+    trailing_activation_atr_mult=float(trailing_activation_atr_mult),
+)
+selected_scheme_runtime = _scheme_with_exit_overrides(selected_scheme, exit_cfg_override)
 
 # 股票池选择
 pool_mode = st.radio(
@@ -96,6 +186,7 @@ elif pool_mode == "持仓池":
         st.warning("持仓池为空")
 
 current_context_signature = backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital)
+current_context_signature = (*current_context_signature, tuple(sorted(exit_cfg_override.to_dict().items())))
 clear_stale_compare(st.session_state, current_context_signature)
 
 # ========== 执行回测 ==========
@@ -112,7 +203,7 @@ if st.button("▶ 运行回测", type="primary", width="stretch"):
 
     backtester = SchemeBacktester()
     result = backtester.run(
-        scheme=selected_scheme,
+        scheme=selected_scheme_runtime,
         factor_df=factor_df,
         price_df=price_df,
         factor_names=factor_names,
@@ -140,10 +231,11 @@ if st.button("▶ 运行回测", type="primary", width="stretch"):
     # FIX: 股票池/参数已发生新回测时，旧“方案对比”结果不再可信，必须清空。
     st.session_state.pop("bt_compare", None)
     st.session_state.pop("bt_compare_signature", None)
+    scheme_snapshot = scheme_audit_snapshot(selected_scheme_runtime)
     st.session_state.bt_run_config = BacktestRunConfig(
         run_id=result.run_id,
-        scheme_id=selected_scheme.scheme_id,
-        scheme_name=selected_scheme.name,
+        scheme_id=selected_scheme_runtime.scheme_id,
+        scheme_name=selected_scheme_runtime.name,
         start_date=result.start_date,
         end_date=result.end_date,
         lookback_days=lookback,
@@ -158,6 +250,8 @@ if st.button("▶ 运行回测", type="primary", width="stretch"):
             "slippage": 0.002,
         },
         risk={"single_position_cap": 0.20, "total_position_cap": 0.90},
+        scheme_config=scheme_snapshot["scheme_config"],
+        resonance_config=scheme_snapshot["resonance_config"],
     )
     try:
         run_dir = result.persist(config=st.session_state.bt_run_config)
@@ -272,9 +366,11 @@ if "bt_result" in st.session_state:
                 liq_buckets["加权滑点率"] = pd.to_numeric(liq_buckets["加权滑点率"], errors="coerce").map(lambda x: f"{x:.4%}")
             st.dataframe(liq_buckets, width="stretch", hide_index=True)
 
-    # P0: K线默认展示 signals_executed，提供原始信号叠加选项
-    show_points = result.signals_executed if result.signals_executed else result.stock_signals
+    # P3: K线复盘事件源必须是实际成交事件；严禁用原始 signal 当作买卖点。
+    show_points = result.signals_executed
     overlay_raw = False
+    if not show_points and result.signals_raw:
+        st.warning("K线复盘暂无实际成交事件 signals_executed；原始信号不会作为买卖点展示，避免把未成交信号误认为交易。", icon="⚠️")
     if result.signals_raw and show_points:
         overlay_raw = st.checkbox("叠加原始规则信号（仅参考，不参与统计）", value=False, key="overlay_raw")
 
@@ -331,7 +427,8 @@ if "bt_result" in st.session_state:
                             elif p in points:
                                 row_meta = badge("执行", "hold")
                             row = {
-                                "日期": str(p.date),
+                                "成交日": str(getattr(p, 'exec_date', None) or p.date),
+                                "信号日": str(getattr(p, 'signal_date', '') or ''),
                                 "来源": row_meta,
                                 "方向": badge("买", "buy") if p.action == "BUY" else badge("卖", "sell"),
                                 "置信度": f"{p.confidence:.0%}",

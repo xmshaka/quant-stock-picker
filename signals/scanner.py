@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from market.timing import POSITION_BRACKETS, PositionBracket
-from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme
+from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme, ResonanceConfig
 
 
 @dataclass
@@ -35,6 +35,9 @@ class ScanSignal:
     layer3_confirmations: int
     total_score: float
     entry_reason: str
+    layer3_total: int = 0
+    layer3_min_confirmations: int = 0
+    layer3_condition_keys: List[str] = field(default_factory=list)
     risk_tags: List[str] = field(default_factory=list)
     suggested_position_pct: float = 0.0
 
@@ -58,11 +61,7 @@ STRATEGY_MARKET_FLOOR = {
     "breakout": 50.0,
 }
 
-STRATEGY_MIN_CONFIRMATIONS = {
-    "trend_momentum": 3,
-    "pullback": 3,
-    "breakout": 3,
-}
+DEFAULT_MIN_CONFIRMATIONS = 3
 
 
 def scan_signals(
@@ -73,6 +72,7 @@ def scan_signals(
     top_n: int = 20,
     market_score: Optional[float] = None,
     include_sell_symbols: Optional[Iterable[str]] = None,
+    include_sell_context: Optional[Dict[str, Dict]] = None,
 ) -> Tuple[List[ScanSignal], List[ScanSignal]]:
     """按 DAILY_START_PLAN 新方案扫描信号。
 
@@ -112,22 +112,29 @@ def scan_signals(
             if len(bars) < 40:
                 continue
             latest_row = row.iloc[0]
+            tradable_ok, tradable_reason, tradable_tags = _check_l4_tradability(bars, latest_row, sid)
+            if not tradable_ok:
+                continue
             l1_ok, l1_score, l1_reason = _check_layer1(bars, sid)
             if not l1_ok:
                 continue
             l2_ok, l2_score, l2_reason = _check_layer2(bars, latest_row, sid)
             if not l2_ok:
                 continue
-            confirmations, l3_reasons = _check_layer3(bars, latest_row, sid)
-            if confirmations < STRATEGY_MIN_CONFIRMATIONS[sid]:
+            resonance_cfg = _resonance_config(sid)
+            confirmations, l3_reasons = _check_layer3(bars, latest_row, sid, resonance_cfg)
+            min_confirmations = int(resonance_cfg.min_confirmations or DEFAULT_MIN_CONFIRMATIONS)
+            if confirmations < min_confirmations:
                 continue
 
+            layer3_total = len(resonance_cfg.buy_conditions) or 6
             total_score = round(
-                factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + min(confirmations / 6, 1.0) * 100 * 0.20,
+                factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + min(confirmations / max(layer3_total, 1), 1.0) * 100 * 0.20,
                 4,
             )
-            reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/6：{'、'.join(l3_reasons)}"
+            reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/{layer3_total}：{'、'.join(l3_reasons)}"
             risk_tags = _build_risk_tags(bars, latest_row, market_score_val, sid)
+            risk_tags.extend([t for t in tradable_tags if t not in risk_tags])
             buy_candidates.append(ScanSignal(
                 symbol=symbol,
                 signal_type="BUY",
@@ -142,8 +149,11 @@ def scan_signals(
                 layer1_score=round(float(l1_score), 4),
                 layer2_score=round(float(l2_score), 4),
                 layer3_confirmations=confirmations,
+                layer3_total=layer3_total,
+                layer3_min_confirmations=min_confirmations,
+                layer3_condition_keys=list(resonance_cfg.buy_conditions or []),
                 total_score=total_score,
-                entry_reason=reason,
+                entry_reason=f"{reason}；L4可交易性：{tradable_reason}",
                 risk_tags=risk_tags,
                 suggested_position_pct=round(min(0.20, scheme.position_pct_per_entry * bracket.per_entry_mult), 4),
             ))
@@ -162,7 +172,7 @@ def scan_signals(
 
     sell_signals = _scan_sell_signals(
         include_sell_symbols or [], price_map, day_data, latest_date,
-        next_exec_date, market_score_val, bracket,
+        next_exec_date, market_score_val, bracket, include_sell_context or {},
     )
     return buy_candidates, sell_signals[:top_n]
 
@@ -272,7 +282,15 @@ def _check_layer2(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[b
     return ok, score, f"横盘突破：振幅{range_pct:.1%}，量比{vol_ratio:.1f}x"
 
 
-def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[int, List[str]]:
+def _resonance_config(scheme_id: str) -> ResonanceConfig:
+    scheme = BUILTIN_SCHEMES.get(str(scheme_id))
+    cfg = getattr(scheme, "resonance_config", None) if scheme else None
+    if cfg is None:
+        return ResonanceConfig(min_confirmations=DEFAULT_MIN_CONFIRMATIONS)
+    return cfg
+
+
+def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_config: Optional[ResonanceConfig] = None) -> Tuple[int, List[str]]:
     close = bars["close"].astype(float)
     current = float(close.iloc[-1])
     ma5 = float(close.rolling(5).mean().iloc[-1])
@@ -287,38 +305,126 @@ def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[i
     mom5 = current / float(close.iloc[-6]) - 1 if len(close) >= 6 and close.iloc[-6] > 0 else 0.0
     mom20 = current / float(close.iloc[-21]) - 1 if len(close) >= 21 and close.iloc[-21] > 0 else 0.0
 
-    checks: List[Tuple[bool, str]]
+    checks: List[Tuple[str, bool, str]]
     if scheme_id == "trend_momentum":
         checks = [
-            (vol_ratio > 1.3, f"放量{vol_ratio:.1f}x"),
-            (ma5 > ma20, "MA5高于MA20"),
-            (pb <= 0.05, f"接近20日高点{pb:.1%}"),
-            (mom5 > 0.01, f"M5={mom5:.1%}"),
-            (mom20 > 0.02, f"M20={mom20:.1%}"),
-            (np.isnan(rsi) or rsi < 85, f"RSI未极端{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("volume_expand", vol_ratio > 1.3, f"放量{vol_ratio:.1f}x"),
+            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
+            ("near_high", pb <= 0.05, f"接近20日高点{pb:.1%}"),
+            ("momentum_5d", mom5 > 0.01, f"M5={mom5:.1%}"),
+            ("momentum_20d", mom20 > 0.02, f"M20={mom20:.1%}"),
+            ("rsi_not_extreme", np.isnan(rsi) or rsi < 85, f"RSI未极端{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
         ]
     elif scheme_id == "pullback":
         checks = [
-            (not np.isnan(rsi) and rsi < 45, f"RSI={rsi:.0f}"),
-            (not np.isnan(boll01) and boll01 < 0.35, f"布林位置{boll01:.2f}"),
-            (0.05 <= pb <= 0.15, f"回撤{pb:.1%}"),
-            (current > close.iloc[-20:].min() * 1.03, "不破20日低点"),
-            (vol_ratio < 1.1, f"缩量/温和量比{vol_ratio:.1f}x"),
-            (current >= close.iloc[-1] * 0.98, "当日未明显破位"),
+            ("rsi_oversold", not np.isnan(rsi) and rsi < 45, f"RSI={rsi:.0f}"),
+            ("boll_lower", not np.isnan(boll01) and boll01 < 0.35, f"布林位置{boll01:.2f}"),
+            ("pullback_range", 0.05 <= pb <= 0.15, f"回撤{pb:.1%}"),
+            ("not_break_20d_low", current > close.iloc[-20:].min() * 1.03, "不破20日低点"),
+            ("volume_calm", vol_ratio < 1.1, f"缩量/温和量比{vol_ratio:.1f}x"),
+            ("near_support", current >= close.iloc[-1] * 0.98, "当日未明显破位"),
         ]
     else:
         prev = close.iloc[-15:-5]
         range_pct = (prev.max() - prev.min()) / prev.mean() if len(prev) >= 5 and prev.mean() > 0 else 1.0
         checks = [
-            (len(prev) >= 5 and current > float(prev.max()) * 1.01, "突破平台上沿"),
-            (vol_ratio > 1.5, f"量比{vol_ratio:.1f}x"),
-            (ma5 > ma20, "MA5高于MA20"),
-            (range_pct < 0.08, f"平台振幅{range_pct:.1%}"),
-            (mom5 > 0.01, f"M5={mom5:.1%}"),
-            (not np.isnan(boll01) and boll01 > 0.6, f"布林上沿{boll01:.2f}"),
+            ("break_platform", len(prev) >= 5 and current > float(prev.max()) * 1.01, "突破平台上沿"),
+            ("volume_surge", vol_ratio > 1.5, f"量比{vol_ratio:.1f}x"),
+            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
+            ("narrow_range", range_pct < 0.08, f"平台振幅{range_pct:.1%}"),
+            ("momentum_5d", mom5 > 0.01, f"M5={mom5:.1%}"),
+            ("boll_upper", not np.isnan(boll01) and boll01 > 0.6, f"布林上沿{boll01:.2f}"),
         ]
-    reasons = [label for ok, label in checks if ok]
+    cfg = resonance_config or _resonance_config(scheme_id)
+    enabled = set(cfg.buy_conditions or [])
+    active = [item for item in checks if not enabled or item[0] in enabled]
+    reasons = [label for _, ok, label in active if ok]
     return len(reasons), reasons
+
+
+def _check_l4_tradability(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[bool, str, List[str]]:
+    """Layer 4：风险可交易性检查。
+
+    信号页只生成 T 日收盘后的候选计划，L4 用于剔除明显不可成交/不适合短线执行的票：
+    - 价格/高低开收数据异常；
+    - 一字涨跌停或涨停封死，T+1 实际可成交性差；
+    - 成交额过低，滑点容易被低估。
+
+    注意：这里不使用未来 T+1 数据，只检查截至信号日的行情与快照字段。
+    """
+    if bars.empty:
+        return False, "行情缺失", ["数据缺失"]
+    latest = bars.iloc[-1]
+    try:
+        close = float(latest.get("close", np.nan))
+        high = float(latest.get("high", close))
+        low = float(latest.get("low", close))
+        open_ = float(latest.get("open", close))
+    except Exception:
+        return False, "价格字段异常", ["数据异常"]
+    prices = [open_, high, low, close]
+    if any((not np.isfinite(v)) or v <= 0 for v in prices) or high < low:
+        return False, "OHLC异常", ["数据异常"]
+
+    prev_close = 0.0
+    if len(bars) >= 2:
+        try:
+            prev_close = float(bars["close"].astype(float).iloc[-2])
+        except Exception:
+            prev_close = 0.0
+    pct = _pct_change(row, close, prev_close)
+    limit_pct = _limit_threshold(row)
+    sealed_limit_up = pct >= limit_pct * 0.98 and close >= high * 0.999
+    sealed_limit_down = pct <= -limit_pct * 0.98 and close <= low * 1.001
+    one_price_limit = abs(high - low) / max(close, 1e-9) <= 0.001 and (sealed_limit_up or sealed_limit_down)
+    if one_price_limit:
+        return False, "一字涨跌停不可可靠成交", ["涨跌停不可成交"]
+    if sealed_limit_up:
+        return False, "涨停封死不追买", ["涨停封死"]
+    if sealed_limit_down:
+        return False, "跌停封死流动性风险", ["跌停封死"]
+
+    turnover = _latest_turnover_amount(latest, row, close)
+    min_turnover = 100_000_000.0 if scheme_id == "trend_momentum" else 50_000_000.0
+    if 0 < turnover < min_turnover:
+        return False, f"成交额不足{turnover / 100_000_000:.2f}亿", ["成交额不足"]
+
+    tags: List[str] = []
+    if turnover <= 0:
+        tags.append("成交额缺失")
+        turnover_text = "成交额缺失"
+    else:
+        turnover_text = f"成交额{turnover / 100_000_000:.2f}亿"
+    return True, turnover_text, tags
+
+
+def _pct_change(row: pd.Series, close: float, prev_close: float) -> float:
+    """返回小数形式涨跌幅，兼容 pct_change/pct_chg 为小数或百分数。"""
+    for key in ("pct_change", "pct_chg", "change_pct"):
+        val = _num(row.get(key), np.nan)
+        if not np.isnan(val):
+            return val / 100.0 if abs(val) > 1 else val
+    if prev_close > 0:
+        return close / prev_close - 1
+    return 0.0
+
+
+def _limit_threshold(row: pd.Series) -> float:
+    """A股普通票 10%，ST/风险警示票 5%。"""
+    raw_name = str(row.get("name", "") or row.get("stock_name", ""))
+    is_st = bool(row.get("is_st", False)) if "is_st" in row.index else False
+    return 0.05 if is_st or "ST" in raw_name.upper() else 0.10
+
+
+def _latest_turnover_amount(latest: pd.Series, row: pd.Series, close: float) -> float:
+    """估算信号日市场成交额，优先用标准化 amount，缺失时用 volume*close*100 兜底。"""
+    amount = _context_float(latest.get("amount", 0.0)) or _context_float(row.get("amount", 0.0))
+    if amount > 0:
+        return amount
+    volume = _context_float(latest.get("volume", 0.0)) or _context_float(row.get("volume", 0.0))
+    if volume > 0 and close > 0:
+        return volume * close * 100.0
+    return 0.0
 
 
 def _scan_sell_signals(
@@ -329,6 +435,7 @@ def _scan_sell_signals(
     next_exec_date: Optional[date],
     market_score: float,
     bracket: PositionBracket,
+    sell_context: Dict[str, Dict],
 ) -> List[ScanSignal]:
     results = []
     symbol_set = [str(s) for s in symbols]
@@ -337,15 +444,57 @@ def _scan_sell_signals(
         row = day_data[day_data["symbol"] == symbol]
         if bars is None or len(bars) < 20:
             continue
+        context = sell_context.get(symbol, {}) or {}
+        scheme_id = _infer_scheme_id(context)
+        exit_cfg = getattr(BUILTIN_SCHEMES.get(scheme_id), "exit_config", None)
         close = bars["close"].astype(float)
         current = float(close.iloc[-1])
         ma5 = float(close.rolling(5).mean().iloc[-1])
         ma20 = float(close.rolling(20).mean().iloc[-1])
         ma40 = float(close.rolling(40).mean().iloc[-1]) if len(close) >= 40 else ma20
+        low20 = float(close.iloc[-20:].min())
         rsi = _num(row.iloc[0].get("rsi14"), np.nan) if not row.empty else np.nan
         reasons = []
-        if market_score < 20:
-            reasons.append("大盘防御档")
+        exit_reason_keys = []
+        market_floor = float(getattr(exit_cfg, "market_defense_score", 20.0) or 20.0)
+        if bool(getattr(exit_cfg, "enable_market_defense_exit", True)) and market_score < market_floor:
+            reasons.append("大盘防御减仓")
+            exit_reason_keys.append("market_defense")
+
+        entry_date = _context_date(context.get("entry_date") or context.get("add_date") or context.get("signal_date"))
+        entry_price = _context_float(context.get("entry_price") or context.get("avg_cost"))
+        if entry_date is not None:
+            holding_days = _trading_days_between(bars, entry_date, latest_date)
+            if entry_price <= 0:
+                entry_price = _entry_close_from_bars(bars, entry_date)
+            pnl_pct = current / entry_price - 1 if entry_price > 0 else 0.0
+            max_holding_days = int(getattr(exit_cfg, "max_holding_days", 20) or 20)
+            time_stop_days = int(getattr(exit_cfg, "time_stop_days", 7) or 7)
+            min_profit = float(getattr(exit_cfg, "time_stop_min_profit_pct", 0.0) or 0.0)
+            if bool(getattr(exit_cfg, "enable_max_holding_exit", True)) and holding_days >= max_holding_days:
+                reasons.append(f"最长持仓退出{holding_days}日")
+                exit_reason_keys.append("max_holding_days")
+            elif bool(getattr(exit_cfg, "enable_time_stop", True)) and holding_days >= time_stop_days and pnl_pct < min_profit:
+                reasons.append(f"时间止损{holding_days}日收益{pnl_pct:.1%}")
+                exit_reason_keys.append("time_stop")
+
+        failure_window = int(getattr(exit_cfg, "failure_window_days", 3) or 3)
+        in_failure_window = True
+        if entry_date is not None:
+            in_failure_window = _trading_days_between(bars, entry_date, latest_date) <= failure_window
+        if bool(getattr(exit_cfg, "enable_strategy_failure_exit", True)) and in_failure_window:
+            if scheme_id == "trend_momentum" and current < ma20:
+                reasons.append("动量失效退出跌破MA20")
+                exit_reason_keys.append("trend_momentum_failed")
+            elif scheme_id == "pullback" and current < low20 * 1.01:
+                reasons.append("回调破位退出接近20日低点")
+                exit_reason_keys.append("pullback_breakdown")
+            elif scheme_id == "breakout":
+                platform_high = _breakout_platform_high(bars, entry_date)
+                if platform_high > 0 and current < platform_high:
+                    reasons.append("突破失败退出跌回平台")
+                    exit_reason_keys.append("breakout_failed")
+
         if ma5 < ma20:
             reasons.append("MA5低于MA20")
         if current < ma40:
@@ -369,6 +518,9 @@ def _scan_sell_signals(
             layer1_score=0.0,
             layer2_score=0.0,
             layer3_confirmations=len(reasons),
+            layer3_total=len(reasons),
+            layer3_min_confirmations=1 if reasons else 0,
+            layer3_condition_keys=exit_reason_keys or reasons,
             total_score=total,
             entry_reason="；".join(reasons),
             risk_tags=reasons,
@@ -376,6 +528,66 @@ def _scan_sell_signals(
         ))
     results.sort(key=lambda s: s.total_score, reverse=True)
     return results
+
+
+def _infer_scheme_id(context: Dict) -> str:
+    raw = " ".join(str(context.get(k, "")) for k in ("scheme_id", "strategy_id", "strategy_name", "add_reason", "note"))
+    if "trend_momentum" in raw or "强势" in raw or "追涨" in raw or "动量" in raw:
+        return "trend_momentum"
+    if "pullback" in raw or "回调" in raw or "低吸" in raw:
+        return "pullback"
+    if "breakout" in raw or "突破" in raw:
+        return "breakout"
+    return "balanced"
+
+
+def _context_date(value) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    try:
+        return _to_date(value)
+    except Exception:
+        return None
+
+
+def _context_float(value) -> float:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _entry_close_from_bars(bars: pd.DataFrame, entry_date: date) -> float:
+    matched = bars[bars["trade_date"].map(_to_date) <= entry_date]
+    if matched.empty:
+        return 0.0
+    return float(matched.iloc[-1]["close"])
+
+
+def _trading_days_between(bars: pd.DataFrame, start_date: date, end_date: date) -> int:
+    """按K线交易日计算持仓天数，买入执行日为第0天。"""
+    if bars.empty or start_date is None or end_date is None:
+        return 0
+    try:
+        unique_dates = sorted({_to_date(d) for d in bars["trade_date"].dropna().tolist()})
+        if start_date in unique_dates and end_date in unique_dates:
+            return max(unique_dates.index(end_date) - unique_dates.index(start_date), 0)
+        between = [d for d in unique_dates if start_date < d <= end_date]
+        return max(len(between), 0)
+    except Exception:
+        return max(0, (end_date - start_date).days)
+
+
+def _breakout_platform_high(bars: pd.DataFrame, entry_date: Optional[date]) -> float:
+    b = bars.copy()
+    if entry_date is not None:
+        b = b[b["trade_date"].map(_to_date) < entry_date]
+    prev = b.tail(15)
+    if len(prev) < 5:
+        return 0.0
+    return float(prev["close"].astype(float).max())
 
 
 def _build_risk_tags(bars: pd.DataFrame, row: pd.Series, market_score: float, scheme_id: str) -> List[str]:

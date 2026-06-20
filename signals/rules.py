@@ -38,6 +38,12 @@ class TradePoint:
     pnl: float = 0.0             # 盈亏金额（仅SELL）
     pnl_pct: float = 0.0         # 盈亏比例（仅SELL）
     holding_days: int = 0        # 持仓天数（仅SELL）
+    signal_date: date = None     # 信号产生日期（T日）
+    exec_date: date = None       # 实际执行日期（通常T+1）
+    exit_type: str = ""          # 退出主类型：stop_loss/take_profit/signal_exit/final_liquidation
+    exit_subtype: str = ""       # 退出子类型：atr_hard_stop/atr_trailing_profit/rule_signal等
+    trigger_price: float = 0.0   # 触发价/规则价
+    projected_pnl: float = 0.0   # 触发时按执行口径预估净盈亏
 
 
 # ============================================================

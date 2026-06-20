@@ -22,6 +22,7 @@ logs/
 data_storage/
 *.log
 data/backtest_runs/
+data/grid_results/
 
 # OS / editor
 .DS_Store

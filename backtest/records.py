@@ -46,6 +46,9 @@ EXIT_TYPE_LABELS = {
     "stop_loss": "止损",
     "take_profit": "止盈",
     "signal_exit": "信号退出",
+    "strategy_failure": "策略失败退出",
+    "time_exit": "时间退出",
+    "market_exit": "大盘风控退出",
     "final_liquidation": "末日清仓",
     "other_exit": "其他退出",
     "": "未记录",
@@ -62,6 +65,12 @@ EXIT_SUBTYPE_LABELS = {
     "generic_stop_loss": "通用止损",
     "generic_take_profit": "通用止盈",
     "generic_signal": "通用信号退出",
+    "time_stop": "时间止损",
+    "max_holding_days": "最长持仓退出",
+    "trend_momentum_failed": "动量失效退出",
+    "pullback_breakdown": "回调破位退出",
+    "breakout_failed": "突破失败退出",
+    "market_defense": "大盘防御减仓",
     "manual_or_unknown": "手动/未知",
     "": "未记录",
 }
@@ -90,9 +99,29 @@ class BacktestRunConfig:
     symbols: List[str] = field(default_factory=list)
     cost: Dict[str, Any] = field(default_factory=dict)
     risk: Dict[str, Any] = field(default_factory=dict)
+    scheme_config: Dict[str, Any] = field(default_factory=dict)
+    resonance_config: Dict[str, Any] = field(default_factory=dict)
     market_regime_filter: bool = False
     git_commit: str = "unknown"
     data_version: str = "unknown"
+
+
+def scheme_audit_snapshot(scheme: Any) -> Dict[str, Any]:
+    """生成回测配置中可审计的策略快照。
+
+    只保存可 JSON 序列化的策略配置，不保存运行态对象；旧记录不会被改写。
+    """
+    if scheme is None:
+        return {"scheme_config": {}, "resonance_config": {}}
+    if hasattr(scheme, "to_dict"):
+        scheme_config = scheme.to_dict()
+    else:
+        scheme_config = dict(scheme) if isinstance(scheme, Mapping) else {}
+    resonance_config = scheme_config.get("resonance_config", {}) if isinstance(scheme_config, dict) else {}
+    return {
+        "scheme_config": scheme_config if isinstance(scheme_config, dict) else {},
+        "resonance_config": resonance_config if isinstance(resonance_config, dict) else {},
+    }
 
 
 def make_run_id(scheme_id: str, end_date: Any, suffix: str = "") -> str:
@@ -133,6 +162,10 @@ def trade_points_to_frame(stock_points: Mapping[str, Iterable[Any]], source: str
                 "pnl": float(getattr(p, "pnl", 0.0) or 0.0),
                 "pnl_pct": float(getattr(p, "pnl_pct", 0.0) or 0.0),
                 "holding_days": int(getattr(p, "holding_days", 0) or 0),
+                "exit_type": getattr(p, "exit_type", ""),
+                "exit_subtype": getattr(p, "exit_subtype", ""),
+                "trigger_price": float(getattr(p, "trigger_price", 0.0) or 0.0),
+                "projected_pnl": float(getattr(p, "projected_pnl", 0.0) or 0.0),
                 "reason": getattr(p, "reason", ""),
                 "rule_name": getattr(p, "rule_name", ""),
                 "confidence": float(getattr(p, "confidence", 0.0) or 0.0),
@@ -440,6 +473,12 @@ def persist_backtest_run(
         "",
         "```json",
         _json(config.cost),
+        "```",
+        "",
+        "## 策略共振配置",
+        "",
+        "```json",
+        _json(config.resonance_config),
         "```",
     ]
     (run_dir / "report.md").write_text("\n".join(report), encoding="utf-8")

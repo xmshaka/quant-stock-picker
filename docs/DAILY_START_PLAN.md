@@ -1,6 +1,6 @@
 # quant-stock-picker 每日开工计划：短线策略重构与买卖点规则
 
-更新时间：2026-06-19 19:52 GMT+8
+更新时间：2026-06-20 12:55 GMT+8
 
 ## 0. 每日开工先读
 
@@ -8,6 +8,7 @@
 
 ```bash
 cat docs/DAILY_START_PLAN.md
+cat docs/买卖点基本逻辑.md
 cat strategy/schemes.py
 cat signals/layers.py
 cat market/timing.py
@@ -40,7 +41,16 @@ cat backtest/scheme_backtest.py
 - 单股回测修复为 T 日信号、T+1 开盘撮合。
 - ATR 跟踪止盈必须进入扣成本盈利保护区，且 projected_pnl > 0。
 - 不允许亏损交易记录为 `ATR跟踪止盈`。
-- 当前常规测试结果：`pytest tests -q` 为 `231 passed, 6 skipped`。
+- P1 已完成：`trend_momentum` / `pullback` / `breakout` 均有策略专属 `resonance_config`，并落盘到回测 `config.json` / 历史页 / 信号页展示。
+- P2 已完成两批：单股回测路径接入策略专属 `exit_config`、时间止损、最长持仓退出、策略失败退出、大盘防御减仓；信号页风险退出提示同步使用持仓/观察上下文与 `exit_config`。
+- P3 已完成四批：全池 Backtrader 路径接入 P2 退出审计元数据；全池默认 cheat-on-open，信号 T 日收盘后在 T+1 开盘撮合；K线复盘事件源统一为实际成交事件，历史页按 `exec_date` 落点并保留 `signal_date` 审计；补齐全池执行→落盘→读取→K线事件转换闭环测试。
+- P4 已完成六批：新增参数网格验证基础模块，支持保守参数空间、策略克隆、结果归一化、低回撤优先排序和 runner 注入式执行；新增轻量 SchemeBacktester runner、CSV/Parquet 输入输出工具和 `scripts/run_param_grid.py` CLI，默认 `max_runs=3` 防止误触发全A重任务；补齐真实 CLI 小样本 smoke，修复 CSV 读取导致股票代码前导 0 丢失的问题；新增参数网格审计目录，输出 `grid_results.csv/parquet`、`config.json`、`summary.md`；新增参数网格结果页面 `dashboard/pages/10_参数网格.py`，读取审计目录并展示实验列表、配置、Top结果和低回撤优先结果表；已真实生成受控小样本审计目录并验证页面辅助函数可读取，`data/grid_results/` 已加入 `.gitignore` 防止产物污染提交。
+- P2 退出体系新增可调开关：`enable_market_defense_exit`、`enable_strategy_failure_exit`、`enable_trailing_exit`、`enable_time_stop`、`enable_max_holding_exit`；回测页新增“短线退出规则”面板，可调整开关、最长持仓、时间止损天数、最低收益、策略失败窗口、大盘防御分数、跟踪止盈激活浮盈%和ATR激活倍数；单股回测、全池 Backtrader、信号扫描均尊重开关，配置随回测记录落盘。
+- P2 跟踪止盈语义已收紧：必须先达到 `highest >= avg_cost × (1 + trailing_activation_pct)` 或 `highest >= avg_cost + trailing_activation_atr_mult × ATR` 后才激活；默认 `5%` 或 `1ATR`，触发后扣成本盈利才记为 `ATR跟踪止盈`，否则记为 `ATR跟踪回撤止损`。
+- 时间止损和最长持仓统一为交易日口径：买入执行日为第 0 个持仓交易日，周末/节假日不计入。
+- L4 风险可交易性检查已补齐：信号扫描过滤 OHLC 异常、一字涨跌停、封死涨跌停、低成交额，买入原因追加 `L4可交易性` 审计文本。
+- `docs/买卖点基本逻辑.md` 已升级到 v2.0，记录当前 layered 买点、T+1 开盘执行、`signals_executed` K线事件源、P2 退出体系、退出开关、600143 日期排查结论；下一次 agent 必须优先读取。
+- 当前常规测试结果：`.venv/bin/pytest tests -q` 为 `296 passed, 6 skipped`。
 - 根目录 `pytest -q` 被历史诊断脚本 `direct_dataflow_test.py` 阻塞，非当前修复引入。
 
 ---
@@ -100,7 +110,7 @@ A股短线择时选股系统
   ├─ L1 趋势过滤
   ├─ L2 策略形态匹配
   ├─ L3 多条件共振
-  └─ L4 风险可交易性检查（待补）
+  └─ L4 风险可交易性检查
 
 执行层
   ├─ T日收盘信号
@@ -112,9 +122,9 @@ A股短线择时选股系统
   ├─ ATR硬止损
   ├─ ATR盈利保护型跟踪止盈
   ├─ 固定止盈
-  ├─ 时间止损（待补）
-  ├─ 信号失效退出（待补）
-  └─ 大盘降档减仓（待补）
+  ├─ 时间止损（交易日口径）
+  ├─ 策略失败退出
+  └─ 大盘降档减仓
 ```
 
 ---
@@ -460,9 +470,9 @@ ExitDecision:
 2. 硬止损
 3. 大盘防御强制降仓
 4. 策略失败退出
-5. 时间止损
+5. ATR盈利保护型跟踪止盈 / 跟踪回撤止损
 6. 固定止盈
-7. 跟踪止盈
+7. 时间止损 / 最长持仓
 8. 信号卖出
 9. 末日清仓
 ```

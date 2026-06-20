@@ -24,6 +24,83 @@ class RuleType(Enum):
 
 
 @dataclass
+class ResonanceConfig:
+    """策略专属共振配置。
+
+    min_confirmations：最低确认数；
+    buy_conditions/sell_conditions：该策略启用的 L3 条件名称，空列表表示使用默认全集。
+    """
+    min_confirmations: int = 2
+    buy_conditions: List[str] = field(default_factory=list)
+    sell_conditions: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {
+            "min_confirmations": self.min_confirmations,
+            "buy_conditions": list(self.buy_conditions),
+            "sell_conditions": list(self.sell_conditions),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "ResonanceConfig":
+        return cls(
+            min_confirmations=int(d.get("min_confirmations", 2)),
+            buy_conditions=list(d.get("buy_conditions", []) or []),
+            sell_conditions=list(d.get("sell_conditions", []) or []),
+        )
+
+
+@dataclass
+class ExitConfig:
+    """策略专属短线退出配置。"""
+    enable_market_defense_exit: bool = True
+    enable_strategy_failure_exit: bool = True
+    enable_trailing_exit: bool = True
+    enable_time_stop: bool = True
+    enable_max_holding_exit: bool = True
+    max_holding_days: int = 20
+    time_stop_days: int = 7
+    time_stop_min_profit_pct: float = 0.0
+    failure_window_days: int = 3
+    market_defense_score: float = 20.0
+    trailing_activation_pct: float = 0.05
+    trailing_activation_atr_mult: float = 1.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "enable_market_defense_exit": self.enable_market_defense_exit,
+            "enable_strategy_failure_exit": self.enable_strategy_failure_exit,
+            "enable_trailing_exit": self.enable_trailing_exit,
+            "enable_time_stop": self.enable_time_stop,
+            "enable_max_holding_exit": self.enable_max_holding_exit,
+            "max_holding_days": self.max_holding_days,
+            "time_stop_days": self.time_stop_days,
+            "time_stop_min_profit_pct": self.time_stop_min_profit_pct,
+            "failure_window_days": self.failure_window_days,
+            "market_defense_score": self.market_defense_score,
+            "trailing_activation_pct": self.trailing_activation_pct,
+            "trailing_activation_atr_mult": self.trailing_activation_atr_mult,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "ExitConfig":
+        return cls(
+            enable_market_defense_exit=bool(d.get("enable_market_defense_exit", True)),
+            enable_strategy_failure_exit=bool(d.get("enable_strategy_failure_exit", True)),
+            enable_trailing_exit=bool(d.get("enable_trailing_exit", True)),
+            enable_time_stop=bool(d.get("enable_time_stop", True)),
+            enable_max_holding_exit=bool(d.get("enable_max_holding_exit", True)),
+            max_holding_days=int(d.get("max_holding_days", 20)),
+            time_stop_days=int(d.get("time_stop_days", 7)),
+            time_stop_min_profit_pct=float(d.get("time_stop_min_profit_pct", 0.0)),
+            failure_window_days=int(d.get("failure_window_days", 3)),
+            market_defense_score=float(d.get("market_defense_score", 20.0)),
+            trailing_activation_pct=float(d.get("trailing_activation_pct", 0.05)),
+            trailing_activation_atr_mult=float(d.get("trailing_activation_atr_mult", 1.0)),
+        )
+
+
+@dataclass
 class SignalRuleConfig:
     """信号规则配置（可序列化）"""
     rule_type: RuleType
@@ -60,6 +137,8 @@ class StrategyScheme:
     take_profit_atr_mult: float = 3.0  # 固定止盈 = 买入价 + N×ATR
     trailing_atr_mult: float = 2.0     # 跟踪止盈 = 持仓最高价 - N×ATR
     atr_period: int = 14               # ATR计算周期
+    resonance_config: ResonanceConfig = field(default_factory=ResonanceConfig)  # P1: 策略专属共振配置
+    exit_config: ExitConfig = field(default_factory=ExitConfig)                  # P2: 策略专属短线退出配置
 
     def to_dict(self) -> Dict:
         return {
@@ -79,6 +158,8 @@ class StrategyScheme:
             "take_profit_atr_mult": self.take_profit_atr_mult,
             "trailing_atr_mult": self.trailing_atr_mult,
             "atr_period": self.atr_period,
+            "resonance_config": self.resonance_config.to_dict(),
+            "exit_config": self.exit_config.to_dict(),
         }
 
     @classmethod
@@ -100,6 +181,8 @@ class StrategyScheme:
             take_profit_atr_mult=d.get("take_profit_atr_mult", 3.0),
             trailing_atr_mult=d.get("trailing_atr_mult", 2.0),
             atr_period=d.get("atr_period", 14),
+            resonance_config=ResonanceConfig.from_dict(d.get("resonance_config", {})),
+            exit_config=ExitConfig.from_dict(d.get("exit_config", {})),
         )
 
 
@@ -127,6 +210,18 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.MACD_TREND, {"fast": 12, "slow": 26, "signal": 9}),
     ],
     regime_fit=["强势单边上涨"],
+    resonance_config=ResonanceConfig(
+        min_confirmations=3,
+        buy_conditions=["volume_expand", "ma5_above_ma20", "near_high", "momentum_5d", "momentum_20d", "rsi_not_extreme"],
+        sell_conditions=["ma5_below_ma20", "macd_bearish", "volume_price_down", "kdj_death"],
+    ),
+    exit_config=ExitConfig(
+        max_holding_days=10,
+        time_stop_days=5,
+        time_stop_min_profit_pct=0.02,
+        failure_window_days=3,
+        market_defense_score=20.0,
+    ),
 ))
 
 _register(StrategyScheme(
@@ -142,6 +237,18 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
     ],
     regime_fit=["震荡整理", "弱势单边下跌"],
+    resonance_config=ResonanceConfig(
+        min_confirmations=3,
+        buy_conditions=["rsi_oversold", "boll_lower", "pullback_range", "not_break_20d_low", "volume_calm", "near_support"],
+        sell_conditions=["rsi_overbought", "ma5_below_ma20", "boll_upper", "kdj_death"],
+    ),
+    exit_config=ExitConfig(
+        max_holding_days=15,
+        time_stop_days=7,
+        time_stop_min_profit_pct=0.0,
+        failure_window_days=3,
+        market_defense_score=20.0,
+    ),
 ))
 
 _register(StrategyScheme(
@@ -157,6 +264,18 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
     ],
     regime_fit=["震荡整理", "强势单边上涨"],
+    resonance_config=ResonanceConfig(
+        min_confirmations=3,
+        buy_conditions=["break_platform", "volume_surge", "ma5_above_ma20", "narrow_range", "momentum_5d", "boll_upper"],
+        sell_conditions=["ma5_below_ma20", "macd_bearish", "volume_price_down", "kdj_death"],
+    ),
+    exit_config=ExitConfig(
+        max_holding_days=10,
+        time_stop_days=5,
+        time_stop_min_profit_pct=0.0,
+        failure_window_days=2,
+        market_defense_score=20.0,
+    ),
 ))
 
 _register(StrategyScheme(
@@ -175,5 +294,16 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
     ],
     regime_fit=["*"],
+    resonance_config=ResonanceConfig(
+        min_confirmations=2,
+        buy_conditions=[],
+        sell_conditions=[],
+    ),
+    exit_config=ExitConfig(
+        max_holding_days=20,
+        time_stop_days=10,
+        time_stop_min_profit_pct=0.0,
+        failure_window_days=3,
+        market_defense_score=20.0,
+    ),
 ))
-

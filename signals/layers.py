@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from signals.rules import TradePoint
+from strategy.schemes import BUILTIN_SCHEMES, ResonanceConfig
 
 
 class StrategyType(str, Enum):
@@ -30,6 +31,7 @@ class StrategyType(str, Enum):
 
 @dataclass
 class ConditionResult:
+    key: str
     name: str
     met: bool
     value: float
@@ -243,8 +245,28 @@ class StrategyMatcher:
 class ResonanceChecker:
     """6个技术条件 ≥ min_confirmations 个同时满足才触发"""
 
-    def __init__(self, min_confirmations=2):
+    def __init__(self, min_confirmations=2, buy_conditions: Optional[List[str]] = None, sell_conditions: Optional[List[str]] = None):
         self.min_confirmations = min_confirmations
+        self.buy_conditions = set(buy_conditions or [])
+        self.sell_conditions = set(sell_conditions or [])
+
+    @classmethod
+    def from_strategy(cls, strategy_type: str, fallback_min_confirmations: int = 2) -> "ResonanceChecker":
+        scheme = BUILTIN_SCHEMES.get(str(strategy_type))
+        cfg = getattr(scheme, "resonance_config", None) if scheme else None
+        if cfg is None:
+            cfg = ResonanceConfig(min_confirmations=fallback_min_confirmations)
+        return cls(
+            min_confirmations=int(getattr(cfg, "min_confirmations", fallback_min_confirmations) or fallback_min_confirmations),
+            buy_conditions=list(getattr(cfg, "buy_conditions", []) or []),
+            sell_conditions=list(getattr(cfg, "sell_conditions", []) or []),
+        )
+
+    def _filter_conditions(self, conditions: List[ConditionResult], side: str) -> List[ConditionResult]:
+        enabled = self.buy_conditions if side == "buy" else self.sell_conditions
+        if not enabled:
+            return conditions
+        return [c for c in conditions if c.key in enabled]
 
     def check_buy(self, bars: pd.DataFrame, idx: int) -> Tuple[bool, List[ConditionResult]]:
         conditions = []
@@ -254,7 +276,7 @@ class ResonanceChecker:
         rsi = self._calc_rsi(bars, idx, 14)
         met = rsi < 40
         conditions.append(ConditionResult(
-            "RSI超卖", met, rsi, 40, "below",
+            "rsi_oversold", "RSI超卖", met, rsi, 40, "below",
             min(1.0, (40 - rsi) / 20 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -263,7 +285,7 @@ class ResonanceChecker:
         ma5_met = self._check_ma_cross(bars, idx, 5, 20, "up")
         ma5, ma20 = self._get_mas(bars, idx, 5, 20)
         conditions.append(ConditionResult(
-            "MA金叉", ma5_met, ma5 / ma20 if ma20 > 0 else 0, 1.0, "cross_up",
+            "ma_golden", "MA金叉", ma5_met, ma5 / ma20 if ma20 > 0 else 0, 1.0, "cross_up",
             min(1.0, (ma5 / ma20 - 1) * 50 + 0.3) if ma5_met else 0,
         ))
         if ma5_met: met_count += 1
@@ -272,7 +294,7 @@ class ResonanceChecker:
         macd_met = self._check_macd(bars, idx, "bullish")
         macd_val = self._get_macd_hist(bars, idx)
         conditions.append(ConditionResult(
-            "MACD翻红", macd_met, macd_val, 0, "above",
+            "macd_bullish", "MACD翻红", macd_met, macd_val, 0, "above",
             min(1.0, abs(macd_val) * 10 + 0.3) if macd_met else 0,
         ))
         if macd_met: met_count += 1
@@ -281,7 +303,7 @@ class ResonanceChecker:
         boll_pos = self._get_boll_position(bars, idx, 20, 2.0)
         met = boll_pos < 0.3
         conditions.append(ConditionResult(
-            "布林下轨", met, boll_pos, 0.3, "below",
+            "boll_lower", "布林下轨", met, boll_pos, 0.3, "below",
             min(1.0, (0.3 - boll_pos) * 3 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -290,7 +312,7 @@ class ResonanceChecker:
         vol_ratio = self._get_volume_ratio(bars, idx, 20)
         met = vol_ratio > 1.2
         conditions.append(ConditionResult(
-            "放量", met, vol_ratio, 1.2, "above",
+            "volume_expand", "放量", met, vol_ratio, 1.2, "above",
             min(1.0, (vol_ratio - 1) * 0.5 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -298,12 +320,14 @@ class ResonanceChecker:
         # 6. KDJ金叉(K<50)
         kdj_met, k_val, d_val = self._check_kdj(bars, idx, "golden")
         conditions.append(ConditionResult(
-            "KDJ金叉", kdj_met, k_val, d_val, "cross_up",
+            "kdj_golden", "KDJ金叉", kdj_met, k_val, d_val, "cross_up",
             min(1.0, (d_val - k_val) / 10 + 0.3) if kdj_met else 0,
         ))
         if kdj_met: met_count += 1
 
-        return met_count >= self.min_confirmations, conditions
+        active = self._filter_conditions(conditions, "buy")
+        met_count = sum(1 for c in active if c.met)
+        return met_count >= self.min_confirmations, active
 
     def check_sell(self, bars: pd.DataFrame, idx: int) -> Tuple[bool, List[ConditionResult]]:
         conditions = []
@@ -313,7 +337,7 @@ class ResonanceChecker:
         rsi = self._calc_rsi(bars, idx, 14)
         met = rsi > 70
         conditions.append(ConditionResult(
-            "RSI超买", met, rsi, 70, "above",
+            "rsi_overbought", "RSI超买", met, rsi, 70, "above",
             min(1.0, (rsi - 70) / 20 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -322,7 +346,7 @@ class ResonanceChecker:
         ma5, ma20 = self._get_mas(bars, idx, 5, 20)
         ma_met = ma5 < ma20 if ma20 > 0 else False
         conditions.append(ConditionResult(
-            "MA死叉", ma_met, ma20 / ma5 if ma5 > 0 else 0, 1.0, "cross_down",
+            "ma5_below_ma20", "MA死叉", ma_met, ma20 / ma5 if ma5 > 0 else 0, 1.0, "cross_down",
             min(1.0, (ma20 / ma5 - 1) * 50 + 0.3) if ma_met else 0,
         ))
         if ma_met: met_count += 1
@@ -331,7 +355,7 @@ class ResonanceChecker:
         macd_met = self._check_macd(bars, idx, "bearish")
         macd_val = self._get_macd_hist(bars, idx)
         conditions.append(ConditionResult(
-            "MACD翻绿", macd_met, macd_val, 0, "below",
+            "macd_bearish", "MACD翻绿", macd_met, macd_val, 0, "below",
             min(1.0, abs(macd_val) * 10 + 0.3) if macd_met else 0,
         ))
         if macd_met: met_count += 1
@@ -340,7 +364,7 @@ class ResonanceChecker:
         boll_pos = self._get_boll_position(bars, idx, 20, 2.0)
         met = boll_pos > 0.8
         conditions.append(ConditionResult(
-            "布林上轨", met, boll_pos, 0.8, "above",
+            "boll_upper", "布林上轨", met, boll_pos, 0.8, "above",
             min(1.0, (boll_pos - 0.8) * 5 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -350,7 +374,7 @@ class ResonanceChecker:
         price_down = bars['close'].astype(float).iloc[idx] < bars['close'].astype(float).iloc[idx - 1] if idx >= 1 else False
         met = vol_ratio > 1.2 and price_down
         conditions.append(ConditionResult(
-            "放量下跌", met, vol_ratio, 1.2, "above",
+            "volume_price_down", "放量下跌", met, vol_ratio, 1.2, "above",
             min(1.0, (vol_ratio - 1) * 0.5 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -358,12 +382,14 @@ class ResonanceChecker:
         # 6. KDJ死叉(K>50)
         kdj_met, k_val, d_val = self._check_kdj(bars, idx, "death")
         conditions.append(ConditionResult(
-            "KDJ死叉", kdj_met, k_val, d_val, "cross_down",
+            "kdj_death", "KDJ死叉", kdj_met, k_val, d_val, "cross_down",
             min(1.0, abs(k_val - d_val) / 10 + 0.3) if kdj_met else 0,
         ))
         if kdj_met: met_count += 1
 
-        return met_count >= self.min_confirmations, conditions
+        active = self._filter_conditions(conditions, "sell")
+        met_count = sum(1 for c in active if c.met)
+        return met_count >= self.min_confirmations, active
 
     # ── 工具方法 ──
     @staticmethod
@@ -473,7 +499,7 @@ def evaluate_layered(
 
     tf = trend_filter or TrendFilter(strategy_type=strategy_type)
     sm = strategy_matcher or StrategyMatcher(StrategyType(strategy_type))
-    rc = resonance_checker or ResonanceChecker(min_confirmations)
+    rc = resonance_checker or ResonanceChecker.from_strategy(strategy_type, min_confirmations)
 
     close = bars['close'].astype(float)
     points = []

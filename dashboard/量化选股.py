@@ -8,6 +8,7 @@
 import sys
 sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
 
+import inspect
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,10 +18,31 @@ from data_loader import load_data, FACTOR_NAME_MAP, NAME_MAP
 from signals.engine import SignalEngine, SignalFormatter
 from signals.scanner import scan_signals
 from signals.portfolio import PortfolioManager, PoolItem
+from strategy.schemes import BUILTIN_SCHEMES
 from theme import (
     inject_theme, metric_row, section_header, badge, badge_html,
     empty_state, signal_card, topbar, C,
 )
+
+
+def _scan_signals_compat(*, factor_df, price_df, factor_names, scheme_id, market_score, top_n, include_sell_symbols, include_sell_context):
+    """兼容 Streamlit 旧进程缓存的 signals.scanner.scan_signals 签名。
+
+    线上 Streamlit 进程可能在模块更新前已启动，rerun 时会复用 sys.modules 中的旧函数，
+    旧函数不接受 include_sell_context。这里先避免页面直接 TypeError；进程重启后会走新版签名。
+    """
+    kwargs = {
+        "scheme_id": scheme_id,
+        "market_score": market_score,
+        "top_n": top_n,
+        "include_sell_symbols": list(include_sell_symbols),
+    }
+    try:
+        if "include_sell_context" in inspect.signature(scan_signals).parameters:
+            kwargs["include_sell_context"] = include_sell_context
+    except (TypeError, ValueError):
+        kwargs["include_sell_context"] = include_sell_context
+    return scan_signals(factor_df, price_df, factor_names, **kwargs)
 
 # ========== 页面配置 ==========
 st.set_page_config(page_title="量化选股", page_icon="🎯", layout="centered", initial_sidebar_state="collapsed")
@@ -60,21 +82,32 @@ hotspot = st.session_state.hotspot
 
 # ── 信号缓存（避免每次 rerun 重算）──
 @st.cache_data(ttl=120, show_spinner=False)
-def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key):
+def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key, portfolio_context_key):
     """按新短线方案扫描信号；用 hashable key 触发缓存，实际数据从 session_state 取。"""
-    buy, sell = scan_signals(
-        st.session_state._factor_df,
-        st.session_state._price_df,
-        st.session_state._factor_names,
+    buy, sell = _scan_signals_compat(
+        factor_df=st.session_state._factor_df,
+        price_df=st.session_state._price_df,
+        factor_names=st.session_state._factor_names,
         scheme_id=scheme_id,
         market_score=market_score,
         top_n=20,
         include_sell_symbols=list(portfolio_symbols_key),
+        include_sell_context=st.session_state.get("_portfolio_signal_context", {}),
     )
     return buy, sell
 
 # ── 加载主数据 ──
 _portfolio_syms = sorted({item.symbol for item in (pm.watch_list + pm.hold_list)})
+st.session_state._portfolio_signal_context = {
+    item.symbol: {
+        "add_date": item.add_date,
+        "add_reason": item.add_reason,
+        "note": item.note,
+        "signal_strength": item.signal_strength,
+        "signal_score": item.signal_score,
+    }
+    for item in (pm.watch_list + pm.hold_list)
+}
 _n_stocks = max(100, len(_portfolio_syms) + 100)
 
 with st.spinner("加载行情数据..."):
@@ -107,6 +140,35 @@ def _build_data_key(factor_df: pd.DataFrame, price_df: pd.DataFrame, latest_date
         tuple(sorted(factor_symbols.unique())[:10]),
         tuple(sorted(price_symbols.unique())[:10]),
     )
+
+
+def _signal_resonance_text(signal) -> str:
+    """信号卡共振展示，必须使用 scanner 传回的策略配置总数，禁止硬编码 /6。"""
+    confirmations = getattr(signal, 'layer3_confirmations', '-')
+    total = getattr(signal, 'layer3_total', 0) or 6
+    minimum = getattr(signal, 'layer3_min_confirmations', 0) or '-'
+    return f"共振 {confirmations}/{total}，最低{minimum}"
+
+
+def _strategy_resonance_summary(scheme_id: str):
+    """当前扫描策略的共振配置摘要。balanced 展示三个子策略。"""
+    target_ids = ["trend_momentum", "pullback", "breakout"] if scheme_id == "balanced" else [scheme_id]
+    rows = []
+    for sid in target_ids:
+        scheme = BUILTIN_SCHEMES.get(sid)
+        if scheme is None:
+            continue
+        cfg = getattr(scheme, "resonance_config", None)
+        if cfg is None:
+            continue
+        rows.append({
+            "策略": scheme.name,
+            "最低确认": cfg.min_confirmations,
+            "买入条件数": len(cfg.buy_conditions or []),
+            "卖出条件数": len(cfg.sell_conditions or []),
+            "买入条件": "、".join(cfg.buy_conditions or []),
+        })
+    return rows
 
 # ── 新方案默认状态 ──
 if "signal_scheme_id" not in st.session_state:
@@ -256,6 +318,10 @@ if page_idx == 0:
                 help="临时使用手动评分；后续接入 market/timing.py 实时评分。",
             )
         st.caption("当前扫描路径：大盘评分 → 股票池过滤 → 三策略独立候选 → L1趋势过滤 → L2形态匹配 → L3共振确认。信号日为T日收盘，建议成交日为T+1。")
+        resonance_rows = _strategy_resonance_summary(selected_scheme)
+        if resonance_rows:
+            st.caption("策略共振配置（与信号卡 共振 x/y 口径一致）")
+            st.dataframe(pd.DataFrame(resonance_rows), width="stretch", hide_index=True)
         if selected_scheme != st.session_state.signal_scheme_id or market_score_input != st.session_state.market_score_override:
             st.session_state.signal_scheme_id = selected_scheme
             st.session_state.market_score_override = market_score_input
@@ -264,6 +330,15 @@ if page_idx == 0:
 
     # ── 计算信号 ──
     portfolio_symbols = tuple(sorted({item.symbol for item in (pm.watch_list + pm.hold_list)}))
+    portfolio_context_key = tuple(sorted(
+        (
+            sym,
+            str(ctx.get("add_date", "")),
+            str(ctx.get("add_reason", "")),
+            str(ctx.get("note", "")),
+        )
+        for sym, ctx in st.session_state.get("_portfolio_signal_context", {}).items()
+    ))
     data_key = _build_data_key(factor_df, price_df, latest_date)
     signal_cache_key = (
         data_key,
@@ -271,6 +346,7 @@ if page_idx == 0:
         st.session_state.signal_scheme_id,
         float(st.session_state.market_score_override),
         portfolio_symbols,
+        portfolio_context_key,
     )
     if st.session_state.get("_latest_signal_cache_key") == signal_cache_key:
         buy_signals, sell_signals = st.session_state.get("_latest_signal_result", ([], []))
@@ -281,6 +357,7 @@ if page_idx == 0:
             st.session_state.signal_scheme_id,
             float(st.session_state.market_score_override),
             portfolio_symbols,
+            portfolio_context_key,
         )
         st.session_state._latest_signal_cache_key = signal_cache_key
         st.session_state._latest_signal_result = (buy_signals, sell_signals)
@@ -332,7 +409,7 @@ if page_idx == 0:
                 signal_card(
                     name=f"<strong>{fmt_name(s.symbol)}</strong>",
                     meta=(
-                        f"{s.strategy_name} · 总分 {s.score:.2f} · 共振 {getattr(s, 'layer3_confirmations', '-')}/6 · "
+                        f"{s.strategy_name} · 总分 {s.score:.2f} · {_signal_resonance_text(s)} · "
                         f"信号日 {getattr(s, 'signal_date', latest_date)} · T+1 {getattr(s, 'suggested_exec_date', '-') or '-'} · "
                         f"建议仓位 {getattr(s, 'suggested_position_pct', 0) * 100:.1f}%"
                     ),
@@ -400,7 +477,7 @@ elif page_idx == 1:
             with col_info:
                 live_sig = st.session_state.get("_latest_signal_map", {}).get(item.symbol)
                 live_meta = (
-                    f"最新扫描：{live_sig.strategy_name} · 总分 {live_sig.score:.2f} · 共振 {live_sig.layer3_confirmations}/6 · {live_sig.signal_date}"
+                    f"最新扫描：{live_sig.strategy_name} · 总分 {live_sig.score:.2f} · {_signal_resonance_text(live_sig)} · {live_sig.signal_date}"
                     if live_sig else
                     f"入池记录：{item.add_reason} · 强度 {item.signal_strength} · {item.add_date}"
                 )

@@ -8,6 +8,7 @@ from __future__ import annotations
 import pandas as pd
 
 from dashboard.components.kline_chart import plot_kline_with_signals, render_kline_chart
+from dashboard.kline_events import trade_points_from_executed_frame
 from signals.rules import TradePoint
 
 
@@ -149,6 +150,39 @@ def test_kline_marker_uses_exec_date_and_keeps_signal_date_tooltip():
     assert f'"signalDate": "{bars["trade_date"].iloc[5].strftime("%Y-%m-%d")}"' in html
     assert f'"execDate": "{bars["trade_date"].iloc[6].strftime("%Y-%m-%d")}"' in html
     assert "信号:" in html
+
+
+def test_executed_frame_to_kline_points_prioritizes_exec_date():
+    """历史页K线复盘必须从成交事件构造点位，exec_date 优先于 signal_date/date。"""
+    df = pd.DataFrame([
+        {
+            "symbol": "000001",
+            "date": "2026-01-03",
+            "signal_date": "2026-01-02",
+            "exec_date": "2026-01-06",
+            "action": "BUY",
+            "exec_price": 10.5,
+            "shares": 1000,
+            "reason": "T日信号",
+            "rule_name": "测试规则",
+            "exit_type": "",
+            "exit_subtype": "",
+        }
+    ])
+    points = trade_points_from_executed_frame(df)
+
+    assert len(points) == 1
+    assert points[0].date == pd.Timestamp("2026-01-06").date()
+    assert points[0].exec_date == pd.Timestamp("2026-01-06").date()
+    assert points[0].signal_date == pd.Timestamp("2026-01-02").date()
+
+    bars = _sample_bars(10)
+    # 强制包含 exec_date，验证 marker 落在 exec_date 而不是 signal_date/date。
+    bars.loc[5, "trade_date"] = pd.Timestamp("2026-01-06")
+    result = plot_kline_with_signals(bars.sort_values("trade_date"), points, symbol="测试")
+    html = result["html"]
+    assert '"time": "2026-01-06"' in html
+    assert '"signalDate": "2026-01-02"' in html
 
 
 def test_signal_markers_use_scatter_and_dashed_lines():

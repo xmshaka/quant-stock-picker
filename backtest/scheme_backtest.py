@@ -25,7 +25,7 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 
-from strategy.schemes import StrategyScheme
+from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme
 from signals.layers import evaluate_layered
 from market.timing import MarketTimingModel
 from signals.rules import TradePoint, evaluate_all_rules
@@ -116,6 +116,12 @@ EXIT_REASON_MAP = {
     'ATR跟踪回撤止损': ('stop_loss', 'atr_trailing_profit_failed'),
     'ATR止盈': ('take_profit', 'atr_fixed_profit'),
     'ATR回撤止损': ('stop_loss', 'atr_profit_failed'),
+    '时间止损': ('stop_loss', 'time_stop'),
+    '最长持仓退出': ('time_exit', 'max_holding_days'),
+    '动量失效退出': ('strategy_failure', 'trend_momentum_failed'),
+    '回调破位退出': ('strategy_failure', 'pullback_breakdown'),
+    '突破失败退出': ('strategy_failure', 'breakout_failed'),
+    '大盘防御减仓': ('market_exit', 'market_defense'),
     '信号卖出': ('signal_exit', 'rule_signal'),
     '末日清仓': ('final_liquidation', 'end_of_backtest'),
 }
@@ -222,9 +228,10 @@ class SchemeBacktestResult:
         """持久化回测结果到 parquet。"""
         from backtest.records import (
             BacktestRunConfig, trade_points_to_frame,
-            trade_details_to_frame, equity_curve_to_frame, persist_backtest_run,
+            trade_details_to_frame, equity_curve_to_frame, persist_backtest_run, scheme_audit_snapshot,
         )
         if config is None:
+            scheme_snapshot = scheme_audit_snapshot(BUILTIN_SCHEMES.get(self.scheme_id))
             config = BacktestRunConfig(
                 run_id=self.run_id,
                 scheme_id=self.scheme_id,
@@ -234,6 +241,8 @@ class SchemeBacktestResult:
                 lookback_days=0,
                 top_n=0,
                 initial_capital=1_000_000.0,
+                scheme_config=scheme_snapshot["scheme_config"],
+                resonance_config=scheme_snapshot["resonance_config"],
             )
         # P0: trades.parquet 以真实成交明细为准，避免丢失成本/PnL字段
         trades_df = trade_details_to_frame(self.trade_details, run_id=config.run_id, source="executed")
@@ -303,6 +312,19 @@ class SchemeBacktester:
         trail_mult = scheme.trailing_atr_mult if scheme else 2.0
         atr_period = scheme.atr_period if scheme else 14
         enable_market_timing = scheme.enable_market_timing if scheme else True
+        exit_cfg = getattr(scheme, 'exit_config', None)
+        max_holding_days = int(getattr(exit_cfg, 'max_holding_days', 20) or 20)
+        time_stop_days = int(getattr(exit_cfg, 'time_stop_days', 7) or 7)
+        time_stop_min_profit_pct = float(getattr(exit_cfg, 'time_stop_min_profit_pct', 0.0) or 0.0)
+        failure_window_days = int(getattr(exit_cfg, 'failure_window_days', 3) or 3)
+        market_defense_score = float(getattr(exit_cfg, 'market_defense_score', 20.0) or 20.0)
+        enable_market_defense_exit = bool(getattr(exit_cfg, 'enable_market_defense_exit', True))
+        enable_strategy_failure_exit = bool(getattr(exit_cfg, 'enable_strategy_failure_exit', True))
+        enable_trailing_exit = bool(getattr(exit_cfg, 'enable_trailing_exit', True))
+        enable_time_stop = bool(getattr(exit_cfg, 'enable_time_stop', True))
+        enable_max_holding_exit = bool(getattr(exit_cfg, 'enable_max_holding_exit', True))
+        trailing_activation_pct = float(getattr(exit_cfg, 'trailing_activation_pct', 0.05) or 0.0)
+        trailing_activation_atr_mult = float(getattr(exit_cfg, 'trailing_activation_atr_mult', 1.0) or 0.0)
 
         # ── 大盘择时 ──
         market_timing = None
@@ -451,6 +473,8 @@ class SchemeBacktester:
 
         # T+1 日期映射
         date_list = sorted(bt_dates)
+        trading_date_keys = [dt.date() if hasattr(dt, 'date') else dt for dt in date_list]
+        trading_day_index = {dt_key: idx for idx, dt_key in enumerate(trading_date_keys)}
         next_date_map: Dict = {}
         for i, dt in enumerate(date_list):
             dt_key = dt.date() if hasattr(dt, 'date') else dt
@@ -523,6 +547,84 @@ class SchemeBacktester:
             denom = max(1.0 - variable_sell_cost, 1e-9)
             return (cost_value / shares + fixed_commission_per_share) / denom
 
+        def _holding_days(dt_key, pos):
+            """持仓天数按交易日计数，不按自然日。
+
+            买入执行日记为第0个持仓交易日；后续每过一个回测交易日+1。
+            用于时间止损、最长持仓退出、策略失败窗口以及交易明细审计。
+            """
+            entry_dt = pos.get('entry_dt')
+            if entry_dt is None:
+                return 0
+            if dt_key in trading_day_index and entry_dt in trading_day_index:
+                return max(trading_day_index[dt_key] - trading_day_index[entry_dt], 0)
+            return (dt_key - entry_dt).days if hasattr(dt_key - entry_dt, 'days') else 0
+
+        def _unrealized_pnl_pct(sym, dt_key, price, pos):
+            pnl, pnl_pct, _ = _project_sell_pnl(sym, dt_key, price, pos)
+            return pnl, pnl_pct
+
+        def _market_defense_exit(dt_key):
+            if not enable_market_defense_exit:
+                return False
+            if market_timing is None:
+                return False
+            try:
+                return float(market_timing.score_on(dt_key)) < market_defense_score
+            except Exception:
+                return False
+
+        def _strategy_failure_exit(sym, dt_key, open_price, pos):
+            """P2: 策略专属失败退出，全部只用截至当日开盘前已知/当日开盘价信息。"""
+            if not enable_strategy_failure_exit:
+                return None
+            holding_days = _holding_days(dt_key, pos)
+            if holding_days > failure_window_days:
+                return None
+            bars = sym_bars_map.get(sym, pd.DataFrame())
+            if bars.empty:
+                return None
+            hist = bars[pd.to_datetime(bars['trade_date']).dt.date < dt_key].copy()
+            if len(hist) < 20:
+                return None
+            close = hist['close'].astype(float)
+            ma20 = float(close.rolling(20).mean().iloc[-1])
+            low20 = float(close.iloc[-20:].min())
+            if scheme_type == 'trend_momentum' and open_price < ma20:
+                return f'动量失效退出(跌破MA20 {ma20:.2f})', '动量失效退出', ma20
+            if scheme_type == 'pullback' and open_price < low20:
+                return f'回调破位退出(跌破20日低点 {low20:.2f})', '回调破位退出', low20
+            if scheme_type == 'breakout':
+                platform_high = pos.get('platform_high', 0.0)
+                if platform_high > 0 and open_price < platform_high:
+                    return f'突破失败退出(跌回平台 {platform_high:.2f})', '突破失败退出', platform_high
+            return None
+
+        def _time_exit_decision(sym, dt_key, open_price, pos):
+            holding_days = _holding_days(dt_key, pos)
+            projected_pnl, projected_pct = _unrealized_pnl_pct(sym, dt_key, open_price, pos)
+            if enable_max_holding_exit and holding_days >= max_holding_days:
+                return '最长持仓退出', '最长持仓退出', open_price, projected_pnl
+            if enable_time_stop and holding_days >= time_stop_days and projected_pct < time_stop_min_profit_pct:
+                return (
+                    f'时间止损({holding_days}日收益{projected_pct:.2%}未达{time_stop_min_profit_pct:.2%})',
+                    '时间止损', open_price, projected_pnl,
+                )
+            return None
+
+        def _trailing_activated(pos):
+            """跟踪止盈激活区间：最高浮盈达标后才允许检查跟踪退出。"""
+            if not enable_trailing_exit:
+                return False
+            avg_cost = float(pos.get('avg_cost', 0.0) or 0.0)
+            highest = float(pos.get('highest', 0.0) or 0.0)
+            atr_val = float(pos.get('atr', 0.0) or 0.0)
+            if avg_cost <= 0 or highest <= 0:
+                return False
+            pct_ok = trailing_activation_pct <= 0 or highest >= avg_cost * (1 + trailing_activation_pct)
+            atr_ok = atr_val > 0 and (trailing_activation_atr_mult <= 0 or highest >= avg_cost + trailing_activation_atr_mult * atr_val)
+            return pct_ok or atr_ok
+
         def _sell(sym, dt_key, price, reason, rule_name, signal_date=None, trigger_price=None, projected_pnl=None):
             """统一卖出逻辑"""
             nonlocal cash, sell_count
@@ -552,7 +654,7 @@ class SchemeBacktester:
             trades_pnl.append(pnl)
             cash += net
             sell_count += 1
-            holding_days = (dt_key - pos['entry_dt']).days if hasattr(dt_key, 'days') else 0
+            holding_days = _holding_days(dt_key, pos)
             tp_out = TradePoint(
                 date=dt_key, action='SELL', reason=reason,
                 confidence=1.0, price=exec_price, rule_name=rule_name,
@@ -560,9 +662,13 @@ class SchemeBacktester:
                 cash_after=cash, position_shares=0,
                 avg_cost=pos['avg_cost'],
                 pnl=pnl, pnl_pct=pnl_pct, holding_days=holding_days,
+                signal_date=signal_date or '',
+                exec_date=dt_key,
+                exit_type=exit_type,
+                exit_subtype=exit_subtype,
+                trigger_price=trigger_price,
+                projected_pnl=projected_pnl,
             )
-            setattr(tp_out, 'signal_date', signal_date or '')
-            setattr(tp_out, 'exec_date', dt_key)
             actual_trades.append((sym, tp_out))
             trade_details.append({
                 'symbol': sym, 'date': dt_key, 'action': 'SELL',
@@ -647,12 +753,23 @@ class SchemeBacktester:
             else:
                 stop_loss = price - sl_mult * atr_val if atr_val > 0 else price * 0.92
                 take_profit = price + tp_mult * atr_val if atr_val > 0 else price * 1.15
+                hist = sym_bars_map.get(sym, pd.DataFrame())
+                platform_high = 0.0
+                platform_low = 0.0
+                if not hist.empty:
+                    pre = hist[pd.to_datetime(hist['trade_date']).dt.date < dt_key].tail(15)
+                    if not pre.empty:
+                        platform_high = float(pre['close'].astype(float).max())
+                        platform_low = float(pre['close'].astype(float).min())
                 positions[sym] = {
                     'shares': shares, 'avg_cost': exec_price, 'entry_dt': dt_key,
                     'highest': price, 'stop_loss': stop_loss,
                     'take_profit': take_profit,
                     'trailing_stop': stop_loss,
                     'atr': atr_val, 'add_count': 0,
+                    'strategy_id': scheme_type,
+                    'platform_high': platform_high,
+                    'platform_low': platform_low,
                     'entries': [{'date': dt_key, 'price': exec_price, 'shares': shares, 'reason': reason}],
                 }
 
@@ -669,9 +786,9 @@ class SchemeBacktester:
                 stop_loss=pos['stop_loss'],
                 take_profit=pos['take_profit'],
                 trailing_stop=pos['trailing_stop'],
+                signal_date=signal_date or '',
+                exec_date=dt_key,
             )
-            setattr(tp_out, 'signal_date', signal_date or '')
-            setattr(tp_out, 'exec_date', dt_key)
             actual_trades.append((sym, tp_out))
             trade_details.append({
                 # FIX:P0: 加仓也属于 BUY 执行事件，K线/明细/统计必须一致
@@ -723,11 +840,27 @@ class SchemeBacktester:
                     _sell(sym, dt_key, open_price, f'止损({pos["stop_loss"]:.2f})', 'ATR止损',
                           trigger_price=pos['stop_loss'], projected_pnl=projected_pnl)
                     continue
-                # 跟踪止盈：只有 trailing_stop 已进入扣成本后的盈利保护区，且当日实际
-                # 开盘撮合价预估净收益仍为正，才允许触发“止盈”。否则等待硬止损/信号卖出。
-                if open_price <= pos['trailing_stop'] and pos['highest'] > pos['avg_cost']:
+                # 大盘防御减仓：低回撤优先，进入防御档后退出持仓并保留审计字段。
+                if _market_defense_exit(dt_key):
                     projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
-                    if pos['trailing_stop'] > _breakeven_sell_price(sym, dt_key, pos) and projected_pnl > 0:
+                    _sell(sym, dt_key, open_price, f'大盘防御减仓(评分<{market_defense_score:.0f})', '大盘防御减仓',
+                          trigger_price=open_price, projected_pnl=projected_pnl)
+                    continue
+                # 策略失败退出：动量跌破、回调破位、突破失败等短线失效信号。
+                failure = _strategy_failure_exit(sym, dt_key, open_price, pos)
+                if failure:
+                    reason, rule_name, trigger = failure
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
+                    _sell(sym, dt_key, open_price, reason, rule_name,
+                          trigger_price=trigger, projected_pnl=projected_pnl)
+                    continue
+                # 跟踪止盈：只有 trailing_stop 已进入扣成本后的盈利保护区，且当日实际
+                # 开盘撮合价预估净收益仍为正，才归因为“止盈”。
+                # 若跳空跌破跟踪线导致扣成本后亏损，仍应退出，但归因为“ATR跟踪回撤止损”，
+                # 不能被后面的时间止损掩盖真实价格触发原因。
+                if _trailing_activated(pos) and open_price <= pos['trailing_stop'] and pos['highest'] > pos['avg_cost']:
+                    projected_pnl, _, _ = _project_sell_pnl(sym, dt_key, open_price, pos)
+                    if pos['trailing_stop'] > _breakeven_sell_price(sym, dt_key, pos):
                         _sell(sym, dt_key, open_price, f'跟踪止盈(最高{pos["highest"]:.2f})', 'ATR跟踪止盈',
                               trigger_price=pos['trailing_stop'], projected_pnl=projected_pnl)
                     continue
@@ -737,6 +870,14 @@ class SchemeBacktester:
                     if projected_pnl > 0:
                         _sell(sym, dt_key, open_price, f'止盈({pos["take_profit"]:.2f})', 'ATR止盈',
                               trigger_price=pos['take_profit'], projected_pnl=projected_pnl)
+                    continue
+                # 时间止损 / 最长持仓退出：短线系统不长期占用资金。
+                # 放在价格类止盈/止损后，避免掩盖更具体的触发原因。
+                time_exit = _time_exit_decision(sym, dt_key, open_price, pos)
+                if time_exit:
+                    reason, rule_name, trigger, projected_pnl = time_exit
+                    _sell(sym, dt_key, open_price, reason, rule_name,
+                          trigger_price=trigger, projected_pnl=projected_pnl)
                     continue
 
             # 2. 执行今日的待处理信号

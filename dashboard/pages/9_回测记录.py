@@ -16,6 +16,7 @@ from backtest.records import (
 )
 from backtest.scheme_backtest import _fetch_ohlcv
 from dashboard.components.kline_chart import plot_equity_curve, plot_kline_with_signals, render_kline_chart
+from dashboard.kline_events import trade_points_from_executed_frame
 from dashboard.history_compare import (
     build_run_compare_table,
     best_run_summary,
@@ -25,7 +26,6 @@ from dashboard.history_compare import (
 )
 from dashboard.history_filters import filter_backtest_runs, unique_non_empty
 from dashboard.history_state import ensure_history_state, reset_history_state, sync_history_state, valid_default, valid_default_list
-from signals.rules import TradePoint
 from theme import inject_theme, metric_row, section_header, empty_state, C
 
 st.set_page_config(page_title="回测记录", page_icon="🧾", layout="wide")
@@ -42,19 +42,6 @@ def _record_table_height(row_count: int) -> int:
     height = header_height + max(int(row_count), 1) * row_height + padding
     return min(max(height, min_height), max_height)
 
-
-def _first_valid_date(*values):
-    """按优先级取第一个有效日期，避免 pandas NaN/NaT 把 exec_date 覆盖掉。"""
-    for value in values:
-        if value is None or value == "":
-            continue
-        try:
-            if pd.isna(value):
-                continue
-        except (TypeError, ValueError):
-            pass
-        return pd.Timestamp(value).date()
-    raise ValueError("缺少有效交易日期")
 
 section_header("历史回测记录")
 st.caption("读取 data/backtest_runs/*：metrics/config/trades/equity/signals，用于复盘和审计。")
@@ -283,6 +270,25 @@ with tab_summary:
     c2.json(consistency)
     c3.write("**文件**")
     c3.code(str(run["path"]), language=None)
+    resonance_config = config.get("resonance_config", {}) if isinstance(config, dict) else {}
+    scheme_config = config.get("scheme_config", {}) if isinstance(config, dict) else {}
+    st.divider()
+    st.write("**策略共振审计**")
+    if resonance_config:
+        metric_row([
+            {"label": "最低确认数", "value": str(resonance_config.get("min_confirmations", ""))},
+            {"label": "买入条件数", "value": f"{len(resonance_config.get('buy_conditions', []) or [])}个"},
+            {"label": "卖出条件数", "value": f"{len(resonance_config.get('sell_conditions', []) or [])}个"},
+        ], cols=3)
+        cc1, cc2 = st.columns(2)
+        cc1.write("买入共振条件")
+        cc1.code("\n".join(resonance_config.get("buy_conditions", []) or ["未记录"]), language=None)
+        cc2.write("卖出共振条件")
+        cc2.code("\n".join(resonance_config.get("sell_conditions", []) or ["未记录"]), language=None)
+    else:
+        st.warning("旧口径记录：config.json 未保存 resonance_config。请重新运行回测生成可审计的新记录。", icon="⚠️")
+    with st.expander("完整策略配置快照", expanded=False):
+        st.json(scheme_config or {"说明": "旧记录未保存 scheme_config"})
 
 with tab_trades:
     if trades.empty:
@@ -388,32 +394,7 @@ with tab_kline:
         symbols = sorted(signals_executed["symbol"].dropna().unique().tolist())
         sym = st.selectbox("选择股票", symbols, key=f"history_symbol_{run_id}")
         sym_sigs = signals_executed[signals_executed["symbol"] == sym].copy()
-        points = []
-        for _, row in sym_sigs.iterrows():
-            try:
-                points.append(TradePoint(
-                    # K线买卖点必须落在实际成交日；date 仅作为旧记录兼容回退。
-                    date=_first_valid_date(row.get("exec_date"), row.get("date"), row.get("signal_date")),
-                    action=str(row.get("action", "")),
-                    reason=str(row.get("reason", "")),
-                    confidence=float(row.get("confidence", 1.0) or 1.0),
-                    price=float(row.get("exec_price", row.get("price", 0.0)) or 0.0),
-                    rule_name=str(row.get("rule_name", "历史成交")),
-                    exec_price=float(row.get("exec_price", row.get("price", 0.0)) or 0.0),
-                    shares=int(row.get("shares", 0) or 0),
-                    cash_after=float(row.get("cash_after", 0.0) or 0.0),
-                    position_shares=int(row.get("position_after", row.get("position_shares", 0)) or 0),
-                    avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
-                    pnl=float(row.get("pnl", 0.0) or 0.0),
-                    pnl_pct=float(row.get("pnl_pct", 0.0) or 0.0),
-                    holding_days=int(row.get("holding_days", 0) or 0),
-                ))
-                signal_date = row.get("signal_date", "")
-                if signal_date is not None and signal_date != "" and not pd.isna(signal_date):
-                    setattr(points[-1], "signal_date", pd.Timestamp(signal_date).date())
-                setattr(points[-1], "exec_date", _first_valid_date(row.get("exec_date"), row.get("date"), row.get("signal_date")))
-            except Exception:
-                continue
+        points = trade_points_from_executed_frame(sym_sigs)
         lookback_days = int(config.get("lookback_days", 80) or 80)
         bars = _fetch_ohlcv([sym], max(lookback_days, 80))
         if bars.empty:
