@@ -33,6 +33,7 @@ class BacktestParams:
     transfer_fee: float = 0.00001     # 过户费，双向万0.1
     slippage: float = 0.002           # 默认蓝筹单边滑点 0.2%
     position_pct: float = 0.90        # 账户总仓位上限 90%
+    max_single_pct: float = 0.20      # 单票最大仓位 20%，目标票不足时也不能集中超配
     max_stocks: int = 20              # 最大持股数
     rebalance_freq: int = 5           # 调仓频率（交易日）
     strategy_id: str = "balanced"     # P3: 全池退出规则使用的策略模板
@@ -511,7 +512,10 @@ class MultiFactorStrategy(bt.Strategy):
         cash = self.broker.getcash()
         if not target_symbols:
             return
-        target_value = total_value * self.p.position_pct / len(target_symbols)
+        # P1 FIX: 全池目标票过少时，原逻辑 `position_pct / len(target_symbols)` 会把
+        # 单票推到 90%/45% 等，违反全局单票 20% 风控红线。
+        max_single_value = total_value * min(float(getattr(self.p, "max_single_pct", 0.20) or 0.20), 0.20)
+        target_value = min(total_value * self.p.position_pct / len(target_symbols), max_single_value)
 
         # === 买入目标股票 ===
         for symbol in target_symbols:
@@ -615,12 +619,33 @@ class MultiFactorStrategy(bt.Strategy):
                 trigger_price = exec_price
             projected_pnl = pnl if action == "SELL" else 0.0
             try:
-                from signals.rules import TradePoint
+                from signals.rules import TradePoint, confidence_audit
+                if action == "SELL":
+                    conf_audit = confidence_audit(1.0, "SELL")
+                    entry_confidence = 1.0
+                elif "confidence_bucket" in order_meta:
+                    entry_confidence = float(order_meta.get("confidence", 0.0) or 0.0)
+                    conf_audit = {
+                        "confidence_bucket": order_meta.get("confidence_bucket", ""),
+                        "confidence_action": order_meta.get("confidence_action", ""),
+                        "confidence_weight": float(order_meta.get("confidence_weight", 0.0) or 0.0),
+                        "confidence_note": order_meta.get("confidence_note", ""),
+                    }
+                else:
+                    # 全池 Backtrader 调仓路径的 BUY 来自因子目标持仓，不是 L3 TradePoint。
+                    # 不得伪装成 watch/standard；必须明确标为未接入 confidence 的因子调仓。
+                    entry_confidence = 0.0
+                    conf_audit = {
+                        "confidence_bucket": "factor_rebalance_unscored",
+                        "confidence_action": "factor_rebalance_no_entry_confidence",
+                        "confidence_weight": 0.0,
+                        "confidence_note": "audit_only_no_filter; full-pool factor rebalance buy has no TradePoint.confidence",
+                    }
                 tp = TradePoint(
                     date=exec_dt,
                     action=action,
                     reason=reason,
-                    confidence=1.0,
+                    confidence=entry_confidence,
                     price=exec_price,
                     rule_name=rule_name,
                     exec_price=exec_price,
@@ -637,10 +662,20 @@ class MultiFactorStrategy(bt.Strategy):
                     exit_subtype=exit_subtype,
                     trigger_price=trigger_price,
                     projected_pnl=projected_pnl,
+                    confidence_bucket=str(conf_audit.get("confidence_bucket", "")),
+                    confidence_action=str(conf_audit.get("confidence_action", "")),
+                    confidence_weight=float(conf_audit.get("confidence_weight", 0.0) or 0.0),
+                    confidence_note=str(conf_audit.get("confidence_note", "")),
                 )
                 self.executed_points.setdefault(symbol, []).append(tp)
             except Exception:
-                pass
+                conf_audit = {
+                    "confidence_bucket": "factor_rebalance_unscored" if action == "BUY" else "exit_signal",
+                    "confidence_action": "factor_rebalance_no_entry_confidence" if action == "BUY" else "exit_signal_audit",
+                    "confidence_weight": 0.0,
+                    "confidence_note": "audit_only_no_filter; confidence audit fallback",
+                }
+                entry_confidence = 0.0 if action == "BUY" else 1.0
             self.trade_details.append({
                 "symbol": symbol,
                 "date": exec_dt,
@@ -672,6 +707,11 @@ class MultiFactorStrategy(bt.Strategy):
                 "exit_subtype": exit_subtype,
                 "trigger_price": trigger_price,
                 "projected_pnl": projected_pnl,
+                "confidence": entry_confidence,
+                "confidence_bucket": conf_audit.get("confidence_bucket", ""),
+                "confidence_action": conf_audit.get("confidence_action", ""),
+                "confidence_weight": conf_audit.get("confidence_weight", 0.0),
+                "confidence_note": conf_audit.get("confidence_note", ""),
             })
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.order_dict.pop(order.ref, None)

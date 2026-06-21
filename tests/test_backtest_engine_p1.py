@@ -144,6 +144,11 @@ def test_backtrader_full_pool_trade_schema_matches_single_stock_audit_fields():
     assert buy["exec_date"] == buy["date"]
     assert sell["signal_date"] == date(2025, 1, 3)
     assert sell["exec_date"] == sell["date"]
+    assert buy["confidence_bucket"] == "factor_rebalance_unscored"
+    assert buy["confidence_action"] == "factor_rebalance_no_entry_confidence"
+    assert "no TradePoint.confidence" in buy["confidence_note"]
+    assert sell["confidence_bucket"] == "exit_signal"
+    assert sell["confidence_action"] == "exit_signal_audit"
     assert sell["exit_type"] == "signal_exit"
     assert sell["exit_subtype"] == "rule_signal"
     assert sell["trigger_price"] == pytest.approx(sell["exec_price"])
@@ -156,6 +161,34 @@ def test_backtrader_full_pool_trade_schema_matches_single_stock_audit_fields():
     point = result["executed_points"]["000777"][0]
     assert getattr(point, "signal_date") == date(2025, 1, 1)
     assert getattr(point, "exec_date") == point.date
+
+
+def test_backtrader_full_pool_caps_single_position_at_20pct_when_targets_are_few():
+    """P1: 全池目标票不足时也不能把单票仓位推到 20% 以上。"""
+    dates = pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"])
+    bars = pd.DataFrame({
+        "open": [10.0, 10.0, 10.0],
+        "high": [11.0, 11.0, 11.0],
+        "low": [9.0, 9.0, 9.0],
+        "close": [10.0, 10.0, 10.0],
+        "volume": [1_000_000] * 3,
+        "amount": [600_000_000] * 3,
+    }, index=dates)
+    engine = BacktestEngine(BacktestParams(
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 3),
+        initial_capital=1_000_000,
+        position_pct=0.90,
+        max_stocks=20,
+        max_single_pct=0.20,
+    ))
+    engine.add_data("000777", bars)
+    engine.add_signals({date(2025, 1, 1): ["000777"]})
+
+    result = engine.run(verbose=False)
+    buy = next(t for t in result["trade_details"] if t["action"] == "BUY")
+
+    assert buy["amount"] <= 1_000_000 * 0.20 * 1.01  # 允许买入滑点后的成交额审计口径略高
 
 
 def test_backtrader_full_pool_time_stop_uses_p2_exit_audit_fields():

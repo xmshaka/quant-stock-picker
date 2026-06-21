@@ -44,6 +44,85 @@ class TradePoint:
     exit_subtype: str = ""       # 退出子类型：atr_hard_stop/atr_trailing_profit/rule_signal等
     trigger_price: float = 0.0   # 触发价/规则价
     projected_pnl: float = 0.0   # 触发时按执行口径预估净盈亏
+    # ── 信号置信度执行审计（第一阶段仅审计，不改变交易结果） ──
+    confidence_bucket: str = ""   # watch/candidate/standard/strong
+    confidence_action: str = ""   # observe_only/reduced_or_pending/standard_entry/strong_entry/add_requires_extra_checks
+    confidence_weight: float = 0.0 # 建议仓位权重，仅审计；当前不参与实际仓位
+    confidence_note: str = ""     # 明确 audit_only_no_filter，避免误解为已硬过滤
+    # ── 买点结构化审计（第一阶段仅落盘，不改变交易结果） ──
+    entry_model: str = ""          # trend_continuation/pullback_reversal/consolidation_breakout/factor_rebalance/unknown
+    main_trigger: str = ""         # 主触发条件 key/语义
+    confirmations: str = ""        # 确认项，JSON/分号文本
+    factor_evidence: str = ""      # 因子证据，JSON/分号文本
+    market_context: str = ""       # 大盘上下文，JSON/分号文本
+    fund_flow_context: str = ""    # 资金流上下文，JSON/分号文本
+    technical_confirmations: str = ""  # 技术确认项，JSON/分号文本
+    veto_checks: str = ""          # 否决项检查，JSON/分号文本
+    risk_tags: str = ""            # 风险标签，JSON/分号文本
+    missing_fields: str = ""       # 缺失数据字段，JSON/分号文本
+
+
+def confidence_audit(confidence: float, action: str = "BUY") -> Dict[str, object]:
+    """将 TradePoint.confidence 转为执行审计字段。
+
+    这是买卖点专业化第一阶段：只落盘审计，不改变回测交易结果。
+    阈值来自 2026-06-20 初步分布观察，尚不能作为硬过滤参数。
+    """
+    try:
+        c = float(confidence)
+    except Exception:
+        c = 0.0
+    c = max(0.0, min(1.0, c))
+    action_u = str(action or "BUY").upper()
+    if action_u == "SELL":
+        return {
+            "confidence_bucket": "exit_signal",
+            "confidence_action": "exit_signal_audit",
+            "confidence_weight": 0.0,
+            "confidence_note": "audit_only_no_filter; sell confidence is not an entry sizing signal",
+        }
+    if c < 0.50:
+        bucket = "watch"
+        decision = "observe_only"
+        weight = 0.0
+    elif c < 0.65:
+        bucket = "candidate"
+        decision = "reduced_or_pending"
+        weight = 0.5
+    elif c < 0.80:
+        bucket = "standard"
+        decision = "standard_entry"
+        weight = 1.0
+    else:
+        bucket = "strong"
+        decision = "strong_entry"
+        weight = 1.0
+
+    if action_u in {"ADD", "加仓"}:
+        # 加仓比开仓更严格：即便高分也需要盈利、结构未破、同路径确认等额外检查。
+        if c < 0.75:
+            decision = "add_not_qualified_by_confidence"
+            weight = 0.0
+        else:
+            decision = "add_requires_extra_checks"
+            weight = min(weight, 0.5)
+
+    return {
+        "confidence_bucket": bucket,
+        "confidence_action": decision,
+        "confidence_weight": weight,
+        "confidence_note": "audit_only_no_filter; thresholds tentative pending larger-sample validation",
+    }
+
+
+def apply_confidence_audit(point: TradePoint, action: Optional[str] = None) -> TradePoint:
+    """原地补齐 TradePoint 的置信度审计字段，返回 point 便于链式使用。"""
+    audit = confidence_audit(point.confidence, action or point.action)
+    point.confidence_bucket = str(audit["confidence_bucket"])
+    point.confidence_action = str(audit["confidence_action"])
+    point.confidence_weight = float(audit["confidence_weight"])
+    point.confidence_note = str(audit["confidence_note"])
+    return point
 
 
 # ============================================================

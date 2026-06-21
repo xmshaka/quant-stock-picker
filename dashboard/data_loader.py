@@ -110,6 +110,19 @@ FACTOR_NAME_MAP = {
     'reversal': '反转因子',
 }
 
+PRICE_SNAPSHOT_COLUMNS = ["symbol", "trade_date", "open", "high", "low", "close", "volume", "amount", "turnover"]
+
+
+def _price_snapshot_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """保留日线快照字段，供后续成交额分位/可交易性审计使用。
+
+    历史只保存 symbol/trade_date/close，导致 `amount_percentile_60d` 在真实快照中
+    永远缺失。这里按数据源实际返回字段保守保留 open/high/low/volume/amount/turnover；若
+    字段不存在则不伪造。
+    """
+    cols = [c for c in PRICE_SNAPSHOT_COLUMNS if c in df.columns]
+    return df[cols].copy()
+
 
 # ──────────────────────────────────────────
 # 模拟数据生成器
@@ -405,7 +418,7 @@ class DataLoader:
                 if df is None or df.empty or len(df) < 20:
                     continue
 
-                all_price.append(df[["symbol", "trade_date", "close"]].copy())
+                all_price.append(_price_snapshot_frame(df))
 
                 df["close_num"] = pd.to_numeric(df["close"], errors="coerce")
                 extra = extra_map.get(symbol)
@@ -520,7 +533,7 @@ class DataLoader:
                 if df is None or df.empty or len(df) < 20:
                     continue
 
-                all_price.append(df[["symbol", "trade_date", "close"]].copy())
+                all_price.append(_price_snapshot_frame(df))
 
                 df["close_num"] = pd.to_numeric(df["close"], errors="coerce")
                 all_factor.extend(self._compute_factors(df, symbol))
@@ -567,7 +580,7 @@ class DataLoader:
                 if df is None or df.empty or len(df) < 20:
                     continue
 
-                all_price.append(df[["symbol", "trade_date", "close"]].copy())
+                all_price.append(_price_snapshot_frame(df))
 
                 df["close_num"] = pd.to_numeric(df["close"], errors="coerce")
                 all_factor.extend(self._compute_factors(df, symbol))
@@ -611,7 +624,7 @@ class DataLoader:
                 if df is None or df.empty or len(df) < 20:
                     continue
 
-                all_price.append(df[["symbol", "trade_date", "close"]].copy())
+                all_price.append(_price_snapshot_frame(df))
                 df["close_num"] = pd.to_numeric(df["close"], errors="coerce")
                 all_factor.extend(self._compute_factors(df, symbol))
             except Exception:

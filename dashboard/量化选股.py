@@ -150,6 +150,28 @@ def _signal_resonance_text(signal) -> str:
     return f"共振 {confirmations}/{total}，最低{minimum}"
 
 
+def _signal_entry_audit_text(signal) -> str:
+    """结构化买点审计摘要。
+
+    moneyflow/相对换手当前只做审计，不作为硬过滤；缺失字段必须直接展示，避免
+    用户误以为资金流/成交额分位已经参与交易决策。
+    """
+    fields = []
+    if getattr(signal, "entry_model", ""):
+        fields.append(f"买点模型: {getattr(signal, 'entry_model')}")
+    if getattr(signal, "fund_flow_context", ""):
+        fields.append(f"资金流: {getattr(signal, 'fund_flow_context')}")
+    if getattr(signal, "factor_evidence", ""):
+        fields.append(f"因子证据: {getattr(signal, 'factor_evidence')}")
+    if getattr(signal, "market_context", ""):
+        fields.append(f"市场: {getattr(signal, 'market_context')}")
+    if getattr(signal, "missing_fields", ""):
+        fields.append(f"缺失字段: {getattr(signal, 'missing_fields')}")
+    if getattr(signal, "veto_checks", ""):
+        fields.append(f"否决/审计: {getattr(signal, 'veto_checks')}")
+    return " ｜ ".join(fields)
+
+
 def _strategy_resonance_summary(scheme_id: str):
     """当前扫描策略的共振配置摘要。balanced 展示三个子策略。"""
     target_ids = ["trend_momentum", "pullback", "breakout"] if scheme_id == "balanced" else [scheme_id]
@@ -417,6 +439,9 @@ if page_idx == 0:
                 )
                 if getattr(s, 'entry_reason', ''):
                     st.caption(s.entry_reason)
+                audit_text = _signal_entry_audit_text(s)
+                if audit_text:
+                    st.caption(audit_text)
             with col_action:
                 if in_hold:
                     st.markdown(f'<div style="text-align:center;padding-top:12px;">{badge("持仓", "hold")}</div>', unsafe_allow_html=True)
@@ -485,6 +510,10 @@ elif page_idx == 1:
                 st.caption(live_meta)
                 if live_sig and getattr(live_sig, 'entry_reason', ''):
                     st.caption(live_sig.entry_reason)
+                if live_sig:
+                    audit_text = _signal_entry_audit_text(live_sig)
+                    if audit_text:
+                        st.caption(audit_text)
             with col_btns:
                 b1, b2, b3 = st.columns(3)
                 with b1:
@@ -546,6 +575,10 @@ elif page_idx == 2:
                 st.caption(f"{live_meta} {sent_label}")
                 if live_sig and getattr(live_sig, 'entry_reason', ''):
                     st.caption(live_sig.entry_reason)
+                if live_sig:
+                    audit_text = _signal_entry_audit_text(live_sig)
+                    if audit_text:
+                        st.caption(audit_text)
             with col_btns:
                 b1, b2 = st.columns(2)
                 with b1:

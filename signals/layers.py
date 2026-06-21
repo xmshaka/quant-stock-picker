@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from signals.rules import TradePoint
+from signals.rules import TradePoint, apply_confidence_audit
 from strategy.schemes import BUILTIN_SCHEMES, ResonanceConfig
 
 
@@ -38,6 +38,75 @@ class ConditionResult:
     threshold: float
     direction: str
     confidence: float
+
+    def audit_text(self) -> str:
+        """面向买卖点复盘的可审计文案，显式展示当前值、阈值和方向。
+
+        旧文案只显示 `RSI超卖(39.6)`，容易让用户误解 39.6 是阈值或
+        专业意义上的“超卖”。这里统一输出 `名称：值 < 阈值` 等格式。
+        """
+        if self.direction in {"below", "above"}:
+            op = "<" if self.direction == "below" else ">"
+            return f"{self.name}：{self.value:.1f} {op} {self.threshold:g}"
+        if self.direction == "cross_up":
+            return f"{self.name}：{self.value:.2f} 上穿/高于 {self.threshold:.2f}"
+        if self.direction == "cross_down":
+            return f"{self.name}：{self.value:.2f} 下穿/低于 {self.threshold:.2f}"
+        return f"{self.name}：{self.value:.1f}"
+
+
+def liquidity_audit_tags(bars: pd.DataFrame, idx: int, *, period: int = 20) -> List[str]:
+    """买点审计用量能/成交额/换手率标签。
+
+    第一阶段只作为审计与风险提示，不作为硬过滤，避免一次性改变信号。
+    """
+    if bars is None or bars.empty or idx < 0 or idx >= len(bars):
+        return []
+    tags: List[str] = []
+    row = bars.iloc[idx]
+    volume = pd.to_numeric(bars.get("volume", pd.Series(dtype=float)), errors="coerce")
+    if len(volume) > idx and idx >= period:
+        avg_vol = float(volume.iloc[max(0, idx - period + 1):idx + 1].mean() or 0.0)
+        vol = float(volume.iloc[idx] or 0.0)
+        vol_ratio = vol / avg_vol if avg_vol > 0 else 0.0
+        if vol_ratio < 0.7:
+            level = "明显缩量"
+        elif vol_ratio < 1.2:
+            level = "温和量"
+        elif vol_ratio < 1.8:
+            level = "放量"
+        else:
+            level = "明显放量"
+        tags.append(f"量能{level}：量比{vol_ratio:.2f}x")
+    amount = row.get("amount", np.nan)
+    try:
+        amount_val = float(amount)
+    except Exception:
+        amount_val = np.nan
+    if np.isfinite(amount_val) and amount_val > 0:
+        tags.append(f"成交额{amount_val / 1e8:.2f}亿")
+    turnover = row.get("turnover_rate", row.get("turnover", np.nan))
+    try:
+        turnover_val = float(turnover)
+    except Exception:
+        turnover_val = np.nan
+    if np.isfinite(turnover_val) and turnover_val > 0:
+        # 数据源可能给 0.05 或 5 两种口径；审计显示统一成百分数。
+        turnover_pct = turnover_val * 100 if turnover_val <= 1 else turnover_val
+        if turnover_pct < 0.5:
+            level = "冷清"
+        elif turnover_pct < 2:
+            level = "温和"
+        elif turnover_pct < 8:
+            level = "活跃"
+        elif turnover_pct < 15:
+            level = "高换手"
+        else:
+            level = "极端换手"
+        tags.append(f"换手{level}：{turnover_pct:.2f}%")
+    else:
+        tags.append("换手率缺失")
+    return tags
 
 
 # ═══════════════════════════════════════════
@@ -268,15 +337,97 @@ class ResonanceChecker:
             return conditions
         return [c for c in conditions if c.key in enabled]
 
+    def _scheme_id(self) -> str:
+        """根据配置 key 反推当前 L3 使用的策略族。
+
+        P0 FIX: 旧版单股 L3 固定生成 RSI/MA/MACD/BOLL/量能/KDJ 六个通用 key，
+        但 `strategy.schemes` 已改为策略专属 key，导致 buy_conditions 过滤后只剩
+        0~1 个条件，trend/pullback/breakout 实际几乎无法触发。这里在单股路径中
+        改为和 signal scanner 一致的策略专属条件集合。
+        """
+        keys = set(self.buy_conditions or [])
+        if {"near_high", "momentum_20d", "rsi_not_extreme"} & keys:
+            return "trend_momentum"
+        if {"pullback_range", "not_break_20d_low", "volume_calm", "near_support"} & keys:
+            return "pullback"
+        if {"break_platform", "volume_surge", "narrow_range", "boll_upper"} & keys:
+            return "breakout"
+        return "balanced"
+
+    def _strategy_buy_conditions(self, bars: pd.DataFrame, idx: int) -> Optional[List[ConditionResult]]:
+        """生成策略专属 BUY 条件，与 `signals.scanner._check_layer3` key 对齐。"""
+        scheme_id = self._scheme_id()
+        if scheme_id == "balanced":
+            return None
+        if idx < 20 or bars is None or bars.empty or "close" not in bars:
+            return []
+
+        close = pd.to_numeric(bars["close"], errors="coerce")
+        current = float(close.iloc[idx])
+        if not np.isfinite(current) or current <= 0:
+            return []
+        close_window = close.iloc[:idx + 1]
+        ma5 = float(close_window.rolling(5).mean().iloc[-1]) if len(close_window) >= 5 else np.nan
+        ma20 = float(close_window.rolling(20).mean().iloc[-1]) if len(close_window) >= 20 else np.nan
+        high20 = float(close_window.iloc[-20:].max())
+        low20 = float(close_window.iloc[-20:].min())
+        prev = close_window.iloc[-15:-5]
+        rsi = self._calc_rsi(bars, idx, 14)
+        boll_pos = self._get_boll_position(bars, idx, 20, 2.0)
+        vol_ratio = self._get_volume_ratio(bars, idx, 20)
+        mom5 = current / float(close_window.iloc[-6]) - 1 if len(close_window) >= 6 and close_window.iloc[-6] > 0 else 0.0
+        mom20 = current / float(close_window.iloc[-21]) - 1 if len(close_window) >= 21 and close_window.iloc[-21] > 0 else 0.0
+        pullback = 1 - current / high20 if high20 > 0 else 0.0
+        range_pct = (float(prev.max()) - float(prev.min())) / float(prev.mean()) if len(prev) >= 5 and float(prev.mean()) > 0 else 1.0
+
+        def cr(key: str, name: str, met: bool, value: float, threshold: float, direction: str, conf: float) -> ConditionResult:
+            return ConditionResult(key, name, bool(met), float(value), float(threshold), direction, max(0.0, min(1.0, float(conf))))
+
+        if scheme_id == "trend_momentum":
+            conditions = [
+                cr("volume_expand", "放量确认", vol_ratio > 1.2, vol_ratio, 1.2, "above", 0.45 + (vol_ratio - 1.2) * 0.25),
+                cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
+                cr("near_high", "接近20日高点", current >= high20 * 0.95, current / high20 if high20 > 0 else 0, 0.95, "above", 0.45 + ((current / high20 - 0.95) * 5 if high20 > 0 else 0)),
+                cr("momentum_5d", "5日动量", mom5 > 0.01, mom5, 0.01, "above", 0.45 + mom5 * 5),
+                cr("momentum_20d", "20日动量", mom20 > 0.02, mom20, 0.02, "above", 0.45 + mom20 * 3),
+                cr("rsi_not_extreme", "RSI不过热", np.isfinite(rsi) and 45 <= rsi <= 75, rsi, 75, "below", 0.7 if np.isfinite(rsi) and 45 <= rsi <= 75 else 0.0),
+            ]
+        elif scheme_id == "pullback":
+            conditions = [
+                cr("rsi_oversold", "RSI偏弱回调", np.isfinite(rsi) and rsi < 45, rsi, 45, "below", 0.45 + (45 - rsi) / 30 if np.isfinite(rsi) else 0.0),
+                cr("boll_lower", "布林低位", np.isfinite(boll_pos) and boll_pos < 0.35, boll_pos, 0.35, "below", 0.45 + (0.35 - boll_pos) if np.isfinite(boll_pos) else 0.0),
+                cr("pullback_range", "回撤区间", 0.05 <= pullback <= 0.15, pullback, 0.05, "above", 0.75 if 0.05 <= pullback <= 0.15 else 0.0),
+                cr("not_break_20d_low", "不破20日低点", current > low20 * 1.03, current / low20 if low20 > 0 else 0, 1.03, "above", 0.7 if current > low20 * 1.03 else 0.0),
+                cr("volume_calm", "缩量/温和量", vol_ratio < 1.1, vol_ratio, 1.1, "below", 0.75 if vol_ratio < 1.1 else 0.0),
+                cr("near_support", "未明显破位", idx == 0 or current >= float(close.iloc[idx - 1]) * 0.98, current / float(close.iloc[idx - 1]) if idx > 0 and close.iloc[idx - 1] > 0 else 1.0, 0.98, "above", 0.7),
+            ]
+        else:
+            platform_high = float(prev.max()) if len(prev) >= 5 else high20
+            conditions = [
+                cr("break_platform", "突破平台上沿", len(prev) >= 5 and current > platform_high * 1.01, current / platform_high if platform_high > 0 else 0, 1.01, "above", 0.45 + ((current / platform_high - 1.01) * 8 if platform_high > 0 else 0)),
+                cr("volume_surge", "量比放大", vol_ratio > 1.5, vol_ratio, 1.5, "above", 0.45 + (vol_ratio - 1.5) * 0.2),
+                cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
+                cr("narrow_range", "平台振幅收敛", range_pct < 0.08, range_pct, 0.08, "below", 0.75 if range_pct < 0.08 else 0.0),
+                cr("momentum_5d", "5日动量", mom5 > 0.01, mom5, 0.01, "above", 0.45 + mom5 * 5),
+                cr("boll_upper", "布林上半区", np.isfinite(boll_pos) and boll_pos > 0.6, boll_pos, 0.6, "above", 0.45 + (boll_pos - 0.6) if np.isfinite(boll_pos) else 0.0),
+            ]
+        return self._filter_conditions(conditions, "buy")
+
     def check_buy(self, bars: pd.DataFrame, idx: int) -> Tuple[bool, List[ConditionResult]]:
+        strategy_conditions = self._strategy_buy_conditions(bars, idx)
+        if strategy_conditions is not None:
+            met_count = sum(1 for c in strategy_conditions if c.met)
+            return met_count >= self.min_confirmations, strategy_conditions
+
         conditions = []
         met_count = 0
 
-        # 1. RSI < 40
+        # 1. RSI < 40：A股短线里这只能称为“偏弱回调”，不是标准超卖。
+        # 标准超卖通常应按 RSI<30，极端超卖 RSI<20；后续进入参数化/网格验证。
         rsi = self._calc_rsi(bars, idx, 14)
         met = rsi < 40
         conditions.append(ConditionResult(
-            "rsi_oversold", "RSI超卖", met, rsi, 40, "below",
+            "rsi_weak_pullback", "RSI偏弱回调", met, rsi, 40, "below",
             min(1.0, (40 - rsi) / 20 + 0.3) if met else 0,
         ))
         if met: met_count += 1
@@ -477,6 +628,48 @@ class ResonanceChecker:
         return k.iloc[-1] < d.iloc[-1] and k.iloc[-2] >= d.iloc[-2] and k.iloc[-1] > 50, k_val, d_val
 
 
+def _entry_model_for_strategy(strategy_type: str) -> str:
+    mapping = {
+        "trend_momentum": "trend_continuation",
+        "pullback": "pullback_reversal",
+        "breakout": "consolidation_breakout",
+        "balanced": "balanced_route_unclassified",
+    }
+    return mapping.get(str(strategy_type), "unknown")
+
+
+def _structured_entry_audit(strategy_type: str, buy_met: List[ConditionResult], liq_tags: List[str], bars: pd.DataFrame, idx: int) -> dict:
+    """生成买点结构化审计字段。
+
+    第一阶段只落盘审计，不改变信号过滤。资金流/市场上下文若未传入当前单股K线，
+    必须写入 missing_fields，不能假装已验证。
+    """
+    keys = [c.key for c in buy_met]
+    names = [c.audit_text() for c in buy_met]
+    missing = []
+    row = bars.iloc[idx] if bars is not None and not bars.empty and 0 <= idx < len(bars) else pd.Series(dtype=object)
+    for field in [
+        "market_score", "main_net_mf_pct_amount", "large_elg_net_mf_pct_amount",
+        "relative_turnover_20d", "turnover_percentile_60d",
+    ]:
+        if field not in row or pd.isna(row.get(field)):
+            missing.append(field)
+    technical = [n for n in names if any(k in n for k in ["RSI", "MA", "MACD", "布林", "KDJ", "动量", "量比", "平台"])]
+    risk_tags = list(liq_tags or [])
+    return {
+        "entry_model": _entry_model_for_strategy(strategy_type),
+        "main_trigger": keys[0] if keys else "unclassified",
+        "confirmations": ";".join(keys),
+        "factor_evidence": "audit_pending_factor_context",
+        "market_context": "audit_pending_market_context" if "market_score" in missing else f"market_score={row.get('market_score')}",
+        "fund_flow_context": "audit_pending_fund_flow_context" if any(f in missing for f in ["main_net_mf_pct_amount", "large_elg_net_mf_pct_amount"]) else f"main={row.get('main_net_mf_pct_amount')};large_elg={row.get('large_elg_net_mf_pct_amount')}",
+        "technical_confirmations": ";".join(technical),
+        "veto_checks": "audit_pending_veto_checks",
+        "risk_tags": ";".join(risk_tags),
+        "missing_fields": ";".join(missing),
+    }
+
+
 # ═══════════════════════════════════════════
 # 三层过滤主函数
 # ═══════════════════════════════════════════
@@ -524,28 +717,33 @@ def evaluate_layered(
         sell_ok, sell_conds = rc.check_sell(bars, i)
         if sell_ok and last_action == "BUY":
             sell_met = [c for c in sell_conds if c.met]
-            reason = " + ".join([f"{c.name}({c.value:.1f})" for c in sell_met])
+            reason = " + ".join([c.audit_text() for c in sell_met])
             conf = float(np.mean([c.confidence for c in sell_met])) if sell_met else 0.5
-            points.append(TradePoint(
+            points.append(apply_confidence_audit(TradePoint(
                 date=current_date, action="SELL",
                 reason=f"L3共振卖出({len(sell_met)}/6): {reason}",
                 confidence=min(1.0, conf), price=float(close.iloc[i]),
                 rule_name=f"三层过滤-{strategy_type}",
-            ))
+            )))
             last_action = "SELL"
             continue
 
         buy_ok, buy_conds = rc.check_buy(bars, i)
         if buy_ok and last_action != "BUY":
             buy_met = [c for c in buy_conds if c.met]
-            reason = " + ".join([f"{c.name}({c.value:.1f})" for c in buy_met])
+            reason = " + ".join([c.audit_text() for c in buy_met])
+            liq_tags = liquidity_audit_tags(bars, i)
+            if liq_tags:
+                reason = f"{reason}；审计：{'，'.join(liq_tags)}"
             conf = float(np.mean([c.confidence for c in buy_met])) if buy_met else 0.5
-            points.append(TradePoint(
+            audit_fields = _structured_entry_audit(strategy_type, buy_met, liq_tags, bars, i)
+            points.append(apply_confidence_audit(TradePoint(
                 date=current_date, action="BUY",
                 reason=f"L3共振买入({len(buy_met)}/6): {reason}",
                 confidence=min(1.0, conf), price=float(close.iloc[i]),
                 rule_name=f"三层过滤-{strategy_type}",
-            ))
+                **audit_fields,
+            )))
             last_action = "BUY"
 
     return points

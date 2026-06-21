@@ -23,6 +23,7 @@ data_storage/
 *.log
 data/backtest_runs/
 data/grid_results/
+data/confidence_audit/
 
 # OS / editor
 .DS_Store

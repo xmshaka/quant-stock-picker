@@ -107,6 +107,272 @@ def load_daily_factors(date_str: Optional[str] = None) -> Tuple[pd.DataFrame, pd
     return factor_df, price_df, factor_names
 
 
+MONEYFLOW_FACTOR_COLUMNS = [
+    "main_net_mf_amount",
+    "large_net_mf_amount",
+    "elg_net_mf_amount",
+    "large_elg_net_mf_amount",
+    "main_net_mf_pct_amount",
+    "large_elg_net_mf_pct_amount",
+    "main_net_mf_rank",
+    "large_elg_net_mf_rank",
+]
+
+RELATIVE_TURNOVER_FACTOR_COLUMNS = [
+    "relative_turnover_5d",
+    "relative_turnover_20d",
+    "turnover_percentile_60d",
+    "amount_percentile_60d",
+]
+
+
+def _normalize_trade_date(series: pd.Series) -> pd.Series:
+    """统一 trade_date 到 YYYY-MM-DD 字符串，便于跨源合并。"""
+    return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d")
+
+
+def _moneyflow_trade_date(series: pd.Series) -> pd.Series:
+    """Tushare moneyflow 日期通常为 YYYYMMDD，统一为 YYYY-MM-DD。"""
+    s = series.astype(str).str.replace("-", "", regex=False)
+    return pd.to_datetime(s, format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
+
+
+def add_relative_turnover_factors(
+    factor_df: pd.DataFrame,
+    price_df: Optional[pd.DataFrame] = None,
+    turnover_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """新增相对换手/成交额分位因子。
+
+    只使用每个交易日及其之前的历史窗口：rolling/expanding 均按 symbol 内时间排序，
+    不引用未来数据。第一阶段作为审计/排序因子，不直接硬过滤。
+    """
+    if factor_df is None or factor_df.empty or "symbol" not in factor_df.columns or "trade_date" not in factor_df.columns:
+        return factor_df
+    out = factor_df.copy()
+    out["_trade_date_norm"] = _normalize_trade_date(out["trade_date"])
+    out = out.sort_values(["symbol", "_trade_date_norm"]).reset_index(drop=True)
+
+    turnover = None
+    turnover_col = "turnover_ratio" if "turnover_ratio" in out.columns else "turnover" if "turnover" in out.columns else None
+    if turnover_col:
+        turnover = pd.to_numeric(out[turnover_col], errors="coerce")
+    elif turnover_df is not None and not turnover_df.empty:
+        t = _standardize_turnover_frame(turnover_df)
+        if not t.empty:
+            out = out.merge(
+                t.rename(columns={"turnover": "_daily_turnover"}),
+                on=["symbol", "_trade_date_norm"],
+                how="left",
+            )
+            turnover = pd.to_numeric(out["_daily_turnover"], errors="coerce")
+    elif price_df is not None and not price_df.empty and {"symbol", "trade_date", "turnover"}.issubset(price_df.columns):
+        p_turnover = price_df[["symbol", "trade_date", "turnover"]].copy()
+        p_turnover["_trade_date_norm"] = _normalize_trade_date(p_turnover["trade_date"])
+        p_turnover = p_turnover.drop_duplicates(["symbol", "_trade_date_norm"], keep="last")
+        out = out.merge(
+            p_turnover[["symbol", "_trade_date_norm", "turnover"]].rename(columns={"turnover": "_daily_turnover"}),
+            on=["symbol", "_trade_date_norm"],
+            how="left",
+        )
+        turnover = pd.to_numeric(out["_daily_turnover"], errors="coerce")
+    if turnover is not None:
+        g = turnover.groupby(out["symbol"], sort=False)
+        avg5 = g.transform(lambda s: s.rolling(5, min_periods=3).mean())
+        avg20 = g.transform(lambda s: s.rolling(20, min_periods=5).mean())
+        out["relative_turnover_5d"] = turnover / avg5.replace(0, pd.NA)
+        out["relative_turnover_20d"] = turnover / avg20.replace(0, pd.NA)
+        out["turnover_percentile_60d"] = g.transform(
+            lambda s: s.rolling(60, min_periods=10).apply(_last_value_percentile, raw=True)
+        )
+    else:
+        for col in ["relative_turnover_5d", "relative_turnover_20d", "turnover_percentile_60d"]:
+            out[col] = pd.NA
+
+    amount_series = None
+    if price_df is not None and not price_df.empty and {"symbol", "trade_date", "amount"}.issubset(price_df.columns):
+        p = price_df[["symbol", "trade_date", "amount"]].copy()
+        p["_trade_date_norm"] = _normalize_trade_date(p["trade_date"])
+        p = p.drop_duplicates(["symbol", "_trade_date_norm"], keep="last")
+        out = out.merge(p[["symbol", "_trade_date_norm", "amount"]].rename(columns={"amount": "_daily_amount"}),
+                        on=["symbol", "_trade_date_norm"], how="left")
+        amount_series = pd.to_numeric(out["_daily_amount"], errors="coerce")
+    elif "amount" in out.columns:
+        amount_series = pd.to_numeric(out["amount"], errors="coerce")
+
+    if amount_series is not None:
+        out["amount_percentile_60d"] = amount_series.groupby(out["symbol"], sort=False).transform(
+            lambda s: s.rolling(60, min_periods=10).apply(_last_value_percentile, raw=True)
+        )
+    else:
+        out["amount_percentile_60d"] = pd.NA
+
+    return out.drop(columns=[c for c in ["_trade_date_norm", "_daily_amount", "_daily_turnover"] if c in out.columns])
+
+
+def _standardize_turnover_frame(turnover_df: pd.DataFrame) -> pd.DataFrame:
+    """标准化换手率历史表为 symbol/_trade_date_norm/turnover。
+
+    支持 Tushare daily_basic(`ts_code`, `trade_date`, `turnover_rate`)、
+    已归一化表(`symbol`, `trade_date`, `turnover_ratio/turnover`)。仅用于计算相对换手，
+    不把缺失值伪造成 0。
+    """
+    if turnover_df is None or turnover_df.empty:
+        return pd.DataFrame(columns=["symbol", "_trade_date_norm", "turnover"])
+    t = turnover_df.copy()
+    if "symbol" not in t.columns:
+        if "ts_code" in t.columns:
+            t["symbol"] = t["ts_code"].astype(str).str.slice(0, 6)
+        else:
+            return pd.DataFrame(columns=["symbol", "_trade_date_norm", "turnover"])
+    if "trade_date" not in t.columns:
+        return pd.DataFrame(columns=["symbol", "_trade_date_norm", "turnover"])
+    turnover_col = None
+    for c in ["turnover_ratio", "turnover_rate", "turnover", "turnover_rate_f"]:
+        if c in t.columns:
+            turnover_col = c
+            break
+    if turnover_col is None:
+        return pd.DataFrame(columns=["symbol", "_trade_date_norm", "turnover"])
+    t["symbol"] = t["symbol"].astype(str).str.zfill(6)
+    t["_trade_date_norm"] = _normalize_trade_date(t["trade_date"])
+    t["turnover"] = pd.to_numeric(t[turnover_col], errors="coerce")
+    t = t.dropna(subset=["symbol", "_trade_date_norm", "turnover"])
+    return t[["symbol", "_trade_date_norm", "turnover"]].drop_duplicates(["symbol", "_trade_date_norm"], keep="last")
+
+
+def _last_value_percentile(values) -> float:
+    """rolling 窗口内最后一个值的历史分位；raw=True，避免构造 Series 拖慢全池。"""
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy()
+    if len(arr) == 0:
+        return float("nan")
+    last = arr[-1]
+    return float((arr <= last).sum() / len(arr))
+
+
+def add_moneyflow_factors(factor_df: pd.DataFrame, moneyflow_df: Optional[pd.DataFrame], price_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """把 Tushare moneyflow 合成为资金流因子。
+
+    单位约定：Tushare moneyflow amount 为“万元”，本系统标准化行情 amount 为“元”。
+    `*_amount` 字段保留万元口径，`*_pct_amount` 统一用万元*10000 / 当日成交额(元)。
+    """
+    if factor_df is None or factor_df.empty:
+        return factor_df
+    out = factor_df.copy()
+    for col in MONEYFLOW_FACTOR_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    if moneyflow_df is None or moneyflow_df.empty or "ts_code" not in moneyflow_df.columns:
+        return out
+    if "symbol" not in out.columns or "trade_date" not in out.columns:
+        return out
+
+    mf = moneyflow_df.copy()
+    mf["symbol"] = mf["ts_code"].astype(str).str.slice(0, 6)
+    mf["_trade_date_norm"] = _moneyflow_trade_date(mf["trade_date"] if "trade_date" in mf.columns else pd.Series([None] * len(mf)))
+    amount_cols = [
+        "buy_sm_amount", "buy_md_amount", "buy_lg_amount", "buy_elg_amount",
+        "sell_sm_amount", "sell_md_amount", "sell_lg_amount", "sell_elg_amount",
+    ]
+    for c in ["net_mf_amount", *amount_cols]:
+        mf[c] = pd.to_numeric(mf.get(c, 0.0), errors="coerce").fillna(0.0)
+    mf["main_net_mf_amount"] = mf["net_mf_amount"]
+    mf["large_net_mf_amount"] = mf["buy_lg_amount"] - mf["sell_lg_amount"]
+    mf["elg_net_mf_amount"] = mf["buy_elg_amount"] - mf["sell_elg_amount"]
+    mf["large_elg_net_mf_amount"] = mf["large_net_mf_amount"] + mf["elg_net_mf_amount"]
+    mf["_mf_turnover_amount_yuan"] = mf[["buy_sm_amount", "buy_md_amount", "buy_lg_amount", "buy_elg_amount"]].sum(axis=1) * 10000.0
+    # 若买方拆单缺失，回退卖方拆单估算。Tushare moneyflow amount 为万元。
+    sell_turnover_yuan = mf[["sell_sm_amount", "sell_md_amount", "sell_lg_amount", "sell_elg_amount"]].sum(axis=1) * 10000.0
+    mf["_mf_turnover_amount_yuan"] = mf["_mf_turnover_amount_yuan"].where(mf["_mf_turnover_amount_yuan"] > 0, sell_turnover_yuan)
+    keep = [
+        "symbol", "_trade_date_norm", "main_net_mf_amount", "large_net_mf_amount",
+        "elg_net_mf_amount", "large_elg_net_mf_amount", "_mf_turnover_amount_yuan",
+    ]
+    mf = mf[keep].drop_duplicates(["symbol", "_trade_date_norm"], keep="last")
+
+    out["_trade_date_norm"] = _normalize_trade_date(out["trade_date"])
+    if price_df is not None and not price_df.empty and {"symbol", "trade_date", "amount"}.issubset(price_df.columns):
+        p = price_df[["symbol", "trade_date", "amount"]].copy()
+        p["_trade_date_norm"] = _normalize_trade_date(p["trade_date"])
+        p = p.drop_duplicates(["symbol", "_trade_date_norm"], keep="last")
+        out = out.merge(p[["symbol", "_trade_date_norm", "amount"]].rename(columns={"amount": "_daily_amount"}),
+                        on=["symbol", "_trade_date_norm"], how="left")
+    elif "amount" in out.columns:
+        out["_daily_amount"] = out["amount"]
+    else:
+        out["_daily_amount"] = pd.NA
+
+    out = out.merge(mf, on=["symbol", "_trade_date_norm"], how="left", suffixes=("", "_mf"))
+    for col in ["main_net_mf_amount", "large_net_mf_amount", "elg_net_mf_amount", "large_elg_net_mf_amount"]:
+        mf_col = f"{col}_mf"
+        if mf_col in out.columns:
+            out[col] = out[mf_col].combine_first(out[col])
+            out = out.drop(columns=[mf_col])
+
+    amount_yuan = pd.to_numeric(out["_daily_amount"], errors="coerce")
+    if "_mf_turnover_amount_yuan" in out.columns:
+        amount_yuan = amount_yuan.where(amount_yuan > 0, pd.to_numeric(out["_mf_turnover_amount_yuan"], errors="coerce"))
+    out["main_net_mf_pct_amount"] = pd.to_numeric(out["main_net_mf_amount"], errors="coerce") * 10000.0 / amount_yuan.replace(0, pd.NA)
+    out["large_elg_net_mf_pct_amount"] = pd.to_numeric(out["large_elg_net_mf_amount"], errors="coerce") * 10000.0 / amount_yuan.replace(0, pd.NA)
+    out["main_net_mf_rank"] = out.groupby("_trade_date_norm")["main_net_mf_pct_amount"].rank(pct=True)
+    out["large_elg_net_mf_rank"] = out.groupby("_trade_date_norm")["large_elg_net_mf_pct_amount"].rank(pct=True)
+    return out.drop(columns=[c for c in ["_trade_date_norm", "_daily_amount", "_mf_turnover_amount_yuan"] if c in out.columns])
+
+
+def enrich_short_term_factors(
+    factor_df: pd.DataFrame,
+    price_df: Optional[pd.DataFrame] = None,
+    moneyflow_df: Optional[pd.DataFrame] = None,
+    turnover_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """短线买卖点上下文因子增强入口。"""
+    enriched = add_relative_turnover_factors(factor_df, price_df, turnover_df)
+    enriched = add_moneyflow_factors(enriched, moneyflow_df, price_df)
+    return enriched
+
+
+def fetch_tushare_daily_basic_turnover_history(trade_dates) -> pd.DataFrame:
+    """按交易日批量读取 Tushare daily_basic 换手率历史。
+
+    用于相对换手率 rolling 计算。只读取实际交易日，优先命中
+    `TushareFetcher.get_daily_basic()` 的 L2 parquet 缓存；接口失败/空表时跳过，
+    不生成假 0。
+    """
+    if trade_dates is None:
+        return pd.DataFrame()
+    dates = pd.to_datetime(pd.Series(trade_dates).dropna().unique(), errors="coerce")
+    dates = sorted({d.strftime("%Y%m%d") for d in dates if pd.notna(d)})
+    if not dates:
+        return pd.DataFrame()
+    try:
+        from data.fetchers.tushare_fetcher import TushareFetcher
+        fetcher = TushareFetcher()
+    except Exception as e:
+        logger.warning(f"[DailyFactors] 初始化 Tushare daily_basic 换手率源失败: {e}")
+        return pd.DataFrame()
+
+    frames = []
+    for td in dates:
+        try:
+            df = fetcher.get_daily_basic(trade_date=td)
+            if df is None or df.empty:
+                continue
+            cols = [c for c in ["ts_code", "symbol", "trade_date", "turnover_rate", "turnover_rate_f", "turnover"] if c in df.columns]
+            if not {"trade_date"}.issubset(cols) or not any(c in cols for c in ["ts_code", "symbol"]):
+                continue
+            if not any(c in cols for c in ["turnover_rate", "turnover_rate_f", "turnover"]):
+                continue
+            frames.append(df[cols].copy())
+        except Exception as e:
+            logger.debug(f"[DailyFactors] daily_basic turnover {td} 失败: {e}")
+            continue
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    logger.info(f"[DailyFactors] Tushare daily_basic 换手率历史: {len(out)} 条, {len(frames)} 个交易日")
+    return out
+
+
 def snapshot_coverage_report(date_str: Optional[str] = None) -> dict:
     """返回每日因子快照覆盖质量摘要。
 
@@ -172,6 +438,31 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
         f"{len(price_df)} 条价格, 耗时 {elapsed:.1f}s"
     )
 
+    # 2.1 增强短线买卖点上下文因子：相对换手 + Tushare moneyflow。
+    moneyflow_df = pd.DataFrame()
+    turnover_df = pd.DataFrame()
+    latest_trade_date = ""
+    try:
+        latest_trade_date = pd.to_datetime(factor_df["trade_date"], errors="coerce").max().strftime("%Y%m%d")
+        from data.fetchers.tushare_fetcher import TushareFetcher
+        moneyflow_df = TushareFetcher().get_money_flow(trade_date=latest_trade_date)
+        if moneyflow_df is not None and not moneyflow_df.empty:
+            logger.info(f"[DailyFactors] Tushare moneyflow {latest_trade_date}: {len(moneyflow_df)} 条")
+        else:
+            logger.warning(f"[DailyFactors] Tushare moneyflow {latest_trade_date} 为空，资金流因子保留缺失")
+    except Exception as e:
+        logger.warning(f"[DailyFactors] moneyflow 增强失败，跳过资金流因子: {e}")
+        moneyflow_df = pd.DataFrame()
+    try:
+        turnover_df = fetch_tushare_daily_basic_turnover_history(factor_df["trade_date"])
+        if turnover_df is None or turnover_df.empty:
+            logger.warning("[DailyFactors] daily_basic 换手率历史为空，相对换手因子保留缺失")
+    except Exception as e:
+        logger.warning(f"[DailyFactors] daily_basic 换手率增强失败，跳过相对换手因子: {e}")
+        turnover_df = pd.DataFrame()
+    factor_df = enrich_short_term_factors(factor_df, price_df, moneyflow_df, turnover_df)
+    factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
+
     # 3. 保存
     today = _today_str()
     factor_df.to_parquet(_factor_path(today))
@@ -184,6 +475,8 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
         "quote_source": source_meta.get("quote_source", "unknown"),
         "daily_basic_source": source_meta.get("daily_basic_source", "unknown"),
         "daily_basic_date": source_meta.get("daily_basic_date"),
+        "moneyflow_source": "tushare_moneyflow_api" if moneyflow_df is not None and not moneyflow_df.empty else "missing",
+        "moneyflow_date": latest_trade_date,
         "universe_size": len(symbols),
         "factor_rows": len(factor_df),
         "price_rows": len(price_df),

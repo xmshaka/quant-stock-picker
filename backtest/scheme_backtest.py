@@ -18,7 +18,7 @@ sys.path.insert(0, "/root/.openclaw/workspace/quant-stock-picker")
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 import pandas as pd
@@ -28,7 +28,7 @@ from loguru import logger
 from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme
 from signals.layers import evaluate_layered
 from market.timing import MarketTimingModel
-from signals.rules import TradePoint, evaluate_all_rules
+from signals.rules import TradePoint, confidence_audit, evaluate_all_rules
 from signals.engine import SignalEngine
 from backtest.engine import BacktestEngine, BacktestParams, estimate_turnover_amount, get_liquidity_slippage_rate
 from backtest.records import (
@@ -40,7 +40,61 @@ from config.settings import settings
 import copy
 
 
-def _fetch_ohlcv(symbols: list, lookback_days: int, adjust: str = "") -> pd.DataFrame:
+def _tp_entry_model(tp: Optional[TradePoint], fallback: str = "") -> str:
+    """读取信号买点模型；缺失时使用回退值，但不伪造为已验证因子。"""
+    model = str(getattr(tp, "entry_model", "") or "").strip() if tp is not None else ""
+    return model or str(fallback or "").strip()
+
+
+def evaluate_add_position_contract(
+    pos: Dict,
+    source_tp: Optional[TradePoint],
+    *,
+    current_price: float,
+    projected_pnl: float,
+    projected_pnl_pct: float,
+    max_alloc: float,
+    target_position_value: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """P5 加仓执行契约：只判断是否允许加仓，不改变原持仓。
+
+    合同口径：扣成本后盈利、原始买点结构未破、同 entry_model、新信号
+    confidence 严格更高、加仓后单票不超过 20% 上限。
+    """
+    if projected_pnl <= 0:
+        return False, f"加仓拒绝: 扣成本后未盈利(projected_pnl={projected_pnl:.2f}, pct={projected_pnl_pct:.2%})"
+
+    old_model = str(pos.get("entry_model") or pos.get("strategy_id") or "").strip()
+    new_model = _tp_entry_model(source_tp, fallback=old_model)
+    if old_model and new_model and old_model != new_model:
+        return False, f"加仓拒绝: entry_model不一致({old_model}!={new_model})"
+
+    old_conf = float(pos.get("entry_confidence", 0.0) or 0.0)
+    new_conf = float(getattr(source_tp, "confidence", 0.0) or 0.0) if source_tp is not None else 0.0
+    if new_conf <= old_conf:
+        return False, f"加仓拒绝: confidence未增强({new_conf:.4f}<={old_conf:.4f})"
+
+    stop_loss = float(pos.get("stop_loss", 0.0) or 0.0)
+    platform_low = float(pos.get("platform_low", 0.0) or 0.0)
+    if stop_loss > 0 and current_price <= stop_loss:
+        return False, f"加仓拒绝: 原始结构破坏(价格{current_price:.2f}<=止损{stop_loss:.2f})"
+    if platform_low > 0 and current_price < platform_low:
+        return False, f"加仓拒绝: 原始结构破坏(价格{current_price:.2f}<平台低点{platform_low:.2f})"
+
+    if target_position_value is not None and target_position_value > max_alloc + 1e-6:
+        return False, f"加仓拒绝: 单票仓位超20%({target_position_value:.2f}>{max_alloc:.2f})"
+
+    return True, "加仓通过: 盈利/同模型/confidence增强/结构未破/单票上限"
+
+
+def _fetch_ohlcv(
+    symbols: list,
+    lookback_days: int,
+    adjust: str = "",
+    start_date=None,
+    end_date=None,
+    warmup_days: int = 120,
+) -> pd.DataFrame:
     """从腾讯数据源拉取 OHLCV，补齐快照缺失的 open/high/low/volume。
 
     P0 数据口径：撮合 / 默认K线买卖点必须使用不复权价格。
@@ -51,8 +105,16 @@ def _fetch_ohlcv(symbols: list, lookback_days: int, adjust: str = "") -> pd.Data
         from data.fetchers.tencent_fetcher import TencentFetcher
         from datetime import datetime, timedelta
         fetcher = TencentFetcher()
-        end = datetime.now().strftime('%Y%m%d')
-        start = (datetime.now() - timedelta(days=lookback_days + 60)).strftime('%Y%m%d')
+        if end_date is not None:
+            end_dt = pd.Timestamp(end_date).to_pydatetime()
+        else:
+            end_dt = datetime.now()
+        if start_date is not None:
+            start_dt = pd.Timestamp(start_date).to_pydatetime() - timedelta(days=max(int(warmup_days or 0), 0))
+        else:
+            start_dt = end_dt - timedelta(days=lookback_days + max(int(warmup_days or 0), 60))
+        end = end_dt.strftime('%Y%m%d')
+        start = start_dt.strftime('%Y%m%d')
         frames = []
         for sym in symbols:
             try:
@@ -77,6 +139,27 @@ def _fetch_ohlcv(symbols: list, lookback_days: int, adjust: str = "") -> pd.Data
     except Exception as e:
         logger.warning(f"[SchemeBacktest] 拉取OHLCV失败: {e}")
     return pd.DataFrame()
+
+
+def _fetch_ohlcv_for_backtest(symbols: list, lookback_days: int, start_date=None, end_date=None, adjust: str = "") -> pd.DataFrame:
+    """按回测区间拉取含 warmup 的 OHLCV，并兼容旧测试 monkeypatch。
+
+    历史问题：直接按“当前日期 - lookback_days”拉取，会让早期回测日期缺少
+    MA40/ADX/MACD 等前置K线，导致类似 2026-03-20/04-03 的候选被 L1
+    `数据不足` 误挡。这里显式使用回测 start/end。
+    """
+    try:
+        return _fetch_ohlcv(
+            symbols,
+            lookback_days,
+            adjust=adjust,
+            start_date=start_date,
+            end_date=end_date,
+            warmup_days=max(120, int(lookback_days or 0)),
+        )
+    except TypeError:
+        # tests 中大量 monkeypatch 仍使用 lambda symbols, lookback_days: ...
+        return _fetch_ohlcv(symbols, lookback_days)
 
 
 def _prepare_execution_bars(df: pd.DataFrame, *, fallback_source: str = "snapshot") -> pd.DataFrame:
@@ -122,6 +205,7 @@ EXIT_REASON_MAP = {
     '回调破位退出': ('strategy_failure', 'pullback_breakdown'),
     '突破失败退出': ('strategy_failure', 'breakout_failed'),
     '大盘防御减仓': ('market_exit', 'market_defense'),
+    'L3共振卖出': ('signal_exit', 'rule_signal'),
     '信号卖出': ('signal_exit', 'rule_signal'),
     '末日清仓': ('final_liquidation', 'end_of_backtest'),
 }
@@ -340,7 +424,7 @@ class SchemeBacktester:
                 market_timing = None
 
         # 拉取 OHLCV
-        ohlcv_df = _fetch_ohlcv(symbols, lookback_days)
+        ohlcv_df = _fetch_ohlcv_for_backtest(symbols, lookback_days, start_date=start_date, end_date=end_date)
         have_ohlcv = not ohlcv_df.empty
         if have_ohlcv:
             ohlcv_df['trade_date'] = pd.to_datetime(ohlcv_df['trade_date'])
@@ -651,6 +735,7 @@ class SchemeBacktester:
             exit_type, exit_subtype = classify_exit_reason(rule_name, reason)
             trigger_price = price if trigger_price is None else trigger_price
             projected_pnl = pnl if projected_pnl is None else projected_pnl
+            conf_audit = confidence_audit(1.0, "SELL")
             trades_pnl.append(pnl)
             cash += net
             sell_count += 1
@@ -668,6 +753,10 @@ class SchemeBacktester:
                 exit_subtype=exit_subtype,
                 trigger_price=trigger_price,
                 projected_pnl=projected_pnl,
+                confidence_bucket=str(conf_audit['confidence_bucket']),
+                confidence_action=str(conf_audit['confidence_action']),
+                confidence_weight=float(conf_audit['confidence_weight']),
+                confidence_note=str(conf_audit['confidence_note']),
             )
             actual_trades.append((sym, tp_out))
             trade_details.append({
@@ -688,14 +777,28 @@ class SchemeBacktester:
                 'projected_pnl': projected_pnl,
                 'holding_days': holding_days,
                 'entries': list(pos.get('entries', [])),
+                'confidence': 1.0,
+                'confidence_bucket': conf_audit['confidence_bucket'],
+                'confidence_action': conf_audit['confidence_action'],
+                'confidence_weight': conf_audit['confidence_weight'],
+                'confidence_note': conf_audit['confidence_note'],
             })
             if verbose:
                 logger.info(f"  [{dt_key}] 卖出 {sym} {pos['shares']}股 @ {price:.2f} 盈亏={pnl:+.0f} ({reason})")
             return tp_out
 
-        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False, signal_date=None):
+        def _entry_audit_from_source(source_tp=None):
+            fields = [
+                'entry_model', 'main_trigger', 'confirmations', 'factor_evidence', 'market_context',
+                'fund_flow_context', 'technical_confirmations', 'veto_checks', 'risk_tags', 'missing_fields',
+            ]
+            return {f: str(getattr(source_tp, f, '') or '') for f in fields}
+
+        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False, signal_date=None, source_tp=None):
             """统一买入/加仓逻辑，含资金校验"""
             nonlocal cash, buy_count
+            conf_audit = confidence_audit(confidence, "ADD" if is_add else "BUY")
+            entry_audit = _entry_audit_from_source(source_tp)
             total_value = cash + sum(
                 p['shares'] * close_lookup.get(s, {}).get(dt_key, p['avg_cost'])
                 for s, p in positions.items()
@@ -723,6 +826,16 @@ class SchemeBacktester:
 
             slippage_rate, liquidity_bucket, turnover_amount = _slippage_info(sym, dt_key)
             exec_price = price * (1 + slippage_rate)  # 买入滑点：成交价略高
+            if is_add:
+                existing = positions[sym]
+                strict_remaining = max_alloc - existing['shares'] * exec_price
+                max_add_shares = int(strict_remaining / exec_price / 100) * 100
+                if max_add_shares <= 0:
+                    if verbose:
+                        logger.info(f"  [{dt_key}] 跳过 {sym} 加仓后将超过单票20%上限")
+                    return None
+                if shares > max_add_shares:
+                    shares = max_add_shares
             cost = shares * exec_price
             commission = max(cost * COMMISSION, MIN_COMMISSION)
             transfer_fee = cost * TRANSFER_FEE
@@ -743,7 +856,15 @@ class SchemeBacktester:
                 new_avg = new_total / new_shares if new_shares > 0 else price
                 existing['shares'] = new_shares
                 existing['avg_cost'] = new_avg
-                existing['entries'].append({'date': dt_key, 'price': exec_price, 'shares': shares, 'reason': reason})
+                existing['entry_confidence'] = float(confidence)
+                existing['last_add_confidence'] = float(confidence)
+                existing['entries'].append({
+                    'date': dt_key, 'price': exec_price, 'shares': shares, 'reason': reason,
+                    'confidence': float(confidence),
+                    'confidence_bucket': conf_audit['confidence_bucket'],
+                    'confidence_action': conf_audit['confidence_action'],
+                    'confidence_note': conf_audit['confidence_note'],
+                })
                 # 止盈止损用加权ATR
                 old_atr = existing.get('atr', atr_val)
                 old_shares = max(new_shares - shares, 0)
@@ -767,10 +888,20 @@ class SchemeBacktester:
                     'take_profit': take_profit,
                     'trailing_stop': stop_loss,
                     'atr': atr_val, 'add_count': 0,
+                    'entry_confidence': float(confidence),
+                    'entry_confidence_bucket': conf_audit['confidence_bucket'],
+                    'entry_confidence_action': conf_audit['confidence_action'],
+                    'entry_model': entry_audit.get('entry_model') or scheme_type,
                     'strategy_id': scheme_type,
                     'platform_high': platform_high,
                     'platform_low': platform_low,
-                    'entries': [{'date': dt_key, 'price': exec_price, 'shares': shares, 'reason': reason}],
+                    'entries': [{
+                        'date': dt_key, 'price': exec_price, 'shares': shares, 'reason': reason,
+                        'confidence': float(confidence),
+                        'confidence_bucket': conf_audit['confidence_bucket'],
+                        'confidence_action': conf_audit['confidence_action'],
+                        'confidence_note': conf_audit['confidence_note'],
+                    }],
                 }
 
             cash -= total_cost
@@ -788,6 +919,11 @@ class SchemeBacktester:
                 trailing_stop=pos['trailing_stop'],
                 signal_date=signal_date or '',
                 exec_date=dt_key,
+                confidence_bucket=str(conf_audit['confidence_bucket']),
+                confidence_action=str(conf_audit['confidence_action']),
+                confidence_weight=float(conf_audit['confidence_weight']),
+                confidence_note=str(conf_audit['confidence_note']),
+                **entry_audit,
             )
             actual_trades.append((sym, tp_out))
             trade_details.append({
@@ -806,6 +942,12 @@ class SchemeBacktester:
                 'stop_loss': pos['stop_loss'],
                 'take_profit': pos['take_profit'],
                 'trailing_stop': pos['trailing_stop'],
+                'confidence': float(confidence),
+                'confidence_bucket': conf_audit['confidence_bucket'],
+                'confidence_action': conf_audit['confidence_action'],
+                'confidence_weight': conf_audit['confidence_weight'],
+                'confidence_note': conf_audit['confidence_note'],
+                **entry_audit,
             })
             if verbose:
                 tag = '加仓' if is_add else '买入'
@@ -898,8 +1040,27 @@ class SchemeBacktester:
                     if sym in positions:
                         # 已持仓 → 加仓（检查次数上限）
                         if positions[sym].get('add_count', 0) < max_add_times:
+                            projected_pnl, projected_pnl_pct, _ = _project_sell_pnl(sym, dt_key, price, positions[sym])
+                            total_value = cash + sum(
+                                p['shares'] * close_lookup.get(s, {}).get(dt_key, p['avg_cost'])
+                                for s, p in positions.items()
+                            )
+                            max_alloc = total_value * max_single_pct
+                            current_value = positions[sym]['shares'] * price
+                            add_ok, add_note = evaluate_add_position_contract(
+                                positions[sym], tp,
+                                current_price=price,
+                                projected_pnl=projected_pnl,
+                                projected_pnl_pct=projected_pnl_pct,
+                                max_alloc=max_alloc,
+                                target_position_value=current_value,
+                            )
+                            if not add_ok:
+                                if verbose:
+                                    logger.info(f"  [{dt_key}] {sym} {add_note}")
+                                continue
                             result_tp = _buy(sym, dt_key, price, tp.reason or '加仓', tp.rule_name or '加仓',
-                                            confidence=tp.confidence, is_add=True, signal_date=getattr(tp, 'date', None))
+                                            confidence=tp.confidence, is_add=True, signal_date=getattr(tp, 'date', None), source_tp=tp)
                             if result_tp:
                                 positions[sym]['add_count'] = positions[sym].get('add_count', 0) + 1
                         elif verbose:
@@ -907,7 +1068,7 @@ class SchemeBacktester:
                     else:
                         # 新建仓
                         _buy(sym, dt_key, price, tp.reason or '信号买入', tp.rule_name or '信号买入',
-                             confidence=tp.confidence, signal_date=getattr(tp, 'date', None))
+                             confidence=tp.confidence, signal_date=getattr(tp, 'date', None), source_tp=tp)
 
             # 3. 计算当日总权益
             total_value = cash
@@ -1231,7 +1392,7 @@ class SchemeBacktester:
             if progress_callback:
                 progress_callback(65, 100, f"拉取 {len(all_selected)} 只股票 OHLCV...")
 
-            ohlcv_df = _fetch_ohlcv(list(all_selected), lookback_days)
+            ohlcv_df = _fetch_ohlcv_for_backtest(list(all_selected), lookback_days, start_date=start_date, end_date=end_date)
             have_ohlcv = not ohlcv_df.empty
             if have_ohlcv:
                 ohlcv_df['trade_date'] = pd.to_datetime(ohlcv_df['trade_date'])

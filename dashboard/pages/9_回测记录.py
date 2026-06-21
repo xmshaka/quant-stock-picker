@@ -10,6 +10,7 @@ from backtest.records import (
     delete_backtest_run,
     list_backtest_runs,
     load_backtest_run,
+    summarize_confidence_performance,
     summarize_exit_audit,
     summarize_liquidity_slippage,
     validate_trade_schema,
@@ -260,7 +261,7 @@ if schema_check["ok"] and consistency.get("ok", False):
 else:
     st.warning(f"⚠️ 审计检查异常: schema={schema_check}, consistency={consistency}")
 
-tab_summary, tab_trades, tab_exit, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "退出审计", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
+tab_summary, tab_trades, tab_confidence, tab_exit, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "置信度审计", "退出审计", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
 
 with tab_summary:
     c1, c2, c3 = st.columns(3)
@@ -305,6 +306,7 @@ with tab_trades:
                 display_trades[col] = pd.to_numeric(display_trades[col], errors="coerce").round(4)
         preferred_cols = [
             "symbol", "date", "action", "event_type", "exec_price", "shares", "amount",
+            "confidence", "confidence_bucket", "confidence_action", "confidence_weight",
             "slippage_rate", "slippage", "流动性分层", "turnover_amount",
             "commission", "stamp_duty", "transfer_fee", "avg_cost", "pnl", "pnl_pct",
             "exit_type", "exit_subtype", "trigger_price", "projected_pnl", "reason",
@@ -314,6 +316,37 @@ with tab_trades:
         display_trades = display_trades[preferred_cols + rest_cols]
         st.dataframe(display_trades, width="stretch", hide_index=True)
         st.caption(f"共 {len(trades)} 笔成交；字段数 {len(trades.columns)}")
+
+with tab_confidence:
+    conf_summary = summarize_confidence_performance(trades)
+    if not conf_summary.get("ok"):
+        empty_state("🧠", "暂无置信度分桶绩效数据")
+    else:
+        st.info(
+            "当前为审计模式：confidence_bucket / confidence_action 仅用于复盘，不改变交易结果；"
+            "阈值需扩大样本验证后才能作为硬过滤。",
+            icon="🧠",
+        )
+        metric_row([
+            {"label": "开仓笔数", "value": f"{conf_summary.get('buy_rows', 0)}笔"},
+            {"label": "卖出笔数", "value": f"{conf_summary.get('sell_rows', 0)}笔"},
+            {"label": "完成轮数", "value": f"{conf_summary.get('round_count', 0)}轮"},
+        ], cols=3)
+        rounds = conf_summary["rounds"].copy()
+        for col in ["总盈亏", "平均盈亏", "最大单笔亏损", "平均持仓天数"]:
+            if col in rounds.columns:
+                rounds[col] = pd.to_numeric(rounds[col], errors="coerce").round(4)
+        for col in ["胜率", "平均收益率"]:
+            if col in rounds.columns:
+                rounds[col] = pd.to_numeric(rounds[col], errors="coerce").map(lambda x: f"{x:.2%}")
+        st.dataframe(rounds, width="stretch", hide_index=True)
+        with st.expander("置信度分桶交易轮次明细", expanded=False):
+            details = conf_summary["details"].copy()
+            for col in ["entry_confidence", "pnl", "pnl_pct", "holding_days"]:
+                if col in details.columns:
+                    details[col] = pd.to_numeric(details[col], errors="coerce").round(4)
+            st.dataframe(details, width="stretch", hide_index=True)
+        st.caption("配对规则：按 symbol 将 BUY/ADD 到下一次 SELL 作为一轮；含 ADD 或混合桶的轮次标记为 mixed_or_add，避免强行归因。")
 
 with tab_exit:
     exit_summary = summarize_exit_audit(trades)

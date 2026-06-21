@@ -186,7 +186,10 @@ elif pool_mode == "持仓池":
         st.warning("持仓池为空")
 
 current_context_signature = backtest_context_signature(pool_mode, custom_symbols, lookback, top_n, capital)
-current_context_signature = (*current_context_signature, tuple(sorted(exit_cfg_override.to_dict().items())))
+# FIX: 保持签名为 dict。此前把 dict 转为 tuple 后，方案对比区仍按
+# current_context_signature["symbols"] 读取，触发
+# TypeError: tuple indices must be integers or slices, not str。
+current_context_signature["exit_config"] = tuple(sorted(exit_cfg_override.to_dict().items()))
 clear_stale_compare(st.session_state, current_context_signature)
 
 # ========== 执行回测 ==========

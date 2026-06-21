@@ -31,6 +31,9 @@ STANDARD_TRADE_COLUMNS = [
     "cash_after", "position_after", "position_shares",
     "stop_loss", "take_profit", "exit_type", "exit_subtype",
     "trigger_price", "projected_pnl",
+    "confidence", "confidence_bucket", "confidence_action", "confidence_weight", "confidence_note",
+    "entry_model", "main_trigger", "confirmations", "factor_evidence", "market_context",
+    "fund_flow_context", "technical_confirmations", "veto_checks", "risk_tags", "missing_fields",
 ]
 
 LIQUIDITY_BUCKET_LABELS = {
@@ -169,6 +172,20 @@ def trade_points_to_frame(stock_points: Mapping[str, Iterable[Any]], source: str
                 "reason": getattr(p, "reason", ""),
                 "rule_name": getattr(p, "rule_name", ""),
                 "confidence": float(getattr(p, "confidence", 0.0) or 0.0),
+                "confidence_bucket": getattr(p, "confidence_bucket", ""),
+                "confidence_action": getattr(p, "confidence_action", ""),
+                "confidence_weight": float(getattr(p, "confidence_weight", 0.0) or 0.0),
+                "confidence_note": getattr(p, "confidence_note", ""),
+                "entry_model": getattr(p, "entry_model", ""),
+                "main_trigger": getattr(p, "main_trigger", ""),
+                "confirmations": getattr(p, "confirmations", ""),
+                "factor_evidence": getattr(p, "factor_evidence", ""),
+                "market_context": getattr(p, "market_context", ""),
+                "fund_flow_context": getattr(p, "fund_flow_context", ""),
+                "technical_confirmations": getattr(p, "technical_confirmations", ""),
+                "veto_checks": getattr(p, "veto_checks", ""),
+                "risk_tags": getattr(p, "risk_tags", ""),
+                "missing_fields": getattr(p, "missing_fields", ""),
                 "source": source,
             })
     return pd.DataFrame(rows)
@@ -230,6 +247,21 @@ def trade_details_to_frame(
         row.setdefault("exit_subtype", "")
         row.setdefault("trigger_price", row.get("price", 0.0) if action == "SELL" else 0.0)
         row.setdefault("projected_pnl", row.get("pnl", 0.0) if action == "SELL" else 0.0)
+        row.setdefault("confidence", 0.0)
+        row.setdefault("confidence_bucket", "")
+        row.setdefault("confidence_action", "")
+        row.setdefault("confidence_weight", 0.0)
+        row.setdefault("confidence_note", "")
+        row.setdefault("entry_model", "")
+        row.setdefault("main_trigger", "")
+        row.setdefault("confirmations", "")
+        row.setdefault("factor_evidence", "")
+        row.setdefault("market_context", "")
+        row.setdefault("fund_flow_context", "")
+        row.setdefault("technical_confirmations", "")
+        row.setdefault("veto_checks", "")
+        row.setdefault("risk_tags", "")
+        row.setdefault("missing_fields", "")
         row.setdefault("reason", "")
         row.setdefault("rule_name", "")
         row["date"] = _date_str(row.get("date"))
@@ -243,7 +275,7 @@ def trade_details_to_frame(
     # 确保标准列在前，额外审计字段保留在后。
     for col in STANDARD_TRADE_COLUMNS:
         if col not in df.columns:
-            df[col] = "" if col in {"run_id", "symbol", "date", "signal_date", "exec_date", "action", "event_type", "source", "reason", "rule_name", "liquidity_bucket", "exit_type", "exit_subtype"} else 0
+            df[col] = "" if col in {"run_id", "symbol", "date", "signal_date", "exec_date", "action", "event_type", "source", "reason", "rule_name", "liquidity_bucket", "exit_type", "exit_subtype", "confidence_bucket", "confidence_action", "confidence_note", "entry_model", "main_trigger", "confirmations", "factor_evidence", "market_context", "fund_flow_context", "technical_confirmations", "veto_checks", "risk_tags", "missing_fields"} else 0
     extra_cols = [c for c in df.columns if c not in STANDARD_TRADE_COLUMNS]
     return df[STANDARD_TRADE_COLUMNS + extra_cols]
 
@@ -381,6 +413,122 @@ def summarize_exit_audit(trades: pd.DataFrame) -> Dict[str, Any]:
         "projected_pnl_total": float(sell_df["projected_pnl"].sum()),
         "summary": summary.reset_index(drop=True),
         "details": sell_df,
+    }
+
+
+def summarize_confidence_performance(trades: pd.DataFrame) -> Dict[str, Any]:
+    """按开仓 confidence 分桶汇总交易绩效。
+
+    第一阶段用于审计，不用于改变交易结果。按成交流水逐 symbol 配对：
+    BUY/ADD 建立当前持仓的 confidence 桶；SELL 发生时把该轮净盈亏归因到开仓桶。
+    如果一轮中出现 ADD 或多个不同桶，标记为 `mixed_or_add`，避免把混合仓位强行归因。
+    """
+    bucket_cols = [
+        "confidence_bucket", "confidence_action", "开仓次数", "完成轮数", "胜率",
+        "总盈亏", "平均盈亏", "平均收益率", "最大单笔亏损", "平均持仓天数",
+    ]
+    empty = pd.DataFrame(columns=bucket_cols)
+    if trades is None or trades.empty:
+        return {"ok": False, "rows": 0, "buy_rows": 0, "sell_rows": 0, "rounds": empty, "details": pd.DataFrame()}
+
+    df = trades.copy()
+    for col in ("action", "event_type", "symbol", "confidence_bucket", "confidence_action"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+    for col in ("confidence", "confidence_weight", "pnl", "pnl_pct", "holding_days"):
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    if "exec_date" not in df.columns:
+        df["exec_date"] = df.get("date", "")
+    df["_dt"] = pd.to_datetime(df["exec_date"].where(df["exec_date"].astype(str) != "", df.get("date", "")), errors="coerce")
+    df = df.sort_values(["symbol", "_dt", "action"]).reset_index(drop=True)
+
+    open_state: Dict[str, Dict[str, Any]] = {}
+    completed: List[Dict[str, Any]] = []
+    buy_rows = 0
+    sell_rows = 0
+    for _, row in df.iterrows():
+        action = str(row.get("action", "")).upper()
+        symbol = str(row.get("symbol", ""))
+        if action == "BUY":
+            buy_rows += 1
+            bucket = str(row.get("confidence_bucket", "") or "unclassified")
+            conf_action = str(row.get("confidence_action", "") or "")
+            event_type = str(row.get("event_type", action) or action).upper()
+            existing = open_state.get(symbol)
+            if existing is None or event_type != "ADD":
+                open_state[symbol] = {
+                    "symbol": symbol,
+                    "entry_date": row.get("exec_date", row.get("date", "")),
+                    "confidence_bucket": bucket,
+                    "confidence_action": conf_action,
+                    "confidence": float(row.get("confidence", 0.0) or 0.0),
+                    "has_add": event_type == "ADD",
+                    "buckets": {bucket},
+                }
+            else:
+                existing["has_add"] = True
+                existing.setdefault("buckets", set()).add(bucket)
+                existing["confidence_bucket"] = "mixed_or_add"
+                existing["confidence_action"] = "mixed_or_add"
+        elif action == "SELL":
+            sell_rows += 1
+            state = open_state.pop(symbol, None)
+            if state is None:
+                bucket = "unpaired_sell"
+                conf_action = "unpaired_sell"
+                entry_date = ""
+                entry_conf = 0.0
+            else:
+                buckets = state.get("buckets", set()) or set()
+                bucket = "mixed_or_add" if state.get("has_add") or len(buckets) > 1 else state.get("confidence_bucket", "unclassified")
+                conf_action = "mixed_or_add" if bucket == "mixed_or_add" else state.get("confidence_action", "")
+                entry_date = state.get("entry_date", "")
+                entry_conf = float(state.get("confidence", 0.0) or 0.0)
+            completed.append({
+                "symbol": symbol,
+                "entry_date": entry_date,
+                "exit_date": row.get("exec_date", row.get("date", "")),
+                "confidence_bucket": bucket or "unclassified",
+                "confidence_action": conf_action,
+                "entry_confidence": entry_conf,
+                "pnl": float(row.get("pnl", 0.0) or 0.0),
+                "pnl_pct": float(row.get("pnl_pct", 0.0) or 0.0),
+                "holding_days": float(row.get("holding_days", 0.0) or 0.0),
+                "exit_type": row.get("exit_type", ""),
+                "exit_subtype": row.get("exit_subtype", ""),
+                "reason": row.get("reason", ""),
+            })
+
+    details = pd.DataFrame(completed)
+    if details.empty:
+        return {"ok": False, "rows": int(len(df)), "buy_rows": buy_rows, "sell_rows": sell_rows, "rounds": empty, "details": details}
+
+    summary = (
+        details.groupby(["confidence_bucket", "confidence_action"], dropna=False)
+        .agg(
+            开仓次数=("symbol", "count"),
+            完成轮数=("symbol", "count"),
+            胜率=("pnl", lambda s: float((s > 0).mean()) if len(s) else 0.0),
+            总盈亏=("pnl", "sum"),
+            平均盈亏=("pnl", "mean"),
+            平均收益率=("pnl_pct", "mean"),
+            最大单笔亏损=("pnl", "min"),
+            平均持仓天数=("holding_days", "mean"),
+        )
+        .reset_index()
+        .sort_values(["confidence_bucket", "完成轮数"])
+    )
+    return {
+        "ok": True,
+        "rows": int(len(df)),
+        "buy_rows": buy_rows,
+        "sell_rows": sell_rows,
+        "round_count": int(len(details)),
+        "rounds": summary.reset_index(drop=True),
+        "details": details.reset_index(drop=True),
     }
 
 

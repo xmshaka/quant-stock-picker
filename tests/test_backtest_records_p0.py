@@ -1,5 +1,5 @@
 """P0 回测记录与K线买卖点一致性测试。"""
-from datetime import date
+from datetime import date, timedelta
 import os
 import time
 
@@ -20,13 +20,210 @@ from backtest.records import (
     make_run_id,
     scheme_audit_snapshot,
     summarize_liquidity_slippage,
+    summarize_confidence_performance,
     trade_details_to_frame,
     trade_points_to_frame,
 )
-from backtest.scheme_backtest import SchemeBacktestResult, classify_exit_reason
+from backtest.scheme_backtest import SchemeBacktestResult, classify_exit_reason, evaluate_add_position_contract
 from dashboard.kline_events import trade_points_from_executed_frame
-from signals.rules import TradePoint
+from signals.rules import TradePoint, apply_confidence_audit
 from strategy.schemes import BUILTIN_SCHEMES, ExitConfig, StrategyScheme
+
+
+def test_fetch_ohlcv_for_backtest_uses_backtest_window_warmup(monkeypatch):
+    """历史回测 OHLCV 必须按回测区间+warmup 拉取，避免早期买点 L1 数据不足。"""
+    import backtest.scheme_backtest as sb
+
+    calls = []
+
+    class FakeFetcher:
+        def get_daily_bars(self, sym, start_date, end_date, adjust):
+            calls.append((sym, start_date, end_date, adjust))
+            return pd.DataFrame({
+                "symbol": [sym],
+                "trade_date": ["2026-01-01"],
+                "open": [10.0],
+                "high": [10.2],
+                "low": [9.8],
+                "close": [10.1],
+                "volume": [1_000_000],
+                "amount": [10_000_000],
+                "source": ["tencent"],
+                "adjust": ["raw"],
+            })
+
+    monkeypatch.setattr("data.fetchers.tencent_fetcher.TencentFetcher", FakeFetcher)
+    df = sb._fetch_ohlcv_for_backtest(
+        ["600143"],
+        lookback_days=78,
+        start_date="2026-02-25",
+        end_date="2026-06-18",
+    )
+
+    assert not df.empty
+    assert calls == [("600143", "20251028", "20260618", "raw")]
+
+
+def test_l3_resonance_sell_classified_as_signal_exit():
+    """L3共振卖出是规则信号退出，不能归到 manual_or_unknown。"""
+    assert classify_exit_reason("三层过滤-balanced", "L3共振卖出(2/6): MA死叉 + MACD翻绿") == (
+        "signal_exit",
+        "rule_signal",
+    )
+
+
+def test_confidence_audit_fields_persist_in_signal_and_trade_frames():
+    """confidence 审计字段必须随 raw/executed/trades 落盘，但不改变交易结果。"""
+    p = apply_confidence_audit(TradePoint(
+        date=date(2026, 1, 2), action="BUY", reason="低置信候选",
+        confidence=0.42, price=10.0, shares=100,
+    ))
+    signal_df = trade_points_to_frame({"600143": [p]}, source="raw")
+    assert signal_df.loc[0, "confidence_bucket"] == "watch"
+    assert signal_df.loc[0, "confidence_action"] == "observe_only"
+    assert "audit_only_no_filter" in signal_df.loc[0, "confidence_note"]
+
+    trade_df = trade_details_to_frame([{
+        "symbol": "600143", "date": date(2026, 1, 3), "action": "BUY",
+        "shares": 100, "price": 10.0, "exec_price": 10.02,
+        "confidence": 0.42,
+        "confidence_bucket": "watch",
+        "confidence_action": "observe_only",
+        "confidence_weight": 0.0,
+        "confidence_note": "audit_only_no_filter; thresholds tentative pending larger-sample validation",
+    }])
+    assert "confidence_bucket" in STANDARD_TRADE_COLUMNS
+    assert trade_df.loc[0, "confidence_bucket"] == "watch"
+    assert trade_df.loc[0, "confidence_action"] == "observe_only"
+
+
+def test_entry_audit_fields_persist_in_signal_and_trade_frames():
+    """买点结构化审计字段必须随 raw/executed/trades 落盘，且只审计不改变交易。"""
+    p = apply_confidence_audit(TradePoint(
+        date=date(2026, 1, 2), action="BUY", reason="结构化买点",
+        confidence=0.72, price=10.0, shares=100,
+        entry_model="pullback_reversal",
+        main_trigger="pullback_range",
+        confirmations="rsi_oversold;pullback_range;not_break_20d_low",
+        factor_evidence="relative_turnover_20d=0.82",
+        market_context="market_score=55",
+        fund_flow_context="large_elg=0.03",
+        technical_confirmations="RSI偏弱回调;布林低位",
+        veto_checks="no_limit_up;not_break_20d_low",
+        risk_tags="成交额缺失",
+        missing_fields="main_net_mf_pct_amount",
+    ))
+    signal_df = trade_points_to_frame({"600143": [p]}, source="raw")
+    assert signal_df.loc[0, "entry_model"] == "pullback_reversal"
+    assert "pullback_range" in signal_df.loc[0, "confirmations"]
+    assert "main_net_mf_pct_amount" in signal_df.loc[0, "missing_fields"]
+
+    trade_df = trade_details_to_frame([{
+        "symbol": "600143", "date": date(2026, 1, 3), "action": "BUY",
+        "shares": 100, "price": 10.0, "exec_price": 10.02,
+        "entry_model": "pullback_reversal",
+        "main_trigger": "pullback_range",
+        "confirmations": "rsi_oversold;pullback_range;not_break_20d_low",
+        "factor_evidence": "relative_turnover_20d=0.82",
+        "market_context": "market_score=55",
+        "fund_flow_context": "large_elg=0.03",
+        "technical_confirmations": "RSI偏弱回调;布林低位",
+        "veto_checks": "no_limit_up;not_break_20d_low",
+        "risk_tags": "成交额缺失",
+        "missing_fields": "main_net_mf_pct_amount",
+    }])
+    assert "entry_model" in STANDARD_TRADE_COLUMNS
+    assert trade_df.loc[0, "entry_model"] == "pullback_reversal"
+    assert trade_df.loc[0, "main_trigger"] == "pullback_range"
+
+
+def test_add_position_contract_requires_profit_same_model_and_stronger_confidence():
+    """P5: 加仓不能因为持仓中又出现 BUY 就执行，必须满足执行契约。"""
+    pos = {
+        "shares": 1000,
+        "avg_cost": 10.0,
+        "stop_loss": 9.2,
+        "platform_low": 9.5,
+        "entry_model": "pullback_reversal",
+        "entry_confidence": 0.62,
+    }
+    weak_tp = TradePoint(
+        date=date(2026, 1, 5), action="BUY", reason="弱信号", confidence=0.61, price=10.3,
+        entry_model="pullback_reversal",
+    )
+    ok, reason = evaluate_add_position_contract(
+        pos, weak_tp, current_price=10.3, projected_pnl=100.0, projected_pnl_pct=0.01,
+        max_alloc=20_000.0, target_position_value=10_300.0,
+    )
+    assert ok is False
+    assert "confidence未增强" in reason
+
+    wrong_model_tp = TradePoint(
+        date=date(2026, 1, 6), action="BUY", reason="错模型", confidence=0.75, price=10.4,
+        entry_model="trend_continuation",
+    )
+    ok, reason = evaluate_add_position_contract(
+        pos, wrong_model_tp, current_price=10.4, projected_pnl=100.0, projected_pnl_pct=0.01,
+        max_alloc=20_000.0, target_position_value=10_400.0,
+    )
+    assert ok is False
+    assert "entry_model不一致" in reason
+
+    strong_tp = TradePoint(
+        date=date(2026, 1, 7), action="BUY", reason="强信号", confidence=0.78, price=10.5,
+        entry_model="pullback_reversal",
+    )
+    ok, reason = evaluate_add_position_contract(
+        pos, strong_tp, current_price=10.5, projected_pnl=120.0, projected_pnl_pct=0.012,
+        max_alloc=20_000.0, target_position_value=10_500.0,
+    )
+    assert ok is True
+    assert "加仓通过" in reason
+
+
+def test_add_position_contract_rejects_loss_broken_structure_and_single_cap():
+    """P5: 扣成本后亏损、结构破坏、单票上限任一不满足都拒绝加仓。"""
+    pos = {
+        "shares": 1000,
+        "avg_cost": 10.0,
+        "stop_loss": 9.2,
+        "platform_low": 9.5,
+        "entry_model": "trend_continuation",
+        "entry_confidence": 0.60,
+    }
+    tp = TradePoint(
+        date=date(2026, 1, 5), action="BUY", reason="强信号", confidence=0.80, price=10.3,
+        entry_model="trend_continuation",
+    )
+
+    ok, reason = evaluate_add_position_contract(pos, tp, current_price=10.3, projected_pnl=-1.0, projected_pnl_pct=-0.0001, max_alloc=20_000.0, target_position_value=10_300.0)
+    assert ok is False and "未盈利" in reason
+
+    ok, reason = evaluate_add_position_contract(pos, tp, current_price=9.1, projected_pnl=10.0, projected_pnl_pct=0.001, max_alloc=20_000.0, target_position_value=9_100.0)
+    assert ok is False and "结构破坏" in reason
+
+    ok, reason = evaluate_add_position_contract(pos, tp, current_price=10.3, projected_pnl=100.0, projected_pnl_pct=0.01, max_alloc=10_000.0, target_position_value=10_300.0)
+    assert ok is False and "单票仓位超20%" in reason
+
+
+def test_summarize_confidence_performance_pairs_buy_sell_rounds():
+    """按开仓 confidence 桶统计完成交易轮次绩效。"""
+    trades = trade_details_to_frame([
+        {"symbol": "600143", "exec_date": date(2026, 3, 26), "action": "BUY", "event_type": "BUY", "shares": 100, "exec_price": 10.0, "confidence": 0.49, "confidence_bucket": "watch", "confidence_action": "observe_only"},
+        {"symbol": "600143", "exec_date": date(2026, 3, 31), "action": "SELL", "shares": 100, "exec_price": 9.8, "pnl": -25.0, "pnl_pct": -0.025, "holding_days": 3, "exit_type": "signal_exit"},
+        {"symbol": "600143", "exec_date": date(2026, 6, 4), "action": "BUY", "event_type": "BUY", "shares": 100, "exec_price": 10.0, "confidence": 0.66, "confidence_bucket": "standard", "confidence_action": "standard_entry"},
+        {"symbol": "600143", "exec_date": date(2026, 6, 18), "action": "SELL", "shares": 100, "exec_price": 10.3, "pnl": 30.0, "pnl_pct": 0.03, "holding_days": 10, "exit_type": "final_liquidation"},
+    ], run_id="confidence_perf")
+
+    summary = summarize_confidence_performance(trades)
+    assert summary["ok"] is True
+    rounds = summary["rounds"]
+    watch = rounds[rounds["confidence_bucket"] == "watch"].iloc[0]
+    standard = rounds[rounds["confidence_bucket"] == "standard"].iloc[0]
+    assert watch["完成轮数"] == 1
+    assert watch["总盈亏"] == -25.0
+    assert standard["完成轮数"] == 1
+    assert standard["胜率"] == 1.0
 
 
 def test_executed_signals_trade_details_consistency():
@@ -413,6 +610,123 @@ def test_single_stock_signal_executes_next_day_open_and_records_signal_date(monk
     assert buy["exec_date"] == dates[1].date()
     assert buy["date"] == dates[1].date()
     assert buy["exec_price"] == pytest.approx(10.50 * 1.002)
+
+
+def test_single_stock_repeated_buy_does_not_add_when_confidence_not_stronger(monkeypatch):
+    """P5端到端：持仓中再次 BUY 但 confidence 未增强时，不应产生 ADD。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 5,
+        "trade_date": dates,
+        "open": [10.00, 10.00, 10.50, 10.60, 10.70],
+        "high": [10.20, 10.20, 10.70, 10.80, 10.90],
+        "low": [9.90, 9.90, 10.40, 10.50, 10.60],
+        "close": [10.10, 10.20, 10.60, 10.70, 10.80],
+        "volume": [1_000_000] * 5,
+        "amount": [1_000_000_000] * 5,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="pullback": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="初始买点", confidence=0.72, price=10.10, rule_name="测试", entry_model="pullback_reversal"),
+            TradePoint(date=dates[1].date(), action="BUY", reason="弱二次买点", confidence=0.70, price=10.20, rule_name="测试", entry_model="pullback_reversal"),
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="pullback",
+        name="加仓弱置信度测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=2,
+        position_pct_per_entry=0.10,
+        max_single_pct=0.20,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+        exit_config=ExitConfig(
+            enable_market_defense_exit=False,
+            enable_strategy_failure_exit=False,
+            enable_trailing_exit=False,
+            enable_time_stop=False,
+            enable_max_holding_exit=False,
+        ),
+    )
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=5, initial_capital=1_000_000,
+    )
+
+    events = [t.get("event_type") or t["action"] for t in result.trade_details]
+    assert events.count("BUY") == 1
+    assert "ADD" not in events
+
+
+def test_single_stock_repeated_buy_adds_only_when_contract_passes(monkeypatch):
+    """P5端到端：盈利、同模型、confidence更强、未破结构时才允许 ADD。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 5,
+        "trade_date": dates,
+        "open": [10.00, 10.00, 10.50, 10.60, 10.70],
+        "high": [10.20, 10.20, 10.70, 10.80, 10.90],
+        "low": [9.90, 9.90, 10.40, 10.50, 10.60],
+        "close": [10.10, 10.20, 10.60, 10.70, 10.80],
+        "volume": [1_000_000] * 5,
+        "amount": [1_000_000_000] * 5,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="pullback": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="初始买点", confidence=0.72, price=10.10, rule_name="测试", entry_model="pullback_reversal"),
+            TradePoint(date=dates[1].date(), action="BUY", reason="强二次买点", confidence=0.82, price=10.20, rule_name="测试", entry_model="pullback_reversal"),
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="pullback",
+        name="加仓契约通过测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=2,
+        position_pct_per_entry=0.10,
+        max_single_pct=0.20,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+        exit_config=ExitConfig(
+            enable_market_defense_exit=False,
+            enable_strategy_failure_exit=False,
+            enable_trailing_exit=False,
+            enable_time_stop=False,
+            enable_max_holding_exit=False,
+        ),
+    )
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=5, initial_capital=1_000_000,
+    )
+
+    adds = [t for t in result.trade_details if t.get("event_type") == "ADD"]
+    assert len(adds) == 1
+    add = adds[0]
+    assert add["signal_date"] == dates[1].date()
+    assert add["exec_date"] == dates[2].date()
+    assert add["confidence"] == pytest.approx(0.82)
+    assert add["entry_model"] == "pullback_reversal"
+    assert add["shares"] * add["exec_price"] <= 1_000_000 * 0.20 * 1.01
 
 
 def test_trailing_take_profit_requires_cost_adjusted_profit(monkeypatch):

@@ -18,6 +18,15 @@ def test_compare_signature_changes_when_custom_stock_changes():
     assert old_sig != new_sig
 
 
+def test_compare_signature_stays_mapping_when_exit_config_added():
+    """方案对比页会用 sig["symbols"] 读取上下文，签名不能被转成 tuple。"""
+    sig = backtest_context_signature("自定义代码", ["600143"], 78, 2, 1_000_000)
+    sig["exit_config"] = tuple(sorted({"time_stop_days": 10, "max_holding_days": 20}.items()))
+
+    assert sig["symbols"] == ("600143",)
+    assert sig["exit_config"] == (("max_holding_days", 20), ("time_stop_days", 10))
+
+
 def test_clear_stale_compare_when_stock_changes():
     old_sig = backtest_context_signature("自定义代码", ["002145"], 60, 10, 1_000_000)
     new_sig = backtest_context_signature("自定义代码", ["5156150"], 60, 10, 1_000_000)

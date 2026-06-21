@@ -8,7 +8,9 @@
 
 ```bash
 cat docs/DAILY_START_PLAN.md
+cat docs/SESSION_HANDOFF.md
 cat docs/买卖点基本逻辑.md
+cat docs/开仓加仓规则契约.md
 cat strategy/schemes.py
 cat signals/layers.py
 cat market/timing.py
@@ -50,6 +52,8 @@ cat backtest/scheme_backtest.py
 - 时间止损和最长持仓统一为交易日口径：买入执行日为第 0 个持仓交易日，周末/节假日不计入。
 - L4 风险可交易性检查已补齐：信号扫描过滤 OHLC 异常、一字涨跌停、封死涨跌停、低成交额，买入原因追加 `L4可交易性` 审计文本。
 - `docs/买卖点基本逻辑.md` 已升级到 v2.0，记录当前 layered 买点、T+1 开盘执行、`signals_executed` K线事件源、P2 退出体系、退出开关、600143 日期排查结论；下一次 agent 必须优先读取。
+- `docs/开仓加仓规则契约.md` 已新增：明确买卖点专业化原则、置信度必须进入开仓/加仓执行契约、禁止围绕单个 run 拟合、`balanced` 长期应组合器化；下一次涉及买点/加仓/策略调整必须先读。
+- `docs/SESSION_HANDOFF.md` 已新增：作为跨会话/跨 agent 的固定交接文件。每次重要收尾必须写入“已完成、测试、未提交变更、已知问题、下一步、禁止回退”，避免最后报告只留在聊天里丢失。
 - 当前常规测试结果：`.venv/bin/pytest tests -q` 为 `296 passed, 6 skipped`。
 - 根目录 `pytest -q` 被历史诊断脚本 `direct_dataflow_test.py` 阻塞，非当前修复引入。
 
@@ -60,12 +64,14 @@ cat backtest/scheme_backtest.py
 项目定位：
 
 ```text
-A股短线择时选股系统
+基于量化因子的 A 股短线择股择时系统
 持仓周期：≤20 个交易日
 覆盖范围：全 A 符合过滤条件股票
 交易方式：不接自动交易
 核心目标：低回撤、稳定小幅盈利、全链路可审计
 ```
+
+2026-06-21 纠偏：技术指标（MACD/KDJ/RSI/BOLL/MA）只能作为买卖点确认项，不能长期作为主驱动。允许引入新的量化因子、市场环境、资金流、情绪和相对换手判断，以提高买卖点准确性；但禁止未来函数、禁止围绕单个 run 拟合、禁止回测美化。若执行中偏离“基于量化因子的短线择股择时”目标，必须在本计划中及时记录和纠偏。
 
 核心原则：
 
@@ -75,6 +81,10 @@ A股短线择时选股系统
 4. 回测必须内置佣金、印花税、过户费、滑点。
 5. 买卖点必须保留 `signal_date` 与 `exec_date`。
 6. 历史回测记录不静默改写，旧错误记录只能通过重新回测生成新记录修正。
+7. 买卖点改造必须先有专家规则契约，再改代码与回测；禁止围绕单个 run 的胜负事后拟合。
+8. `TradePoint.confidence` 是开仓/加仓执行契约的一部分，不是仅用于展示；低置信度信号不能与高置信度信号同等开仓。
+9. 不允许“指标罗列触发”：必须先定义买点类型、主触发、确认项、否决项、风险标签和缺失数据，再决定是否交易。
+10. 买卖点应以“因子证据 + 市场环境 + 资金/情绪/换手上下文 + 技术确认 + 风控否决”组合判断；数据缺失必须落入 `missing_fields`，不得假装已验证。
 
 ---
 
@@ -115,6 +125,7 @@ A股短线择时选股系统
 执行层
   ├─ T日收盘信号
   ├─ T+1开盘撮合
+  ├─ 信号置信度 confidence → 开仓/加仓门槛与仓位调制（待重接入）
   ├─ 成本/滑点四项审计
   └─ A股100股整数手
 
@@ -552,6 +563,7 @@ ExitDecision:
 ```bash
 cd /root/.openclaw/workspace/quant-stock-picker
 cat docs/DAILY_START_PLAN.md
+cat docs/SESSION_HANDOFF.md
 git status --short
 pytest tests/test_backtest_records_p0.py tests/test_kline_chart_regressions.py -q
 ```
@@ -579,3 +591,40 @@ pytest tests/test_kline_cache_isolation.py tests/test_kline_chart_regressions.py
 - 不要把亏损交易归因为止盈。
 - 不要静默改写旧历史 run。
 - 默认一天汇总提交一次 Git，不要每个小修立即提交，除非用户明确要求。
+
+---
+
+## 11. 2026-06-21 数据层可行性验证：资金流 / 大单 / 相对换手
+
+已做极小样本 Tushare 验证，不改策略代码：
+
+```text
+Tushare token: settings.tushare_token 可用，长度 56
+Tushare version: 1.4.29
+pro.moneyflow(trade_date='20260618'): 返回 5188 行
+字段包含：buy_sm/md/lg/elg_vol/amount、sell_sm/md/lg/elg_vol/amount、net_mf_vol、net_mf_amount
+与本地 data/daily_factors/factors_20260618.parquet 按 symbol 合并：4480/4480 覆盖，coverage=1.0000
+pro.moneyflow_hsgt(start_date='20260618', end_date='20260618'): 返回 north_money/south_money 等字段
+pro.stk_factor(trade_date='20260618'): 返回 5507 行，包含 Tushare 计算的 MACD/KDJ/RSI/BOLL/CCI 等字段，可作校验源，不作为未来函数
+```
+
+结论：
+
+```text
+1. 个股主力/大单/超大单资金流在 Tushare moneyflow 源可用。
+2. 大盘北向资金流 moneyflow_hsgt 可用。
+3. 本地 daily_factors 目前仅有 turnover_ratio / north_hold_change / margin_change 等基础字段，尚未接入 moneyflow 大单字段。
+4. 换手率应优先做相对换手因子，而非只用绝对换手率：relative_turnover_5d、relative_turnover_20d、turnover_percentile_60d。
+```
+
+后续落地顺序：
+
+```text
+P0: 核实 resonance_config key 与 L3 ConditionResult key 是否一致，避免策略专属共振失效。=> 2026-06-21 已复现并修复，补测试。
+P1: 核实全池 Backtrader 单票 20% 硬限制；目标股票不足时不得把单票推到超过 20%。=> 2026-06-21 已复现并修复，补测试。
+P2: 增加资金流数据缓存/因子：main_net_mf_amount、large_net_mf_amount、elg_net_mf_amount、*_pct_amount、*_rank。=> 2026-06-21 已完成第一阶段数据层接入，不硬过滤。
+P3: 增加相对换手因子：relative_turnover_5d、relative_turnover_20d、turnover_percentile_60d、amount_percentile_60d。=> 2026-06-21 已完成第一阶段；`amount_percentile_60d` 依赖历史 amount，当前 price snapshot 缺 amount 时保留缺失。
+P4: 买点结构化输出：entry_model、main_trigger、factor_evidence、market_context、fund_flow_context、technical_confirmations、veto_checks、risk_tags、missing_fields。=> 2026-06-21 已完成第一阶段字段、落盘和 layered BUY 基础审计；后续需填充真实因子/资金/市场上下文。
+P5: 开仓/加仓契约改造：加仓必须盈利、同模型、结构未破、confidence 更强、加仓后单票 <=20%。=> 2026-06-21 已完成单股加仓执行契约第一阶段；后续补端到端回测用例与前端审计展示。
+```
+

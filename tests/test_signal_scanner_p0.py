@@ -302,6 +302,46 @@ def test_scan_signal_carries_resonance_config_metadata_for_ui():
     assert f"共振{sig.layer3_confirmations}/{sig.layer3_total}" in sig.entry_reason
 
 
+def test_scan_signal_carries_moneyflow_and_turnover_entry_audit_context():
+    """P4.2: 信号页 BUY 应携带资金流/相对换手审计上下文，缺失字段显式标记。"""
+    latest = date(2026, 1, 1) + timedelta(days=49)
+    strong = [10 + i * 0.15 for i in range(50)]
+    price_df = pd.DataFrame(
+        _bars("000091", strong)
+        + _bars("000092", [10 + i * 0.02 for i in range(50)])
+        + _bars("000093", [12 - i * 0.01 for i in range(50)])
+    )
+    factor_df = pd.DataFrame([
+        _factor_row(
+            "000091", latest,
+            momentum_5d=0.08, momentum_20d=0.25, volume_ratio=1.8, rsi14=65, boll_position=0.85,
+            main_net_mf_pct_amount=0.0234,
+            large_elg_net_mf_pct_amount=0.0189,
+            main_net_mf_rank=0.8123,
+            large_elg_net_mf_rank=0.7666,
+            relative_turnover_5d=1.2345,
+            relative_turnover_20d=1.1111,
+            turnover_percentile_60d=0.6543,
+            # amount_percentile_60d 刻意缺失：真实快照当前仍无历史 amount 支持，不能伪装为0。
+        ),
+        _factor_row("000092", latest, momentum_5d=0.01, momentum_20d=0.02, volume_ratio=1.0, rsi14=55, boll_position=0.5),
+        _factor_row("000093", latest, momentum_5d=-0.02, momentum_20d=-0.05, volume_ratio=0.8, rsi14=45, boll_position=0.2),
+    ])
+    factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
+
+    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+
+    sig = next(s for s in buy if s.symbol == "000091")
+    assert sig.entry_model == "trend_continuation"
+    assert sig.main_trigger == "trend_momentum"
+    assert "relative_turnover_20d=1.1111" in sig.factor_evidence
+    assert "main_net_mf_pct_amount=0.0234" in sig.fund_flow_context
+    assert "large_elg_net_mf_rank=0.7666" in sig.fund_flow_context
+    assert "market_score=60.00" in sig.market_context
+    assert "amount_percentile_60d" in sig.missing_fields
+    assert "仅审计不硬过滤" in sig.veto_checks
+
+
 def test_layered_signal_reasons_use_html_safe_text_without_angle_brackets():
     from signals.layers import TrendFilter
 

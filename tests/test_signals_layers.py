@@ -125,6 +125,37 @@ class TestResonanceChecker:
         # min=4 should be stricter (but not necessarily false)
         assert ok4 is not None
 
+    def test_rsi_below_40_is_weak_pullback_not_oversold(self):
+        """A股短线：RSI<40 只能标记为偏弱回调，不能误称标准超卖。"""
+        bars = make_bars(80, trend="up")
+        # 制造温和回调，确保 RSI 进入 30~40 区间附近。
+        closes = bars["close"].to_numpy().copy()
+        for i in range(65, 80):
+            closes[i] = closes[64] * (1 - (i - 64) * 0.006)
+        bars["close"] = closes
+        rc = ResonanceChecker(min_confirmations=1)
+        _, conditions = rc.check_buy(bars, 79)
+        rsi_cond = next(c for c in conditions if c.key == "rsi_weak_pullback")
+
+        assert rsi_cond.name == "RSI偏弱回调"
+        assert rsi_cond.threshold == 40
+        assert "超卖" not in rsi_cond.name
+        assert "< 40" in rsi_cond.audit_text()
+
+    def test_strategy_resonance_config_keys_match_active_buy_conditions(self):
+        """P0: 策略专属共振配置必须真实命中单股 L3 条件，不能过滤成空集。"""
+        from strategy.schemes import BUILTIN_SCHEMES
+
+        bars = make_bars(120, trend="up")
+        for sid in ["trend_momentum", "pullback", "breakout"]:
+            cfg_keys = set(BUILTIN_SCHEMES[sid].resonance_config.buy_conditions)
+            rc = ResonanceChecker.from_strategy(sid)
+            _, conditions = rc.check_buy(bars, 119)
+            active_keys = {c.key for c in conditions}
+
+            assert active_keys == cfg_keys
+            assert len(conditions) == len(cfg_keys) == 6
+
 
 class TestEvaluateLayered:
     def test_up_trend_produces_signals(self):
@@ -180,6 +211,62 @@ class TestEvaluateLayered:
         # 不同策略应产生不同信号
         assert len(set(results.values())) >= 2 or all(v == 0 for v in results.values())
 
+    def test_layered_buy_attaches_structured_entry_audit_fields(self):
+        """P4: layered BUY 必须带买点模型/确认项/缺失字段审计，不改变交易触发。"""
+        class AlwaysTrend:
+            def check(self, bars, idx):
+                return True, "ok", 1.0
+
+        class AlwaysStrategy:
+            def match(self, bars, idx):
+                return True, "ok", 1.0
+
+        class OneBuyNoSell:
+            def check_sell(self, bars, idx):
+                return False, []
+
+            def check_buy(self, bars, idx):
+                return True, [
+                    ConditionResult("pullback_range", "回撤区间", True, 0.08, 0.05, "above", 0.7),
+                    ConditionResult("rsi_oversold", "RSI偏弱回调", True, 35, 45, "below", 0.7),
+                    ConditionResult("not_break_20d_low", "不破20日低点", True, 1.05, 1.03, "above", 0.7),
+                ]
+
+        bars = make_bars(60, trend="up")
+        points = evaluate_layered(
+            bars,
+            strategy_type="pullback",
+            trend_filter=AlwaysTrend(),
+            strategy_matcher=AlwaysStrategy(),
+            resonance_checker=OneBuyNoSell(),
+        )
+        buy = next(p for p in points if p.action == "BUY")
+
+        assert buy.entry_model == "pullback_reversal"
+        assert buy.main_trigger == "pullback_range"
+        assert "rsi_oversold" in buy.confirmations
+        assert "audit_pending" in buy.factor_evidence
+        assert "market_score" in buy.missing_fields
+        assert "main_net_mf_pct_amount" in buy.missing_fields
+
+    def test_buy_reason_contains_threshold_and_liquidity_audit(self):
+        bars = make_bars(120, trend="up")
+        closes = bars["close"].to_numpy().copy()
+        for i in range(105, 120):
+            closes[i] = closes[104] * (1 - (i - 104) * 0.006)
+        bars["close"] = closes
+        bars["amount"] = bars["close"] * bars["volume"]
+        bars["turnover"] = 3.2
+        points = evaluate_layered(bars, strategy_type="balanced")
+        buys = [p for p in points if p.action == "BUY"]
+        if buys:
+            reason = buys[-1].reason
+            assert "审计：" in reason
+            assert "量" in reason
+            assert "成交额" in reason
+            assert "换手" in reason
+            assert "RSI超卖" not in reason
+
 
 class TestIntegration:
     """集成测试: 三层过滤 + 回测兼容性"""
@@ -202,4 +289,41 @@ class TestIntegration:
             assert hasattr(p, 'date')
             assert hasattr(p, 'price')
             assert hasattr(p, 'confidence')
+            assert hasattr(p, 'confidence_bucket')
+            assert hasattr(p, 'confidence_action')
+            assert hasattr(p, 'confidence_note')
             assert p.action in ("BUY", "SELL")
+
+    def test_confidence_audit_is_attached_without_filtering(self):
+        """置信度第一阶段只审计不硬过滤，低置信BUY仍可被记录但标注观察。"""
+        from signals.rules import TradePoint, apply_confidence_audit
+
+        p = apply_confidence_audit(TradePoint(
+            date=pd.Timestamp("2026-01-01").date(),
+            action="BUY",
+            reason="低置信候选",
+            confidence=0.42,
+            price=10.0,
+        ))
+
+        assert p.confidence_bucket == "watch"
+        assert p.confidence_action == "observe_only"
+        assert p.confidence_weight == 0.0
+        assert "audit_only_no_filter" in p.confidence_note
+
+    def test_sell_confidence_audit_not_labeled_entry(self):
+        """SELL 的 confidence 不是开仓仓位信号，不能标成 strong_entry。"""
+        from signals.rules import TradePoint, apply_confidence_audit
+
+        p = apply_confidence_audit(TradePoint(
+            date=pd.Timestamp("2026-01-02").date(),
+            action="SELL",
+            reason="卖出信号",
+            confidence=1.0,
+            price=10.0,
+        ))
+
+        assert p.confidence_bucket == "exit_signal"
+        assert p.confidence_action == "exit_signal_audit"
+        assert p.confidence_weight == 0.0
+        assert "not an entry sizing signal" in p.confidence_note

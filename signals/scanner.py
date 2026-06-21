@@ -40,6 +40,16 @@ class ScanSignal:
     layer3_condition_keys: List[str] = field(default_factory=list)
     risk_tags: List[str] = field(default_factory=list)
     suggested_position_pct: float = 0.0
+    # 买点结构化审计字段：仅用于信号页解释/落盘前上下文，不参与交易过滤。
+    entry_model: str = ""
+    main_trigger: str = ""
+    confirmations: str = ""
+    factor_evidence: str = ""
+    market_context: str = ""
+    fund_flow_context: str = ""
+    technical_confirmations: str = ""
+    veto_checks: str = ""
+    missing_fields: str = ""
 
     # 兼容旧信号卡片字段
     @property
@@ -135,6 +145,15 @@ def scan_signals(
             reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/{layer3_total}：{'、'.join(l3_reasons)}"
             risk_tags = _build_risk_tags(bars, latest_row, market_score_val, sid)
             risk_tags.extend([t for t in tradable_tags if t not in risk_tags])
+            entry_audit = _build_entry_audit_context(
+                latest_row,
+                scheme_id=sid,
+                market_score=market_score_val,
+                market_bracket=bracket.label,
+                l2_reason=l2_reason,
+                l3_reasons=l3_reasons,
+                risk_tags=risk_tags,
+            )
             buy_candidates.append(ScanSignal(
                 symbol=symbol,
                 signal_type="BUY",
@@ -156,6 +175,7 @@ def scan_signals(
                 entry_reason=f"{reason}；L4可交易性：{tradable_reason}",
                 risk_tags=risk_tags,
                 suggested_position_pct=round(min(0.20, scheme.position_pct_per_entry * bracket.per_entry_mult), 4),
+                **entry_audit,
             ))
 
     # balanced 作为组合器：同一股票只保留最高分策略；单策略页面则正常保留该策略结果。
@@ -280,6 +300,84 @@ def _check_layer2(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[b
     ok = range_pct < 0.08 and breakout and vol_ratio > 1.3
     score = min(100.0, max(0.0, (0.08 - range_pct) * 500 + max(0, vol_ratio - 1.0) * 35 + (20 if breakout else 0)))
     return ok, score, f"横盘突破：振幅{range_pct:.1%}，量比{vol_ratio:.1f}x"
+
+
+def _entry_model_for_scheme(scheme_id: str) -> str:
+    mapping = {
+        "trend_momentum": "trend_continuation",
+        "pullback": "pullback_reversal",
+        "breakout": "consolidation_breakout",
+    }
+    return mapping.get(str(scheme_id), "unknown")
+
+
+def _build_entry_audit_context(
+    row: pd.Series,
+    *,
+    scheme_id: str,
+    market_score: float,
+    market_bracket: str,
+    l2_reason: str,
+    l3_reasons: List[str],
+    risk_tags: List[str],
+) -> Dict[str, str]:
+    """构造信号页买点结构化上下文，严格 audit-only。
+
+    P4.2: moneyflow/相对换手先进入解释字段，不作为硬过滤；缺失字段必须显式
+    写入 missing_fields，尤其不能把 amount_percentile_60d 缺失伪装成 0。
+    """
+    missing: List[str] = []
+
+    def pick_num(field: str) -> Optional[float]:
+        if field not in row.index:
+            missing.append(field)
+            return None
+        value = _num(row.get(field), np.nan)
+        if np.isnan(value):
+            missing.append(field)
+            return None
+        return float(value)
+
+    main_pct = pick_num("main_net_mf_pct_amount")
+    large_pct = pick_num("large_elg_net_mf_pct_amount")
+    main_rank = pick_num("main_net_mf_rank")
+    large_rank = pick_num("large_elg_net_mf_rank")
+    rel_turnover_5d = pick_num("relative_turnover_5d")
+    rel_turnover_20d = pick_num("relative_turnover_20d")
+    turnover_pct60 = pick_num("turnover_percentile_60d")
+    amount_pct60 = pick_num("amount_percentile_60d")
+
+    factor_parts = [f"factor_score_context={scheme_id}"]
+    for label, value in [
+        ("relative_turnover_5d", rel_turnover_5d),
+        ("relative_turnover_20d", rel_turnover_20d),
+        ("turnover_percentile_60d", turnover_pct60),
+        ("amount_percentile_60d", amount_pct60),
+    ]:
+        if value is not None:
+            factor_parts.append(f"{label}={value:.4f}")
+
+    fund_parts = []
+    for label, value in [
+        ("main_net_mf_pct_amount", main_pct),
+        ("large_elg_net_mf_pct_amount", large_pct),
+        ("main_net_mf_rank", main_rank),
+        ("large_elg_net_mf_rank", large_rank),
+    ]:
+        if value is not None:
+            fund_parts.append(f"{label}={value:.4f}")
+
+    return {
+        "entry_model": _entry_model_for_scheme(scheme_id),
+        "main_trigger": str(scheme_id),
+        "confirmations": "；".join(l3_reasons),
+        "factor_evidence": "；".join(factor_parts),
+        "market_context": f"market_score={float(market_score):.2f}；market_bracket={market_bracket}",
+        "fund_flow_context": "；".join(fund_parts) if fund_parts else "audit_pending_fund_flow_context",
+        "technical_confirmations": "；".join(l3_reasons),
+        "veto_checks": "L4可交易性已通过；资金流/相对换手仅审计不硬过滤",
+        "missing_fields": "；".join(dict.fromkeys(missing)),
+    }
 
 
 def _resonance_config(scheme_id: str) -> ResonanceConfig:
