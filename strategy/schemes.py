@@ -200,7 +200,7 @@ def _register(scheme: StrategyScheme):
 _register(StrategyScheme(
     scheme_id="trend_momentum",
     name="强势追涨",
-    description="适合强势上涨市。高动量 + 高量比 + 布林上轨，顺势追涨。",
+    description="适合强势上涨市。高动量 + 资金净流入 + 高相对换手，顺势追涨。",
     factor_weights={
         'momentum_20d': 0.30, 'momentum_5d': 0.20, 'volume_ratio': 0.20,
         'boll_position': 0.10, 'high_20d_distance': 0.10, 'rsi14': 0.10,
@@ -212,8 +212,29 @@ _register(StrategyScheme(
     regime_fit=["强势单边上涨"],
     resonance_config=ResonanceConfig(
         min_confirmations=3,
-        buy_conditions=["volume_expand", "ma5_above_ma20", "near_high", "momentum_5d", "momentum_20d", "rsi_not_extreme"],
-        sell_conditions=["ma5_below_ma20", "macd_bearish", "volume_price_down", "kdj_death"],
+        buy_conditions=[
+            # 资金流条件
+            "large_elg_net_mf_positive",        # 超大单净流入
+            "main_net_mf_positive",             # 主力净流入
+            "large_elg_net_mf_rank_high",       # 超大单净流入排名前20%
+            # 相对换手条件
+            "relative_turnover_5d_high",        # 5日相对换手率高
+            "amount_percentile_60d_high",       # 60日成交额分位高
+            # 技术确认条件
+            "momentum_5d_strong",               # 5日动量强
+            "momentum_20d_strong",              # 20日动量强
+            "volume_expand",                    # 放量
+            "ma5_above_ma20",                   # 短期均线上穿
+            "rsi_not_extreme",                  # RSI不过热
+        ],
+        sell_conditions=[
+            "main_net_mf_negative",             # 主力净流出
+            "large_elg_net_mf_negative",        # 超大单净流出
+            "relative_turnover_5d_low",         # 5日相对换手率低
+            "ma5_below_ma20",                   # 短期均线下穿
+            "macd_bearish",                     # MACD转弱
+            "volume_price_down",                # 放量下跌
+        ],
     ),
     exit_config=ExitConfig(
         max_holding_days=10,
@@ -227,7 +248,7 @@ _register(StrategyScheme(
 _register(StrategyScheme(
     scheme_id="pullback",
     name="回调低吸",
-    description="适合上升趋势中的回调。高反转 + 低RSI + 远离高点，低吸买入。",
+    description="适合上升趋势中的回调。资金流出减缓 + 相对缩量 + 低RSI，低吸买入。",
     factor_weights={
         'reversal': 0.30, 'rsi14': -0.20, 'high_20d_distance': -0.20,
         'volume_ratio': -0.15, 'volatility_20d': -0.15,
@@ -239,8 +260,29 @@ _register(StrategyScheme(
     regime_fit=["震荡整理", "弱势单边下跌"],
     resonance_config=ResonanceConfig(
         min_confirmations=3,
-        buy_conditions=["rsi_oversold", "boll_lower", "pullback_range", "not_break_20d_low", "volume_calm", "near_support"],
-        sell_conditions=["rsi_overbought", "ma5_below_ma20", "boll_upper", "kdj_death"],
+        buy_conditions=[
+            # 资金流条件
+            "main_net_mf_negative_improving",   # 主力净流出但改善
+            "large_elg_net_mf_negative_improving", # 超大单净流出但改善
+            # 相对换手条件
+            "relative_turnover_5d_low",         # 5日相对换手率低（缩量回调）
+            "turnover_percentile_60d_low",      # 60日换手率分位低
+            # 技术确认条件
+            "rsi_oversold",                     # RSI超卖
+            "boll_lower",                       # 布林下轨
+            "pullback_range",                   # 回调幅度适中
+            "not_break_20d_low",                # 不破20日低点
+            "volume_calm",                      # 成交量平稳
+            "near_support",                     # 接近支撑位
+        ],
+        sell_conditions=[
+            "main_net_mf_negative_worsening",   # 主力净流出恶化
+            "large_elg_net_mf_negative_worsening", # 超大单净流出恶化
+            "relative_turnover_5d_high",        # 5日相对换手率高（放量下跌）
+            "rsi_overbought",                   # RSI超买
+            "ma5_below_ma20",                   # 短期均线下穿
+            "boll_upper",                       # 布林上轨（反弹到位）
+        ],
     ),
     exit_config=ExitConfig(
         max_holding_days=15,
@@ -254,7 +296,7 @@ _register(StrategyScheme(
 _register(StrategyScheme(
     scheme_id="breakout",
     name="横盘突破",
-    description="适合横盘整理后的突破。布林收窄 + 放量突破 + 短期强势。",
+    description="适合横盘整理后的突破。资金大幅流入 + 高相对换手 + 放量突破。",
     factor_weights={
         'boll_position': 0.30, 'volume_ratio': 0.25, 'momentum_5d': 0.20,
         'high_20d_distance': 0.15, 'momentum_20d': 0.10,
@@ -266,8 +308,29 @@ _register(StrategyScheme(
     regime_fit=["震荡整理", "强势单边上涨"],
     resonance_config=ResonanceConfig(
         min_confirmations=3,
-        buy_conditions=["break_platform", "volume_surge", "ma5_above_ma20", "narrow_range", "momentum_5d", "boll_upper"],
-        sell_conditions=["ma5_below_ma20", "macd_bearish", "volume_price_down", "kdj_death"],
+        buy_conditions=[
+            # 资金流条件
+            "large_elg_net_mf_positive_strong", # 超大单净流入强劲
+            "main_net_mf_positive_strong",      # 主力净流入强劲
+            # 相对换手条件
+            "relative_turnover_5d_high",        # 5日相对换手率高
+            "amount_percentile_60d_high",       # 60日成交额分位高
+            # 技术确认条件
+            "break_platform",                   # 突破平台
+            "volume_surge",                     # 成交量激增
+            "ma5_above_ma20",                   # 短期均线上穿
+            "narrow_range",                     # 横盘振幅收窄
+            "momentum_5d_strong",               # 5日动量强
+            "boll_upper_break",                 # 突破布林上轨
+        ],
+        sell_conditions=[
+            "main_net_mf_negative",             # 主力净流出
+            "large_elg_net_mf_negative",        # 超大单净流出
+            "relative_turnover_5d_low",         # 5日相对换手率低
+            "ma5_below_ma20",                   # 短期均线下穿
+            "macd_bearish",                     # MACD转弱
+            "volume_price_down",                # 放量下跌
+        ],
     ),
     exit_config=ExitConfig(
         max_holding_days=10,
@@ -281,7 +344,7 @@ _register(StrategyScheme(
 _register(StrategyScheme(
     scheme_id="balanced",
     name="均衡择时",
-    description="全行情适配。各因子均衡配置，不押注单一风格。",
+    description="全行情适配。均衡配置，不押注单一风格。长期应作为组合器使用。",
     factor_weights={
         'momentum_20d': 0.10, 'momentum_5d': 0.10, 'reversal': 0.10,
         'rsi14': 0.10, 'boll_position': 0.10, 'volatility_20d': 0.10,
@@ -295,9 +358,25 @@ _register(StrategyScheme(
     ],
     regime_fit=["*"],
     resonance_config=ResonanceConfig(
-        min_confirmations=2,
-        buy_conditions=[],
-        sell_conditions=[],
+        min_confirmations=3,
+        buy_conditions=[
+            # 资金流基础条件
+            "main_net_mf_not_negative",         # 主力不净流出
+            # 相对换手基础条件
+            "relative_turnover_5d_not_low",     # 5日相对换手率不低
+            # 技术基础条件（从各策略选通用项）
+            "ma5_above_ma20",                   # 短期均线上穿
+            "rsi_not_extreme",                  # RSI不过热
+            "volume_expand",                    # 放量
+            "momentum_5d_positive",             # 5日动量为正
+        ],
+        sell_conditions=[
+            "main_net_mf_negative",             # 主力净流出
+            "relative_turnover_5d_low",         # 5日相对换手率低
+            "ma5_below_ma20",                   # 短期均线下穿
+            "macd_bearish",                     # MACD转弱
+            "volume_price_down",                # 放量下跌
+        ],
     ),
     exit_config=ExitConfig(
         max_holding_days=20,

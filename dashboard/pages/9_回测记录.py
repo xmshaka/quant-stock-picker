@@ -243,6 +243,7 @@ trades = run["trades"]
 equity = run["equity"]
 signals_executed = run["signals_executed"]
 signals_raw = run["signals_raw"]
+skipped_signals = run.get("skipped_signals", pd.DataFrame())
 
 section_header("记录详情", f"{run_id} · {config.get('scheme_name', '')}")
 metric_row([
@@ -261,7 +262,7 @@ if schema_check["ok"] and consistency.get("ok", False):
 else:
     st.warning(f"⚠️ 审计检查异常: schema={schema_check}, consistency={consistency}")
 
-tab_summary, tab_trades, tab_confidence, tab_exit, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "置信度审计", "退出审计", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
+tab_summary, tab_trades, tab_confidence, tab_skipped, tab_exit, tab_liquidity, tab_equity, tab_kline, tab_raw = st.tabs(["概览", "交易流水", "置信度审计", "跳过信号", "退出审计", "滑点审计", "权益曲线", "K线复盘", "配置/报告"])
 
 with tab_summary:
     c1, c2, c3 = st.columns(3)
@@ -323,8 +324,8 @@ with tab_confidence:
         empty_state("🧠", "暂无置信度分桶绩效数据")
     else:
         st.info(
-            "当前为审计模式：confidence_bucket / confidence_action 仅用于复盘，不改变交易结果；"
-            "阈值需扩大样本验证后才能作为硬过滤。",
+            "新版单股/少量股票回测已接入 confidence 执行契约：watch/observe_only 不成交，candidate 降仓；"
+            "全池因子调仓仍无 L3 confidence，标记为 factor_rebalance_no_entry_confidence。阈值仍需扩大样本验证。",
             icon="🧠",
         )
         metric_row([
@@ -347,6 +348,40 @@ with tab_confidence:
                     details[col] = pd.to_numeric(details[col], errors="coerce").round(4)
             st.dataframe(details, width="stretch", hide_index=True)
         st.caption("配对规则：按 symbol 将 BUY/ADD 到下一次 SELL 作为一轮；含 ADD 或混合桶的轮次标记为 mixed_or_add，避免强行归因。")
+
+with tab_skipped:
+    if skipped_signals is None or skipped_signals.empty:
+        empty_state("🟡", "暂无跳过信号；旧记录或全量成交记录可能没有 skipped_signals 文件")
+    else:
+        display_skipped = skipped_signals.copy()
+        for col in ["signal_price", "confidence", "confidence_weight"]:
+            if col in display_skipped.columns:
+                display_skipped[col] = pd.to_numeric(display_skipped[col], errors="coerce").round(4)
+        metric_row([
+            {"label": "跳过信号", "value": f"{len(display_skipped)}条"},
+            {"label": "涉及股票", "value": f"{display_skipped['symbol'].nunique() if 'symbol' in display_skipped.columns else 0}只"},
+            {"label": "observe-only", "value": f"{int((display_skipped.get('confidence_action', pd.Series(dtype=str)).astype(str) == 'observe_only').sum())}条"},
+        ], cols=3)
+        stage_counts = (
+            display_skipped.groupby(["skip_stage", "confidence_action"], dropna=False)
+            .size()
+            .reset_index(name="数量")
+            if {"skip_stage", "confidence_action"}.issubset(display_skipped.columns)
+            else pd.DataFrame()
+        )
+        if not stage_counts.empty:
+            st.write("**跳过原因分布**")
+            st.dataframe(stage_counts, width="stretch", hide_index=True)
+        preferred_cols = [
+            "symbol", "signal_date", "exec_date", "action", "skip_stage", "skip_reason",
+            "confidence", "confidence_bucket", "confidence_action", "confidence_weight",
+            "entry_model", "main_trigger", "fund_flow_context", "factor_evidence", "missing_fields",
+            "reason", "rule_name",
+        ]
+        preferred_cols = [c for c in preferred_cols if c in display_skipped.columns]
+        rest_cols = [c for c in display_skipped.columns if c not in preferred_cols]
+        st.dataframe(display_skipped[preferred_cols + rest_cols], width="stretch", hide_index=True)
+        st.caption("skipped_signals 只解释 raw→executed 的差异，不参与收益、交易次数或K线默认成交点统计。")
 
 with tab_exit:
     exit_summary = summarize_exit_audit(trades)
@@ -445,3 +480,5 @@ with tab_raw:
         st.dataframe(signals_executed, width="stretch", hide_index=True)
     with st.expander("signals_raw"):
         st.dataframe(signals_raw, width="stretch", hide_index=True)
+    with st.expander("skipped_signals"):
+        st.dataframe(skipped_signals, width="stretch", hide_index=True)

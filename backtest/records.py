@@ -36,6 +36,14 @@ STANDARD_TRADE_COLUMNS = [
     "fund_flow_context", "technical_confirmations", "veto_checks", "risk_tags", "missing_fields",
 ]
 
+SKIPPED_SIGNAL_COLUMNS = [
+    "run_id", "symbol", "signal_date", "exec_date", "action", "skip_stage", "skip_reason",
+    "reason", "rule_name", "signal_price", "confidence", "confidence_bucket", "confidence_action",
+    "confidence_weight", "confidence_note", "entry_model", "main_trigger", "confirmations",
+    "factor_evidence", "market_context", "fund_flow_context", "technical_confirmations",
+    "veto_checks", "risk_tags", "missing_fields",
+]
+
 LIQUIDITY_BUCKET_LABELS = {
     "large_cap_gt_5e": "大盘蓝筹(>5亿)",
     "mid_cap_1e_5e": "中盘(1-5亿)",
@@ -278,6 +286,58 @@ def trade_details_to_frame(
             df[col] = "" if col in {"run_id", "symbol", "date", "signal_date", "exec_date", "action", "event_type", "source", "reason", "rule_name", "liquidity_bucket", "exit_type", "exit_subtype", "confidence_bucket", "confidence_action", "confidence_note", "entry_model", "main_trigger", "confirmations", "factor_evidence", "market_context", "fund_flow_context", "technical_confirmations", "veto_checks", "risk_tags", "missing_fields"} else 0
     extra_cols = [c for c in df.columns if c not in STANDARD_TRADE_COLUMNS]
     return df[STANDARD_TRADE_COLUMNS + extra_cols]
+
+
+def skipped_signals_to_frame(
+    skipped_signals: Iterable[Mapping[str, Any]],
+    *,
+    run_id: str = "",
+) -> pd.DataFrame:
+    """跳过信号审计表标准化。
+
+    用于解释 signals_raw 有信号但 signals_executed/trades 没成交的原因，例如
+    low-confidence observe-only、资金不足、加仓契约拒绝等。当前第一阶段主要记录
+    observe-only，后续可扩展其它 skip_stage。
+    """
+    rows: List[Dict[str, Any]] = []
+    for raw in skipped_signals or []:
+        row = dict(raw)
+        row.setdefault("run_id", run_id)
+        row.setdefault("symbol", "")
+        row.setdefault("signal_date", "")
+        row.setdefault("exec_date", "")
+        row.setdefault("action", "")
+        row.setdefault("skip_stage", "")
+        row.setdefault("skip_reason", "")
+        row.setdefault("reason", "")
+        row.setdefault("rule_name", "")
+        row.setdefault("signal_price", 0.0)
+        row.setdefault("confidence", 0.0)
+        row.setdefault("confidence_bucket", "")
+        row.setdefault("confidence_action", "")
+        row.setdefault("confidence_weight", 0.0)
+        row.setdefault("confidence_note", "")
+        row.setdefault("entry_model", "")
+        row.setdefault("main_trigger", "")
+        row.setdefault("confirmations", "")
+        row.setdefault("factor_evidence", "")
+        row.setdefault("market_context", "")
+        row.setdefault("fund_flow_context", "")
+        row.setdefault("technical_confirmations", "")
+        row.setdefault("veto_checks", "")
+        row.setdefault("risk_tags", "")
+        row.setdefault("missing_fields", "")
+        row["signal_date"] = _date_str(row.get("signal_date"))
+        row["exec_date"] = _date_str(row.get("exec_date"))
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=SKIPPED_SIGNAL_COLUMNS)
+    for col in SKIPPED_SIGNAL_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col not in {"signal_price", "confidence", "confidence_weight"} else 0.0
+    extra_cols = [c for c in df.columns if c not in SKIPPED_SIGNAL_COLUMNS]
+    return df[SKIPPED_SIGNAL_COLUMNS + extra_cols]
 
 
 def validate_trade_schema(df: pd.DataFrame) -> Dict[str, Any]:
@@ -562,6 +622,7 @@ def persist_backtest_run(
     trades: Optional[pd.DataFrame] = None,
     signals_raw: Optional[pd.DataFrame] = None,
     signals_executed: Optional[pd.DataFrame] = None,
+    skipped_signals: Optional[pd.DataFrame] = None,
     equity: Optional[pd.DataFrame] = None,
     positions: Optional[pd.DataFrame] = None,
     factor_snapshot: Optional[pd.DataFrame] = None,
@@ -597,6 +658,7 @@ def persist_backtest_run(
         "trades": trades,
         "signals_raw": signals_raw,
         "signals_executed": signals_executed,
+        "skipped_signals": skipped_signals,
         "equity": equity,
         "positions": positions,
         "factor_snapshot": factor_snapshot,
@@ -702,6 +764,7 @@ def load_backtest_run(run_id: str, root: Path = BACKTEST_RUN_ROOT) -> Dict[str, 
         "trades": trades,
         "signals_executed": _read_frame(run_dir / "signals_executed"),
         "signals_raw": _read_frame(run_dir / "signals_raw"),
+        "skipped_signals": _read_frame(run_dir / "skipped_signals"),
         "equity": _read_frame(run_dir / "equity"),
         "positions": _read_frame(run_dir / "positions"),
         "factor_snapshot": _read_frame(run_dir / "factor_snapshot"),

@@ -33,7 +33,7 @@ from signals.engine import SignalEngine
 from backtest.engine import BacktestEngine, BacktestParams, estimate_turnover_amount, get_liquidity_slippage_rate
 from backtest.records import (
     BacktestRunConfig, make_run_id, trade_points_to_frame,
-    trade_details_to_frame, equity_curve_to_frame, persist_backtest_run,
+    trade_details_to_frame, skipped_signals_to_frame, equity_curve_to_frame, persist_backtest_run,
 )
 from data.bars_normalizer import assert_raw_for_execution, normalize_daily_bars
 from config.settings import settings
@@ -85,6 +85,27 @@ def evaluate_add_position_contract(
         return False, f"加仓拒绝: 单票仓位超20%({target_position_value:.2f}>{max_alloc:.2f})"
 
     return True, "加仓通过: 盈利/同模型/confidence增强/结构未破/单票上限"
+
+
+def evaluate_entry_confidence_contract(confidence: float) -> Tuple[bool, float, Dict[str, object], str]:
+    """开仓 confidence 执行契约。
+
+    低置信度不再与高置信度同等开仓：
+    - observe_only(weight=0): 只保留 raw signal，不进入 executed/trades。
+    - reduced_or_pending(weight=0.5): 降仓执行，仍受成本、100股、单票20%约束。
+    - standard/strong(weight=1): 标准执行。
+
+    返回: (允许执行, 仓位权重, confidence审计字段, 执行说明)
+    """
+    audit = confidence_audit(confidence, "BUY")
+    weight = float(audit.get("confidence_weight", 0.0) or 0.0)
+    action = str(audit.get("confidence_action", "") or "")
+    if weight <= 0 or action == "observe_only":
+        return False, 0.0, audit, f"开仓观察: confidence={float(confidence or 0.0):.4f}, action={action}"
+    weight = max(0.0, min(1.0, weight))
+    if weight < 1.0:
+        return True, weight, audit, f"开仓降仓: confidence={float(confidence or 0.0):.4f}, weight={weight:.2f}"
+    return True, 1.0, audit, f"开仓标准执行: confidence={float(confidence or 0.0):.4f}"
 
 
 def _fetch_ohlcv(
@@ -261,6 +282,7 @@ class SchemeBacktestResult:
     # 详情
     equity_curve: Dict[str, float] = field(default_factory=dict)
     trade_details: List[Dict] = field(default_factory=list)
+    skipped_signals: List[Dict] = field(default_factory=list)
     _stock_signals_backup: Dict[str, List[TradePoint]] = field(default_factory=dict)
 
     @property
@@ -332,10 +354,12 @@ class SchemeBacktestResult:
         trades_df = trade_details_to_frame(self.trade_details, run_id=config.run_id, source="executed")
         raw_df = trade_points_to_frame(self.signals_raw, source="raw_rule")
         executed_df = trade_points_to_frame(self.signals_executed, source="executed")
+        skipped_df = skipped_signals_to_frame(self.skipped_signals, run_id=config.run_id)
         equity_df = equity_curve_to_frame(self.equity_curve, config.run_id)
         return persist_backtest_run(
             result=self, config=config,
             trades=trades_df, signals_raw=raw_df, signals_executed=executed_df,
+            skipped_signals=skipped_df,
             equity=equity_df,
             **overrides,
         )
@@ -381,6 +405,7 @@ class SchemeBacktester:
         initial_capital: float,
         verbose: bool,
         scheme: 'StrategyScheme' = None,
+        enable_entry_confidence_contract: bool = True,
     ) -> SchemeBacktestResult:
         """单股/少量股票回测：直接用信号规则驱动买卖模拟
 
@@ -523,6 +548,7 @@ class SchemeBacktester:
         trades_pnl: List[float] = []
         actual_trades: List[tuple] = []  # (symbol, TradePoint)
         trade_details: List[Dict] = []   # 每笔交易明细
+        skipped_signals: List[Dict] = [] # raw有信号但未执行的审计明细
 
         # 价格查找表：open + close
         open_lookup: Dict[str, Dict] = {}
@@ -794,7 +820,29 @@ class SchemeBacktester:
             ]
             return {f: str(getattr(source_tp, f, '') or '') for f in fields}
 
-        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False, signal_date=None, source_tp=None):
+        def _record_skipped_signal(sym, dt_key, tp, stage, note):
+            """记录 raw 信号未进入执行层的原因，不改变交易结果。"""
+            conf_audit = confidence_audit(float(getattr(tp, 'confidence', 0.0) or 0.0), getattr(tp, 'action', 'BUY'))
+            entry_audit = _entry_audit_from_source(tp)
+            skipped_signals.append({
+                'symbol': sym,
+                'signal_date': getattr(tp, 'date', '') or '',
+                'exec_date': dt_key,
+                'action': getattr(tp, 'action', ''),
+                'skip_stage': stage,
+                'skip_reason': note,
+                'reason': getattr(tp, 'reason', '') or '',
+                'rule_name': getattr(tp, 'rule_name', '') or '',
+                'signal_price': float(getattr(tp, 'price', 0.0) or 0.0),
+                'confidence': float(getattr(tp, 'confidence', 0.0) or 0.0),
+                'confidence_bucket': conf_audit['confidence_bucket'],
+                'confidence_action': conf_audit['confidence_action'],
+                'confidence_weight': conf_audit['confidence_weight'],
+                'confidence_note': conf_audit['confidence_note'],
+                **entry_audit,
+            })
+
+        def _buy(sym, dt_key, price, reason, rule_name, confidence=1.0, is_add=False, signal_date=None, source_tp=None, confidence_weight=None):
             """统一买入/加仓逻辑，含资金校验"""
             nonlocal cash, buy_count
             conf_audit = confidence_audit(confidence, "ADD" if is_add else "BUY")
@@ -816,7 +864,9 @@ class SchemeBacktester:
                 # 建仓
                 # ── 大盘择时仓位调制 ──
                 market_mult = market_timing.position_multiplier_on(dt_key) if market_timing else 0.78
-                alloc = min(cash * pos_pct_per_entry * market_mult, max_alloc)
+                weight = float(confidence_weight if confidence_weight is not None else conf_audit.get('confidence_weight', 1.0) or 0.0)
+                weight = max(0.0, min(1.0, weight))
+                alloc = min(cash * pos_pct_per_entry * market_mult * weight, max_alloc)
 
             shares = int(alloc / price / 100) * 100
             if shares <= 0:
@@ -1067,8 +1117,20 @@ class SchemeBacktester:
                             logger.info(f"  [{dt_key}] {sym} 已达最大加仓次数({max_add_times})")
                     else:
                         # 新建仓
+                        if enable_entry_confidence_contract:
+                            entry_ok, entry_weight, _, entry_note = evaluate_entry_confidence_contract(tp.confidence)
+                            if not entry_ok:
+                                _record_skipped_signal(sym, dt_key, tp, 'entry_confidence_contract', entry_note)
+                                if verbose:
+                                    logger.info(f"  [{dt_key}] {sym} {entry_note}")
+                                continue
+                            if verbose and entry_weight < 1.0:
+                                logger.info(f"  [{dt_key}] {sym} {entry_note}")
+                        else:
+                            entry_weight = 1.0
                         _buy(sym, dt_key, price, tp.reason or '信号买入', tp.rule_name or '信号买入',
-                             confidence=tp.confidence, signal_date=getattr(tp, 'date', None), source_tp=tp)
+                             confidence=tp.confidence, signal_date=getattr(tp, 'date', None), source_tp=tp,
+                             confidence_weight=entry_weight)
 
             # 3. 计算当日总权益
             total_value = cash
@@ -1221,6 +1283,7 @@ class SchemeBacktester:
             signals_executed=stock_signal_details,
             signals_raw=raw_signal_details,
             trade_details=trade_details,
+            skipped_signals=skipped_signals,
             data_source=data_source,
             data_adjust=data_adjust,
             data_version=data_version,
@@ -1269,6 +1332,7 @@ class SchemeBacktester:
         initial_capital: float = 1_000_000.0,
         verbose: bool = False,
         progress_callback=None,
+        enable_entry_confidence_contract: bool = True,
     ) -> SchemeBacktestResult:
         """运行方案回测
 
@@ -1282,6 +1346,7 @@ class SchemeBacktester:
             top_n: 每期选股数量
             initial_capital: 初始资金
             progress_callback: 进度回调 fn(step, total, msg)，用于 UI 进度条
+            enable_entry_confidence_contract: 是否启用开仓 confidence 执行契约；关闭仅用于 A/B 对比旧口径
         """
         # 0. 全池模式时应用股票配置过滤
         filter_report = ""
@@ -1318,6 +1383,7 @@ class SchemeBacktester:
                 factor_df, price_df, bt_dates, start_date, end_date,
                 lookback_days, initial_capital, verbose,
                 scheme=scheme,
+                enable_entry_confidence_contract=enable_entry_confidence_contract,
             )
             result.scheme_id = scheme.scheme_id
             result.scheme_name = scheme.name

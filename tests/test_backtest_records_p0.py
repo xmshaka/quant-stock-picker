@@ -612,6 +612,232 @@ def test_single_stock_signal_executes_next_day_open_and_records_signal_date(monk
     assert buy["exec_price"] == pytest.approx(10.50 * 1.002)
 
 
+def test_single_stock_watch_confidence_is_observe_only_not_executed(monkeypatch):
+    """开仓 confidence 执行契约：watch 信号只观察，不进入 executed/trades。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": dates,
+        "open": [10.00, 10.50, 10.80],
+        "high": [10.20, 10.80, 11.00],
+        "low": [9.90, 10.40, 10.70],
+        "close": [10.10, 10.70, 10.90],
+        "volume": [1_000_000] * 3,
+        "amount": [1_000_000_000] * 3,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="低置信度观察", confidence=0.49, price=10.10, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="balanced",
+        name="watch观察测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+    )
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+    )
+
+    assert result.trade_details == []
+    assert result.signals_executed.get("000001") == []
+    assert len(result.signals_raw["000001"]) == 1
+    assert result.signals_raw["000001"][0].confidence == pytest.approx(0.49)
+    assert len(result.skipped_signals) == 1
+    skipped = result.skipped_signals[0]
+    assert skipped["symbol"] == "000001"
+    assert skipped["signal_date"] == dates[0].date()
+    assert skipped["exec_date"] == dates[1].date()
+    assert skipped["skip_stage"] == "entry_confidence_contract"
+    assert "observe_only" in skipped["skip_reason"]
+    assert skipped["confidence_action"] == "observe_only"
+
+
+def test_single_stock_skipped_signals_persist_for_observe_only(monkeypatch, tmp_path):
+    """observe-only 跳过原因必须落盘，避免 raw/executed 差异不可解释。"""
+    import backtest.scheme_backtest as sb
+    from backtest.records import BacktestRunConfig, load_backtest_run
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": dates,
+        "open": [10.00, 10.50, 10.80],
+        "high": [10.20, 10.80, 11.00],
+        "low": [9.90, 10.40, 10.70],
+        "close": [10.10, 10.70, 10.90],
+        "volume": [1_000_000] * 3,
+        "amount": [1_000_000_000] * 3,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="低置信度观察", confidence=0.49, price=10.10, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="balanced",
+        name="watch观察落盘测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+    )
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+    )
+    result.run_id = "skip_observe_only_test"
+    config = BacktestRunConfig(
+        run_id=result.run_id,
+        scheme_id=scheme.scheme_id,
+        scheme_name=scheme.name,
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        lookback_days=3,
+        top_n=1,
+        initial_capital=1_000_000,
+    )
+    result.persist(config=config, root=tmp_path)
+
+    loaded = load_backtest_run(result.run_id, root=tmp_path)
+    skipped = loaded["skipped_signals"]
+    assert len(skipped) == 1
+    assert skipped.loc[0, "symbol"] == "000001"
+    assert skipped.loc[0, "skip_stage"] == "entry_confidence_contract"
+    assert skipped.loc[0, "confidence_action"] == "observe_only"
+    assert "observe_only" in skipped.loc[0, "skip_reason"]
+
+
+def test_single_stock_candidate_confidence_reduces_entry_size(monkeypatch):
+    """candidate 信号允许开仓但按 confidence_weight=0.5 降仓。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": dates,
+        "open": [10.00, 10.00, 10.00],
+        "high": [10.20, 10.20, 10.20],
+        "low": [9.90, 9.90, 9.90],
+        "close": [10.00, 10.00, 10.00],
+        "volume": [1_000_000] * 3,
+        "amount": [1_000_000_000] * 3,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="候选降仓", confidence=0.60, price=10.00, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="balanced",
+        name="candidate降仓测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        position_pct_per_entry=0.20,
+        max_single_pct=0.20,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+    )
+    result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+    )
+
+    buy = next(t for t in result.trade_details if t["action"] == "BUY")
+    assert buy["confidence_action"] == "reduced_or_pending"
+    assert buy["confidence_weight"] == pytest.approx(0.5)
+    # 无大盘择时时 market_mult=0.78；candidate 再乘 0.5。
+    expected_alloc = 1_000_000 * 0.20 * 0.78 * 0.5
+    expected_shares = int(expected_alloc / 10.00 / 100) * 100
+    assert buy["shares"] == expected_shares
+
+
+def test_entry_confidence_contract_can_be_disabled_for_ab_comparison(monkeypatch):
+    """A/B 对比旧口径：关闭开仓 confidence 契约时，watch BUY 仍按旧逻辑成交。"""
+    import backtest.scheme_backtest as sb
+
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"])
+    bars = pd.DataFrame({
+        "symbol": ["000001"] * 3,
+        "trade_date": dates,
+        "open": [10.00, 10.50, 10.80],
+        "high": [10.20, 10.80, 11.00],
+        "low": [9.90, 10.40, 10.70],
+        "close": [10.10, 10.70, 10.90],
+        "volume": [1_000_000] * 3,
+        "amount": [1_000_000_000] * 3,
+    })
+    monkeypatch.setattr(sb, "_fetch_ohlcv_for_backtest", lambda symbols, lookback_days, start_date=None, end_date=None, adjust="": bars.copy())
+    monkeypatch.setattr(
+        sb,
+        "evaluate_layered",
+        lambda sym_bars, strategy_type="balanced": [
+            TradePoint(date=dates[0].date(), action="BUY", reason="低置信度旧口径", confidence=0.49, price=10.10, rule_name="测试规则")
+        ],
+    )
+    scheme = StrategyScheme(
+        scheme_id="balanced",
+        name="confidence A/B 测试",
+        description="",
+        factor_weights={},
+        signal_rules=[],
+        regime_fit=["*"],
+        enable_market_timing=False,
+        max_add_times=0,
+        take_profit_atr_mult=100.0,
+        stop_loss_atr_mult=100.0,
+        trailing_atr_mult=100.0,
+    )
+
+    new_result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+        enable_entry_confidence_contract=True,
+    )
+    old_result = sb.SchemeBacktester().run(
+        scheme, factor_df=bars[["symbol", "trade_date"]].copy(), price_df=bars.copy(), factor_names=[],
+        symbols=["000001"], lookback_days=3, initial_capital=1_000_000,
+        enable_entry_confidence_contract=False,
+    )
+
+    assert new_result.trade_details == []
+    assert len(new_result.skipped_signals) == 1
+    old_buys = [t for t in old_result.trade_details if t["action"] == "BUY"]
+    assert len(old_buys) == 1
+    assert old_result.skipped_signals == []
+    assert old_buys[0]["confidence_action"] == "observe_only"
+
+
 def test_single_stock_repeated_buy_does_not_add_when_confidence_not_stronger(monkeypatch):
     """P5端到端：持仓中再次 BUY 但 confidence 未增强时，不应产生 ADD。"""
     import backtest.scheme_backtest as sb

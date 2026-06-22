@@ -357,8 +357,6 @@ class ResonanceChecker:
     def _strategy_buy_conditions(self, bars: pd.DataFrame, idx: int) -> Optional[List[ConditionResult]]:
         """生成策略专属 BUY 条件，与 `signals.scanner._check_layer3` key 对齐。"""
         scheme_id = self._scheme_id()
-        if scheme_id == "balanced":
-            return None
         if idx < 20 or bars is None or bars.empty or "close" not in bars:
             return []
 
@@ -380,42 +378,193 @@ class ResonanceChecker:
         pullback = 1 - current / high20 if high20 > 0 else 0.0
         range_pct = (float(prev.max()) - float(prev.min())) / float(prev.mean()) if len(prev) >= 5 and float(prev.mean()) > 0 else 1.0
 
+        # 获取资金流和相对换手数据
+        mf_vals = self._get_moneyflow_values(bars, idx)
+        to_vals = self._get_turnover_values(bars, idx)
+
         def cr(key: str, name: str, met: bool, value: float, threshold: float, direction: str, conf: float) -> ConditionResult:
             return ConditionResult(key, name, bool(met), float(value), float(threshold), direction, max(0.0, min(1.0, float(conf))))
 
-        if scheme_id == "trend_momentum":
+        if scheme_id == "balanced":
             conditions = [
-                cr("volume_expand", "放量确认", vol_ratio > 1.2, vol_ratio, 1.2, "above", 0.45 + (vol_ratio - 1.2) * 0.25),
+                # 资金流基础条件（提高置信度权重）
+                cr("main_net_mf_not_negative", "主力不净流出", mf_vals['main_net_mf_amount'] >= -10000, mf_vals['main_net_mf_amount'], -10000, "above", 0.6 + min(0.4, (mf_vals['main_net_mf_amount'] + 20000) / 30000)),
+                # 相对换手基础条件（提高置信度权重）
+                cr("relative_turnover_5d_not_low", "5日相对换手率不低", to_vals['relative_turnover_5d'] > 0.8, to_vals['relative_turnover_5d'], 0.8, "above", 0.6 + (to_vals['relative_turnover_5d'] - 0.8) * 2),
+                # 技术基础条件
                 cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
-                cr("near_high", "接近20日高点", current >= high20 * 0.95, current / high20 if high20 > 0 else 0, 0.95, "above", 0.45 + ((current / high20 - 0.95) * 5 if high20 > 0 else 0)),
-                cr("momentum_5d", "5日动量", mom5 > 0.01, mom5, 0.01, "above", 0.45 + mom5 * 5),
-                cr("momentum_20d", "20日动量", mom20 > 0.02, mom20, 0.02, "above", 0.45 + mom20 * 3),
-                cr("rsi_not_extreme", "RSI不过热", np.isfinite(rsi) and 45 <= rsi <= 75, rsi, 75, "below", 0.7 if np.isfinite(rsi) and 45 <= rsi <= 75 else 0.0),
+                cr("rsi_not_extreme", "RSI不过热", np.isfinite(rsi) and 40 <= rsi <= 70, rsi, 70, "below", 0.7 if np.isfinite(rsi) and 40 <= rsi <= 70 else 0.0),
+                cr("volume_expand", "放量", vol_ratio > 1.0, vol_ratio, 1.0, "above", 0.45 + (vol_ratio - 1) * 0.5),
+                cr("momentum_5d_positive", "5日动量为正", mom5 > 0.0, mom5, 0.0, "above", 0.45 + max(0.0, mom5) * 10),
+            ]
+        elif scheme_id == "trend_momentum":
+            # 趋势动量策略：优化逻辑以提高交易确定性
+            
+            # 1. 资金流确定性判断（不只是净流入，还要有质量）
+            mf_strong = mf_vals['large_elg_net_mf_amount'] > 50000  # 需要显著流入
+            mf_positive = mf_vals['main_net_mf_amount'] > 10000
+            mf_rank_good = mf_vals['large_elg_net_mf_rank'] > 0.7
+            
+            # 资金流综合置信度：强流入+高排名 = 高确定性
+            mf_confidence = (
+                0.4 * (1 if mf_strong else 0.2) +
+                0.3 * (1 if mf_positive else 0.2) +
+                0.3 * min(1.0, (mf_vals['large_elg_net_mf_rank'] - 0.5) * 2)
+            )
+            
+            # 2. 量能确定性判断（活跃但不异常）
+            turnover_normal = 1.0 < to_vals['relative_turnover_5d'] < 1.4
+            amount_healthy = 0.6 < to_vals['amount_percentile_60d'] < 0.85
+            volume_healthy = 1.1 < vol_ratio < 1.6
+            
+            # 量能综合置信度
+            volume_confidence = (
+                0.4 * (1 if turnover_normal else 0.3) +
+                0.3 * (1 if amount_healthy else 0.3) +
+                0.3 * (1 if volume_healthy else 0.3)
+            )
+            
+            # 3. 趋势确定性判断
+            momentum_strong = mom5 > 0.025 and mom20 > 0.04
+            ma_aligned = ma5 > ma20 * 1.02  # 显著高于
+            rsi_optimal = 55 < rsi < 68  # 强势但不超买
+            
+            trend_confidence = (
+                0.4 * min(1.0, mom5 * 15) +
+                0.3 * (1 if ma_aligned else 0.2) +
+                0.3 * (0.8 if rsi_optimal else 0.3)
+            )
+            
+            conditions = [
+                # 资金流条件（保持原key，优化逻辑）
+                cr("large_elg_net_mf_positive", "超大单显著流入", mf_strong,
+                   mf_vals['large_elg_net_mf_amount'], 50000, "above", mf_confidence * 0.4),
+                
+                cr("main_net_mf_positive", "主力净流入", mf_positive,
+                   mf_vals['main_net_mf_amount'], 10000, "above", mf_confidence * 0.3),
+                
+                cr("large_elg_net_mf_rank_high", "超大单流入排名高", mf_rank_good,
+                   mf_vals['large_elg_net_mf_rank'], 0.7, "above", mf_confidence * 0.3),
+                
+                # 量能条件
+                cr("relative_turnover_5d_high", "相对换手活跃", turnover_normal,
+                   to_vals['relative_turnover_5d'], 1.0, "above", volume_confidence * 0.4),
+                
+                cr("amount_percentile_60d_high", "成交额分位健康", amount_healthy,
+                   to_vals['amount_percentile_60d'], 0.6, "above", volume_confidence * 0.3),
+                
+                cr("volume_expand", "温和放量", volume_healthy,
+                   vol_ratio, 1.1, "above", volume_confidence * 0.3),
+                
+                # 趋势条件
+                cr("momentum_5d_strong", "5日动量强劲", momentum_strong,
+                   mom5, 0.025, "above", trend_confidence * 0.4),
+                
+                cr("momentum_20d_strong", "20日动量强劲", mom20 > 0.04,
+                   mom20, 0.04, "above", trend_confidence * 0.3),
+                
+                cr("ma5_above_ma20", "MA5显著高于MA20", ma_aligned,
+                   ma5 / ma20 if ma20 > 0 else 0, 1.02, "above", trend_confidence * 0.15),
+                
+                cr("rsi_not_extreme", "RSI强势区间", rsi_optimal,
+                   rsi, 68, "below", trend_confidence * 0.15),
             ]
         elif scheme_id == "pullback":
+            # 回调低吸策略：聚焦于高确定性健康回调
+            
+            # 1. 资金流确定性：回调中流出放缓或转正
+            mf_improving = mf_vals['main_net_mf_amount'] > -50000  # 流出不超过5万
+            elg_improving = mf_vals['large_elg_net_mf_amount'] > -100000  # 流出不超过10万
+            
+            # 资金流改善置信度
+            mf_confidence = (
+                0.5 * (1 if mf_improving else 0.3) +
+                0.5 * (1 if elg_improving else 0.3)
+            )
+            
+            # 2. 量能确定性：缩量回调，抛压减轻
+            turnover_calm = to_vals['relative_turnover_5d'] < 0.9
+            turnover_low_percentile = to_vals['turnover_percentile_60d'] < 0.4
+            volume_calm = vol_ratio < 1.0
+            
+            # 量能置信度
+            volume_confidence = (
+                0.4 * (1 if turnover_calm else 0.2) +
+                0.3 * (1 if turnover_low_percentile else 0.2) +
+                0.3 * (1 if volume_calm else 0.2)
+            )
+            
+            # 3. 技术确定性：关键支撑有效
+            healthy_pullback = 0.08 <= pullback <= 0.18  # 健康回调幅度
+            support_holding = current > low20 * 1.05  # 不破关键支撑
+            near_support_ma = ma20 > 0 and current / ma20 < 1.08  # 接近均线支撑
+            rsi_weak = np.isfinite(rsi) and rsi < 50  # RSI偏弱但不极端
+            
+            # 技术置信度
+            tech_confidence = (
+                0.3 * (1 if healthy_pullback else 0.2) +
+                0.3 * (1 if support_holding else 0.2) +
+                0.2 * (1 if near_support_ma else 0.2) +
+                0.2 * (0.8 if rsi_weak else 0.3)
+            )
+            
             conditions = [
-                cr("rsi_oversold", "RSI偏弱回调", np.isfinite(rsi) and rsi < 45, rsi, 45, "below", 0.45 + (45 - rsi) / 30 if np.isfinite(rsi) else 0.0),
-                cr("boll_lower", "布林低位", np.isfinite(boll_pos) and boll_pos < 0.35, boll_pos, 0.35, "below", 0.45 + (0.35 - boll_pos) if np.isfinite(boll_pos) else 0.0),
-                cr("pullback_range", "回撤区间", 0.05 <= pullback <= 0.15, pullback, 0.05, "above", 0.75 if 0.05 <= pullback <= 0.15 else 0.0),
-                cr("not_break_20d_low", "不破20日低点", current > low20 * 1.03, current / low20 if low20 > 0 else 0, 1.03, "above", 0.7 if current > low20 * 1.03 else 0.0),
-                cr("volume_calm", "缩量/温和量", vol_ratio < 1.1, vol_ratio, 1.1, "below", 0.75 if vol_ratio < 1.1 else 0.0),
-                cr("near_support", "未明显破位", idx == 0 or current >= float(close.iloc[idx - 1]) * 0.98, current / float(close.iloc[idx - 1]) if idx > 0 and close.iloc[idx - 1] > 0 else 1.0, 0.98, "above", 0.7),
+                # 资金流条件（保持原key，优化逻辑）
+                cr("main_net_mf_negative_improving", "主力流出改善", mf_improving,
+                   mf_vals['main_net_mf_amount'], -50000, "above", mf_confidence * 0.5),
+                
+                cr("large_elg_net_mf_negative_improving", "超大单流出改善", elg_improving,
+                   mf_vals['large_elg_net_mf_amount'], -100000, "above", mf_confidence * 0.5),
+                
+                # 量能条件
+                cr("relative_turnover_5d_low", "相对换手缩量", turnover_calm,
+                   to_vals['relative_turnover_5d'], 0.9, "below", volume_confidence * 0.4),
+                
+                cr("turnover_percentile_60d_low", "换手率分位低", turnover_low_percentile,
+                   to_vals['turnover_percentile_60d'], 0.4, "below", volume_confidence * 0.3),
+                
+                cr("volume_calm", "成交量温和", volume_calm,
+                   vol_ratio, 1.0, "below", volume_confidence * 0.3),
+                
+                # 技术条件
+                cr("pullback_range", "健康回调幅度", healthy_pullback,
+                   pullback, 0.08, "above", tech_confidence * 0.3),
+                
+                cr("not_break_20d_low", "不破关键支撑", support_holding,
+                   current / low20 if low20 > 0 else 0, 1.05, "above", tech_confidence * 0.3),
+                
+                cr("near_support", "接近均线支撑", near_support_ma,
+                   current / ma20 if ma20 > 0 else 0, 1.08, "below", tech_confidence * 0.2),
+                
+                cr("rsi_oversold", "RSI偏弱回调", rsi_weak,
+                   rsi, 50, "below", tech_confidence * 0.2),
+                
+                # 布林位置作为辅助确认
+                cr("boll_lower", "布林下轨附近", np.isfinite(boll_pos) and boll_pos < 0.4,
+                   boll_pos, 0.4, "below", 0.4 if np.isfinite(boll_pos) and boll_pos < 0.4 else 0.1),
             ]
         else:
             platform_high = float(prev.max()) if len(prev) >= 5 else high20
             conditions = [
+                # 资金流条件（突破需要强劲流入，提高置信度权重）
+                cr("large_elg_net_mf_positive_strong", "超大单净流入强劲", mf_vals['large_elg_net_mf_amount'] > 50000, mf_vals['large_elg_net_mf_amount'], 50000, "above", 0.6 + min(0.4, mf_vals['large_elg_net_mf_amount'] / 125000)),
+                cr("main_net_mf_positive_strong", "主力净流入强劲", mf_vals['main_net_mf_amount'] > 25000, mf_vals['main_net_mf_amount'], 25000, "above", 0.6 + min(0.4, mf_vals['main_net_mf_amount'] / 62500)),
+                # 相对换手条件（突破需要高换手，降低阈值）
+                cr("relative_turnover_5d_high", "5日相对换手率高", to_vals['relative_turnover_5d'] > 1.2, to_vals['relative_turnover_5d'], 1.2, "above", 0.45 + min(1.0, (to_vals['relative_turnover_5d'] - 1) * 2)),
+                cr("amount_percentile_60d_high", "60日成交额分位高", to_vals['amount_percentile_60d'] > 0.7, to_vals['amount_percentile_60d'], 0.7, "above", 0.45 + (to_vals['amount_percentile_60d'] - 0.6) * 2.5),
+                # 技术确认条件
                 cr("break_platform", "突破平台上沿", len(prev) >= 5 and current > platform_high * 1.01, current / platform_high if platform_high > 0 else 0, 1.01, "above", 0.45 + ((current / platform_high - 1.01) * 8 if platform_high > 0 else 0)),
                 cr("volume_surge", "量比放大", vol_ratio > 1.5, vol_ratio, 1.5, "above", 0.45 + (vol_ratio - 1.5) * 0.2),
                 cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
                 cr("narrow_range", "平台振幅收敛", range_pct < 0.08, range_pct, 0.08, "below", 0.75 if range_pct < 0.08 else 0.0),
-                cr("momentum_5d", "5日动量", mom5 > 0.01, mom5, 0.01, "above", 0.45 + mom5 * 5),
-                cr("boll_upper", "布林上半区", np.isfinite(boll_pos) and boll_pos > 0.6, boll_pos, 0.6, "above", 0.45 + (boll_pos - 0.6) if np.isfinite(boll_pos) else 0.0),
+                cr("momentum_5d_strong", "5日动量强", mom5 > 0.03, mom5, 0.03, "above", 0.45 + mom5 * 8),
+                cr("boll_upper_break", "突破布林上轨", np.isfinite(boll_pos) and boll_pos > 0.7, boll_pos, 0.7, "above", 0.45 + (boll_pos - 0.6) if np.isfinite(boll_pos) else 0.0),
             ]
         return self._filter_conditions(conditions, "buy")
 
     def check_buy(self, bars: pd.DataFrame, idx: int) -> Tuple[bool, List[ConditionResult]]:
         strategy_conditions = self._strategy_buy_conditions(bars, idx)
-        if strategy_conditions is not None:
+        if strategy_conditions and len(strategy_conditions) > 0:
             met_count = sum(1 for c in strategy_conditions if c.met)
             return met_count >= self.min_confirmations, strategy_conditions
 
@@ -543,6 +692,39 @@ class ResonanceChecker:
         return met_count >= self.min_confirmations, active
 
     # ── 工具方法 ──
+    @staticmethod
+    def _get_factor_value(bars: pd.DataFrame, idx: int, factor_name: str, default: float = np.nan) -> float:
+        """从 bars 获取指定因子值，支持新因子字段。"""
+        if factor_name in bars.columns:
+            try:
+                val = float(bars.iloc[idx][factor_name])
+                return val if np.isfinite(val) else default
+            except Exception:
+                return default
+        return default
+
+    @staticmethod
+    def _get_moneyflow_values(bars: pd.DataFrame, idx: int) -> dict:
+        """获取资金流相关因子值。"""
+        return {
+            'main_net_mf_amount': ResonanceChecker._get_factor_value(bars, idx, 'main_net_mf_amount', 0.0),
+            'large_elg_net_mf_amount': ResonanceChecker._get_factor_value(bars, idx, 'large_elg_net_mf_amount', 0.0),
+            'main_net_mf_pct_amount': ResonanceChecker._get_factor_value(bars, idx, 'main_net_mf_pct_amount', 0.0),
+            'large_elg_net_mf_pct_amount': ResonanceChecker._get_factor_value(bars, idx, 'large_elg_net_mf_pct_amount', 0.0),
+            'main_net_mf_rank': ResonanceChecker._get_factor_value(bars, idx, 'main_net_mf_rank', 0.5),
+            'large_elg_net_mf_rank': ResonanceChecker._get_factor_value(bars, idx, 'large_elg_net_mf_rank', 0.5),
+        }
+
+    @staticmethod
+    def _get_turnover_values(bars: pd.DataFrame, idx: int) -> dict:
+        """获取相对换手相关因子值。"""
+        return {
+            'relative_turnover_5d': ResonanceChecker._get_factor_value(bars, idx, 'relative_turnover_5d', 1.0),
+            'relative_turnover_20d': ResonanceChecker._get_factor_value(bars, idx, 'relative_turnover_20d', 1.0),
+            'turnover_percentile_60d': ResonanceChecker._get_factor_value(bars, idx, 'turnover_percentile_60d', 0.5),
+            'amount_percentile_60d': ResonanceChecker._get_factor_value(bars, idx, 'amount_percentile_60d', 0.5),
+        }
+
     @staticmethod
     def _calc_rsi(bars, idx, period=14):
         if idx < period: return np.nan
