@@ -386,17 +386,124 @@ class ResonanceChecker:
             return ConditionResult(key, name, bool(met), float(value), float(threshold), direction, max(0.0, min(1.0, float(conf))))
 
         if scheme_id == "balanced":
-            conditions = [
-                # 资金流基础条件（提高置信度权重）
-                cr("main_net_mf_not_negative", "主力不净流出", mf_vals['main_net_mf_amount'] >= -10000, mf_vals['main_net_mf_amount'], -10000, "above", 0.6 + min(0.4, (mf_vals['main_net_mf_amount'] + 20000) / 30000)),
-                # 相对换手基础条件（提高置信度权重）
-                cr("relative_turnover_5d_not_low", "5日相对换手率不低", to_vals['relative_turnover_5d'] > 0.8, to_vals['relative_turnover_5d'], 0.8, "above", 0.6 + (to_vals['relative_turnover_5d'] - 0.8) * 2),
-                # 技术基础条件
-                cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
-                cr("rsi_not_extreme", "RSI不过热", np.isfinite(rsi) and 40 <= rsi <= 70, rsi, 70, "below", 0.7 if np.isfinite(rsi) and 40 <= rsi <= 70 else 0.0),
-                cr("volume_expand", "放量", vol_ratio > 1.0, vol_ratio, 1.0, "above", 0.45 + (vol_ratio - 1) * 0.5),
-                cr("momentum_5d_positive", "5日动量为正", mom5 > 0.0, mom5, 0.0, "above", 0.45 + max(0.0, mom5) * 10),
-            ]
+            # balanced策略：作为组合器/路由器，评估哪个子策略最适合当前情况
+            
+            # 1. 评估各策略适用性
+            strategy_scores = {
+                'trend_momentum': 0,
+                'pullback': 0, 
+                'breakout': 0
+            }
+            
+            # 趋势动量策略适用性
+            if mf_vals['large_elg_net_mf_amount'] > 50000 and mf_vals['main_net_mf_amount'] > 25000:
+                strategy_scores['trend_momentum'] += 2
+            if mf_vals.get('large_elg_net_mf_rank', 0) > 0.7:
+                strategy_scores['trend_momentum'] += 1
+            if to_vals['relative_turnover_5d'] > 1.1 and to_vals['amount_percentile_60d'] > 0.6:
+                strategy_scores['trend_momentum'] += 1
+            if mom5 > 0.025 and mom20 > 0.04:
+                strategy_scores['trend_momentum'] += 1
+            if ma5 > ma20 * 1.02:
+                strategy_scores['trend_momentum'] += 1
+            if 55 < rsi < 68:
+                strategy_scores['trend_momentum'] += 1
+            
+            # 回调低吸策略适用性
+            if mf_vals['main_net_mf_amount'] > -50000 and mf_vals['large_elg_net_mf_amount'] > -100000:
+                strategy_scores['pullback'] += 2
+            if to_vals['relative_turnover_5d'] < 0.9 and to_vals['turnover_percentile_60d'] < 0.4:
+                strategy_scores['pullback'] += 1
+            if vol_ratio < 1.0:
+                strategy_scores['pullback'] += 1
+            if 0.08 <= pullback <= 0.18:
+                strategy_scores['pullback'] += 1
+            if current > low20 * 1.05:
+                strategy_scores['pullback'] += 1
+            if ma20 > 0 and current / ma20 < 1.08:
+                strategy_scores['pullback'] += 1
+            if rsi < 50:
+                strategy_scores['pullback'] += 1
+            
+            # 横盘突破策略适用性
+            if mf_vals['large_elg_net_mf_amount'] > 50000 and mf_vals['main_net_mf_amount'] > 30000:
+                strategy_scores['breakout'] += 2
+            if to_vals['relative_turnover_5d'] > 1.2 and to_vals['amount_percentile_60d'] > 0.7:
+                strategy_scores['breakout'] += 1
+            if vol_ratio > 1.4:
+                strategy_scores['breakout'] += 1
+            if len(prev) >= 5 and current > float(prev.max()) * 1.015:
+                strategy_scores['breakout'] += 1
+            if range_pct < 0.10:
+                strategy_scores['breakout'] += 1
+            if mom5 > 0.03:
+                strategy_scores['breakout'] += 1
+            if ma5 > ma20 * 1.02:
+                strategy_scores['breakout'] += 1
+            if np.isfinite(boll_pos) and boll_pos > 0.7:
+                strategy_scores['breakout'] += 1
+            
+            # 2. 选择最佳策略
+            best_strategy = max(strategy_scores.items(), key=lambda x: x[1])
+            best_strategy_name, best_score = best_strategy
+            
+            # 3. 基于最佳策略生成基础条件
+            conditions = []
+            
+            if best_score > 2:  # 需要足够高的分数才生成信号
+                # 基础条件（与配置保持一致）
+                conditions.append(cr(
+                    "main_net_mf_not_negative", "主力不净流出", 
+                    mf_vals['main_net_mf_amount'] > -20000,
+                    mf_vals['main_net_mf_amount'], -20000, "above", 
+                    0.5 + min(0.5, (mf_vals['main_net_mf_amount'] + 30000) / 50000)
+                ))
+                
+                conditions.append(cr(
+                    "relative_turnover_5d_not_low", "5日相对换手率不低", 
+                    to_vals['relative_turnover_5d'] > 0.8,
+                    to_vals['relative_turnover_5d'], 0.8, "above",
+                    0.5 + min(0.5, (to_vals['relative_turnover_5d'] - 0.8) * 2)
+                ))
+                
+                conditions.append(cr(
+                    "ma5_above_ma20", "MA5高于MA20", 
+                    ma5 > ma20,
+                    ma5 / ma20 if ma20 > 0 else 0, 1.0, "above",
+                    0.6 + min(0.4, (ma5 / ma20 - 1) * 10 if ma20 > 0 else 0.0)
+                ))
+                
+                conditions.append(cr(
+                    "rsi_not_extreme", "RSI不过热", 
+                    rsi < 70,
+                    rsi, 70, "below",
+                    0.6 + min(0.4, (70 - rsi) / 30 if rsi < 70 else 0.0)
+                ))
+                
+                conditions.append(cr(
+                    "volume_expand", "放量", 
+                    vol_ratio > 1.0,
+                    vol_ratio, 1.0, "above",
+                    0.5 + min(0.5, (vol_ratio - 1) * 0.5)
+                ))
+                
+                conditions.append(cr(
+                    "momentum_5d_positive", "5日动量为正", 
+                    mom5 > 0,
+                    mom5, 0, "above",
+                    0.5 + min(0.5, mom5 * 10)
+                ))
+                
+                # 策略选择审计字段
+                conditions.append(cr(
+                    "strategy_selection", f"策略选择:{best_strategy_name}({best_score})", 
+                    True,
+                    best_score, 0, "above", 
+                    min(1.0, best_score / 8)
+                ))
+            else:
+                # 没有策略适合，不生成信号
+                conditions = []
         elif scheme_id == "trend_momentum":
             # 趋势动量策略：优化逻辑以提高交易确定性
             
@@ -544,21 +651,80 @@ class ResonanceChecker:
                    boll_pos, 0.4, "below", 0.4 if np.isfinite(boll_pos) and boll_pos < 0.4 else 0.1),
             ]
         else:
+            # 横盘突破策略：聚焦于高确定性真突破
             platform_high = float(prev.max()) if len(prev) >= 5 else high20
+            
+            # 1. 资金流确定性：突破需要显著流入
+            mf_breakout_strong = mf_vals['large_elg_net_mf_amount'] > 50000  # 显著流入
+            mf_main_strong = mf_vals['main_net_mf_amount'] > 30000
+            
+            # 资金流置信度
+            mf_breakout_confidence = (
+                0.5 * (1 if mf_breakout_strong else 0.2) +
+                0.5 * (1 if mf_main_strong else 0.2)
+            )
+            
+            # 2. 量能确定性：突破需要活跃量能
+            turnover_surge = to_vals['relative_turnover_5d'] > 1.2
+            amount_high_percentile = to_vals['amount_percentile_60d'] > 0.7
+            volume_surge = vol_ratio > 1.4
+            
+            # 量能置信度
+            volume_breakout_confidence = (
+                0.4 * (1 if turnover_surge else 0.2) +
+                0.3 * (1 if amount_high_percentile else 0.2) +
+                0.3 * (1 if volume_surge else 0.2)
+            )
+            
+            # 3. 突破确定性：突破确认
+            true_breakout = len(prev) >= 5 and current > platform_high * 1.015  # 突破确认
+            consolidation = range_pct < 0.10  # 平台整理
+            momentum_breakout = mom5 > 0.03  # 突破动量
+            ma_aligned_breakout = ma5 > ma20 * 1.02  # 均线多头
+            boll_breakout = np.isfinite(boll_pos) and boll_pos > 0.7  # 布林上轨附近
+            
+            # 突破置信度
+            breakout_confidence = (
+                0.3 * (1 if true_breakout else 0.2) +
+                0.2 * (1 if consolidation else 0.2) +
+                0.2 * min(1.0, mom5 * 15) +
+                0.15 * (1 if ma_aligned_breakout else 0.2) +
+                0.15 * (0.8 if boll_breakout else 0.2)
+            )
+            
             conditions = [
-                # 资金流条件（突破需要强劲流入，提高置信度权重）
-                cr("large_elg_net_mf_positive_strong", "超大单净流入强劲", mf_vals['large_elg_net_mf_amount'] > 50000, mf_vals['large_elg_net_mf_amount'], 50000, "above", 0.6 + min(0.4, mf_vals['large_elg_net_mf_amount'] / 125000)),
-                cr("main_net_mf_positive_strong", "主力净流入强劲", mf_vals['main_net_mf_amount'] > 25000, mf_vals['main_net_mf_amount'], 25000, "above", 0.6 + min(0.4, mf_vals['main_net_mf_amount'] / 62500)),
-                # 相对换手条件（突破需要高换手，降低阈值）
-                cr("relative_turnover_5d_high", "5日相对换手率高", to_vals['relative_turnover_5d'] > 1.2, to_vals['relative_turnover_5d'], 1.2, "above", 0.45 + min(1.0, (to_vals['relative_turnover_5d'] - 1) * 2)),
-                cr("amount_percentile_60d_high", "60日成交额分位高", to_vals['amount_percentile_60d'] > 0.7, to_vals['amount_percentile_60d'], 0.7, "above", 0.45 + (to_vals['amount_percentile_60d'] - 0.6) * 2.5),
-                # 技术确认条件
-                cr("break_platform", "突破平台上沿", len(prev) >= 5 and current > platform_high * 1.01, current / platform_high if platform_high > 0 else 0, 1.01, "above", 0.45 + ((current / platform_high - 1.01) * 8 if platform_high > 0 else 0)),
-                cr("volume_surge", "量比放大", vol_ratio > 1.5, vol_ratio, 1.5, "above", 0.45 + (vol_ratio - 1.5) * 0.2),
-                cr("ma5_above_ma20", "MA5高于MA20", ma5 > ma20, ma5 / ma20 if ma20 > 0 else 0, 1.0, "above", 0.45 + ((ma5 / ma20 - 1) * 20 if ma20 > 0 else 0)),
-                cr("narrow_range", "平台振幅收敛", range_pct < 0.08, range_pct, 0.08, "below", 0.75 if range_pct < 0.08 else 0.0),
-                cr("momentum_5d_strong", "5日动量强", mom5 > 0.03, mom5, 0.03, "above", 0.45 + mom5 * 8),
-                cr("boll_upper_break", "突破布林上轨", np.isfinite(boll_pos) and boll_pos > 0.7, boll_pos, 0.7, "above", 0.45 + (boll_pos - 0.6) if np.isfinite(boll_pos) else 0.0),
+                # 资金流条件
+                cr("large_elg_net_mf_positive_strong", "超大单显著流入", mf_breakout_strong,
+                   mf_vals['large_elg_net_mf_amount'], 50000, "above", mf_breakout_confidence * 0.5),
+                
+                cr("main_net_mf_positive_strong", "主力显著流入", mf_main_strong,
+                   mf_vals['main_net_mf_amount'], 30000, "above", mf_breakout_confidence * 0.5),
+                
+                # 量能条件
+                cr("relative_turnover_5d_high", "相对换手活跃", turnover_surge,
+                   to_vals['relative_turnover_5d'], 1.2, "above", volume_breakout_confidence * 0.4),
+                
+                cr("amount_percentile_60d_high", "成交额分位较高", amount_high_percentile,
+                   to_vals['amount_percentile_60d'], 0.7, "above", volume_breakout_confidence * 0.3),
+                
+                cr("volume_surge", "量比放大", volume_surge,
+                   vol_ratio, 1.4, "above", volume_breakout_confidence * 0.3),
+                
+                # 突破条件
+                cr("break_platform", "突破平台上沿", true_breakout,
+                   current / platform_high if platform_high > 0 else 0, 1.015, "above", breakout_confidence * 0.3),
+                
+                cr("narrow_range", "平台整理", consolidation,
+                   range_pct, 0.10, "below", breakout_confidence * 0.2),
+                
+                cr("momentum_5d_strong", "突破动量", momentum_breakout,
+                   mom5, 0.03, "above", breakout_confidence * 0.2),
+                
+                cr("ma5_above_ma20", "均线多头", ma_aligned_breakout,
+                   ma5 / ma20 if ma20 > 0 else 0, 1.02, "above", breakout_confidence * 0.15),
+                
+                cr("boll_upper_break", "布林上轨附近", boll_breakout,
+                   boll_pos, 0.7, "above", breakout_confidence * 0.15),
             ]
         return self._filter_conditions(conditions, "buy")
 
