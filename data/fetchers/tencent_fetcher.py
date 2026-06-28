@@ -57,10 +57,18 @@ class TencentFetcher(BaseFetcher):
     # ── 内部工具 ──
     def _symbol_to_tencent(self, symbol: str) -> str:
         """将纯数字代码转为腾讯格式 (sh/sz前缀)
+        支持格式: 600519, 600519.SH, sh600519
         如 600519 -> sh600519, 000858 -> sz000858
         港股 00700 -> hk00700
         """
         s = symbol.strip().lower()
+        
+        # 去掉.SH/.SZ后缀
+        if s.endswith('.sh'):
+            s = s[:-3]
+        elif s.endswith('.sz'):
+            s = s[:-3]
+        
         if s.startswith(("sh", "sz", "hk", "us")):
             return s
         if s.startswith(("60", "68", "51", "52")):

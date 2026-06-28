@@ -98,6 +98,80 @@ class FactorValue(Base):
     beta = Column(Float, comment="Beta值")
     max_drawdown_60d = Column(Float, comment="60日最大回撤")
     
+    # 资金流因子（新增）
+    main_net_mf_amount = Column(Float, comment="主力净流入金额(万元)")
+    large_net_mf_amount = Column(Float, comment="大单净流入金额(万元)")
+    elg_net_mf_amount = Column(Float, comment="超大单净流入金额(万元)")
+    large_elg_net_mf_amount = Column(Float, comment="大单+超大单净流入(万元)")
+    main_net_mf_pct_amount = Column(Float, comment="主力净流入占成交额比例")
+    large_elg_net_mf_pct_amount = Column(Float, comment="大单+超大单净流入占成交额比例")
+    main_net_mf_rank = Column(Float, comment="主力净流入比例排名(0-1)")
+    large_elg_net_mf_rank = Column(Float, comment="大单+超大单净流入比例排名(0-1)")
+    
+    # 相对换手率因子（新增）
+    relative_turnover_5d = Column(Float, comment="5日相对换手率")
+    relative_turnover_20d = Column(Float, comment="20日相对换手率")
+    turnover_percentile_60d = Column(Float, comment="60日换手率分位")
+    amount_percentile_60d = Column(Float, comment="60日成交额分位")
+    
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_date", name="uix_symbol_date_factor"),
+        Index("idx_symbol_date", "symbol", "trade_date"),
+        Index("idx_trade_date", "trade_date"),
+    )
+
+
+class MoneyFlow(Base):
+    """资金流原始数据表 - Tushare moneyflow数据"""
+    __tablename__ = "moneyflow"
+    
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts_code = Column(String(20), nullable=False, comment="TS代码")
+    symbol = Column(String(10), nullable=False, comment="股票代码(6位)")
+    trade_date = Column(String(8), nullable=False, comment="交易日期YYYYMMDD")
+    
+    # 小单
+    buy_sm_vol = Column(BigInteger, comment="小单买入成交量(手)")
+    buy_sm_amount = Column(Float, comment="小单买入成交额(万元)")
+    sell_sm_vol = Column(BigInteger, comment="小单卖出成交量(手)")
+    sell_sm_amount = Column(Float, comment="小单卖出成交额(万元)")
+    
+    # 中单
+    buy_md_vol = Column(BigInteger, comment="中单买入成交量(手)")
+    buy_md_amount = Column(Float, comment="中单买入成交额(万元)")
+    sell_md_vol = Column(BigInteger, comment="中单卖出成交量(手)")
+    sell_md_amount = Column(Float, comment="中单卖出成交额(万元)")
+    
+    # 大单
+    buy_lg_vol = Column(BigInteger, comment="大单买入成交量(手)")
+    buy_lg_amount = Column(Float, comment="大单买入成交额(万元)")
+    sell_lg_vol = Column(BigInteger, comment="大单卖出成交量(手)")
+    sell_lg_amount = Column(Float, comment="大单卖出成交额(万元)")
+    
+    # 超大单
+    buy_elg_vol = Column(BigInteger, comment="超大单买入成交量(手)")
+    buy_elg_amount = Column(Float, comment="超大单买入成交额(万元)")
+    sell_elg_vol = Column(BigInteger, comment="超大单卖出成交量(手)")
+    sell_elg_amount = Column(Float, comment="超大单卖出成交额(万元)")
+    
+    # 合计
+    net_mf_vol = Column(BigInteger, comment="净流入成交量(手)")
+    net_mf_amount = Column(Float, comment="净流入成交额(万元)")
+    
+    source = Column(String(20), comment="数据来源", default="tushare")
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_date", "source", name="uix_moneyflow_symbol_date_source"),
+        Index("idx_moneyflow_symbol_date", "symbol", "trade_date"),
+        Index("idx_moneyflow_date", "trade_date"),
+        Index("idx_moneyflow_source", "source"),
+    )
+
     # 流动性因子
     turnover_20d = Column(Float, comment="20日均换手")
     amt_per_cap = Column(Float, comment="流通市值换手率")

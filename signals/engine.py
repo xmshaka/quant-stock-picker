@@ -63,6 +63,7 @@ class SignalEngine:
     """信号生成引擎 - 支持行情分类自适应"""
 
     # 已废弃的因子（快照中可能残留，但不再参与打分）
+# TODO: margin_change已废弃，考虑移除引用  # [已移除 20260627_172424]
     DEPRECATED_FACTORS = {'boll_width', 'margin_change'}
 
     # 行情分类阈值

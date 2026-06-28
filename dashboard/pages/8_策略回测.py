@@ -6,6 +6,9 @@ from copy import deepcopy
 from dataclasses import fields
 import streamlit as st
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 from data_loader import load_data, FACTOR_NAME_MAP, NAME_MAP
 from strategy.registry import SchemeRegistry
@@ -23,7 +26,7 @@ inject_theme()
 # ========== 数据 ==========
 @st.cache_data(ttl=300, show_spinner=False)
 def get_data(n_stocks=200):
-    return load_data(data_source="real", n_stocks=n_stocks, n_days=252)
+    return load_data(data_source="real", prefer_snapshot=True, n_stocks=n_stocks, n_days=252)
 
 registry = SchemeRegistry()
 schemes = registry.list_all()
@@ -479,6 +482,7 @@ if "bt_result" in st.session_state:
         compare_progress = st.progress(0)
         compare_status = st.empty()
         all_results = []
+        all_saved_paths = []
         for i, scheme in enumerate(all_schemes):
             compare_status.caption(f"回测 [{scheme.name}] ({i+1}/{len(all_schemes)})...")
             backtester = SchemeBacktester()
@@ -487,12 +491,108 @@ if "bt_result" in st.session_state:
                 factor_names=factor_names, symbols=custom_symbols,
                 lookback_days=lookback, top_n=top_n, initial_capital=capital,
             )
+            
+            # 新增：保存回测记录到标准回测目录
+            try:
+                # 使用与单个回测相同的配置，确保一致性
+                scheme_snapshot = scheme_audit_snapshot(scheme)
+                config = BacktestRunConfig(
+                    run_id=result.run_id,
+                    scheme_id=scheme.scheme_id,
+                    scheme_name=scheme.name,
+                    start_date=result.start_date,
+                    end_date=result.end_date,
+                    lookback_days=lookback,
+                    top_n=top_n,
+                    initial_capital=capital,
+                    pool_mode=pool_mode,
+                    symbols=custom_symbols or [],
+                    cost={
+                        "commission": 0.00025,
+                        "stamp_duty": 0.001,
+                        "transfer_fee": 0.00001,
+                        "slippage": 0.002,
+                    },
+                    risk={"single_position_cap": 0.20, "total_position_cap": 0.90},
+                    scheme_config=scheme_snapshot["scheme_config"],
+                    resonance_config=scheme_snapshot["resonance_config"],
+                )
+                saved_path = result.persist(config=config)
+                all_saved_paths.append(saved_path)
+                compare_status.caption(f"回测 [{scheme.name}] ({i+1}/{len(all_schemes)})... 已保存到: {saved_path.name}")
+                logger.info(f"[Compare] 已保存回测记录: {saved_path}")
+            except Exception as e:
+                logger.warning(f"[Compare] 保存回测记录失败: {e}")
+                compare_status.caption(f"回测 [{scheme.name}] ({i+1}/{len(all_schemes)})... 保存失败: {e}")
+            
             all_results.append(result)
             compare_progress.progress((i + 1) / len(all_schemes))
+        
+        # 记录保存结果统计
+        if all_saved_paths:
+            saved_count = len(all_saved_paths)
+            compare_status.caption(f"✅ 对比完成，已保存 {saved_count}/{len(all_schemes)} 个回测记录")
+        else:
+            compare_status.caption(f"✅ 对比完成，但未保存任何回测记录")
         compare_status.caption("✅ 对比完成")
         all_results.sort(key=lambda r: r.total_return, reverse=True)
         st.session_state.bt_compare = all_results
         st.session_state.bt_compare_signature = current_context_signature
+        
+        # 自动保存对比结果到文件
+        try:
+            import json
+            from datetime import datetime
+            from pathlib import Path
+            
+            # 创建保存目录
+            compare_dir = Path("data/compare_results")
+            compare_dir.mkdir(exist_ok=True)
+            
+            # 生成文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            symbols_str = "_" + "_".join(current_context_signature["symbols"]) if current_context_signature["symbols"] else "_全池"
+            filename = f"compare_{timestamp}{symbols_str}.json"
+            filepath = compare_dir / filename
+            
+            # 准备保存数据
+            save_data = {
+                "timestamp": datetime.now().isoformat(),
+                "context": current_context_signature,
+                "results": []
+            }
+            
+            for result in all_results:
+                result_data = {
+                    "scheme_id": result.scheme_id,
+                    "scheme_name": result.scheme_name,
+                    "total_return": result.total_return,
+                    "annual_return": result.annual_return,
+                    "sharpe_ratio": result.sharpe_ratio,
+                    "max_drawdown": result.max_drawdown,
+                    "win_rate": result.win_rate,
+                    "trade_count": result.trade_count,
+                    "buy_count": result.buy_count,
+                    "sell_count": result.sell_count,
+                    "final_value": result.final_value,
+                    "start_date": result.start_date,
+                    "end_date": result.end_date,
+                    "run_id": result.run_id if hasattr(result, 'run_id') else "",
+                    "has_signals": result.trade_count > 0
+                }
+                save_data["results"].append(result_data)
+            
+            # 保存到文件
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            
+            # 显示保存成功消息
+            compare_status.caption(f"✅ 对比完成，已保存到: {filepath}")
+            st.success(f"对比结果已保存到文件: {filepath}")
+            
+        except Exception as e:
+            st.warning(f"保存对比结果时出错: {e}")
+            compare_status.caption(f"✅ 对比完成（保存失败: {e}）")
 
     if "bt_compare" in st.session_state and st.session_state.get("bt_compare_signature") == current_context_signature:
         section_header("方案对比")
@@ -514,6 +614,10 @@ if "bt_result" in st.session_state:
                 "交易": r.trade_summary,
             })
         st.dataframe(pd.DataFrame(compare_data), width="stretch", hide_index=True)
+        
+        # 显示保存的文件位置
+        if "bt_compare_save_path" in st.session_state:
+            st.caption(f"📁 对比结果已保存到: {st.session_state.bt_compare_save_path}")
 
 else:
     empty_state("📈", "点击「运行回测」开始")

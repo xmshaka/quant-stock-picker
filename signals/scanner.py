@@ -402,37 +402,80 @@ def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_
     vol_ratio = _num(row.get("volume_ratio"), 1.0)
     mom5 = current / float(close.iloc[-6]) - 1 if len(close) >= 6 and close.iloc[-6] > 0 else 0.0
     mom20 = current / float(close.iloc[-21]) - 1 if len(close) >= 21 and close.iloc[-21] > 0 else 0.0
-
+    
+    # 获取资金流和相对换手因子
+    main_mf_amount = _num(row.get("main_net_mf_amount"), 0.0)
+    large_elg_mf_amount = _num(row.get("large_elg_net_mf_amount"), 0.0)
+    main_mf_rank = _num(row.get("main_net_mf_rank"), 0.0)
+    large_elg_mf_rank = _num(row.get("large_elg_net_mf_rank"), 0.0)
+    relative_turnover_5d = _num(row.get("relative_turnover_5d"), 1.0)
+    amount_percentile_60d = _num(row.get("amount_percentile_60d"), 0.0)
+    turnover_percentile_60d = _num(row.get("turnover_percentile_60d"), 0.0)
+    
     checks: List[Tuple[str, bool, str]]
     if scheme_id == "trend_momentum":
         checks = [
-            ("volume_expand", vol_ratio > 1.3, f"放量{vol_ratio:.1f}x"),
-            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
-            ("near_high", pb <= 0.05, f"接近20日高点{pb:.1%}"),
-            ("momentum_5d", mom5 > 0.01, f"M5={mom5:.1%}"),
-            ("momentum_20d", mom20 > 0.02, f"M20={mom20:.1%}"),
-            ("rsi_not_extreme", np.isnan(rsi) or rsi < 85, f"RSI未极端{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            # 资金流条件
+            ("large_elg_net_mf_positive", large_elg_mf_amount > 50000, f"超大单净流入{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive", main_mf_amount > 10000, f"主力净流入{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_rank_high", large_elg_mf_rank > 0.7, f"超大单流入排名{large_elg_mf_rank:.2f}"),
+            # 相对换手条件
+            ("relative_turnover_5d_high", 1.0 < relative_turnover_5d < 1.4, f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", 0.6 < amount_percentile_60d < 0.85, f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_expand", 1.1 < vol_ratio < 1.6, f"温和放量{vol_ratio:.1f}x"),
+            # 趋势条件
+            ("momentum_5d_strong", mom5 > 0.025, f"5日动量{mom5:.1%}"),
+            ("momentum_20d_strong", mom20 > 0.04, f"20日动量{mom20:.1%}"),
+            ("ma5_above_ma20", ma5 > ma20 * 1.02, "MA5显著高于MA20"),
+            ("rsi_not_extreme", 55 < rsi < 68, f"RSI强势区间{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
         ]
     elif scheme_id == "pullback":
         checks = [
+            # 资金流条件
+            ("main_net_mf_negative_improving", main_mf_amount > -50000, f"主力净流出改善{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_negative_improving", large_elg_mf_amount > -100000, f"超大单净流出改善{large_elg_mf_amount/10000:.1f}万"),
+            # 相对换手条件
+            ("relative_turnover_5d_low", relative_turnover_5d < 0.9, f"相对换手{relative_turnover_5d:.2f}x"),
+            ("turnover_percentile_60d_low", turnover_percentile_60d < 0.4, f"换手率分位{turnover_percentile_60d:.2f}"),
+            ("volume_calm", vol_ratio < 1.0, f"缩量{vol_ratio:.1f}x"),
+            # 技术条件
             ("rsi_oversold", not np.isnan(rsi) and rsi < 45, f"RSI={rsi:.0f}"),
             ("boll_lower", not np.isnan(boll01) and boll01 < 0.35, f"布林位置{boll01:.2f}"),
             ("pullback_range", 0.05 <= pb <= 0.15, f"回撤{pb:.1%}"),
             ("not_break_20d_low", current > close.iloc[-20:].min() * 1.03, "不破20日低点"),
-            ("volume_calm", vol_ratio < 1.1, f"缩量/温和量比{vol_ratio:.1f}x"),
             ("near_support", current >= close.iloc[-1] * 0.98, "当日未明显破位"),
         ]
-    else:
+    elif scheme_id == "breakout":
         prev = close.iloc[-15:-5]
         range_pct = (prev.max() - prev.min()) / prev.mean() if len(prev) >= 5 and prev.mean() > 0 else 1.0
         checks = [
+            # 资金流条件
+            ("large_elg_net_mf_positive_strong", large_elg_mf_amount > 50000, f"超大单净流入强劲{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive_strong", main_mf_amount > 30000, f"主力净流入强劲{main_mf_amount/10000:.1f}万"),
+            # 相对换手条件
+            ("relative_turnover_5d_high", relative_turnover_5d > 1.2, f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", amount_percentile_60d > 0.7, f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_surge", vol_ratio > 1.4, f"量比{vol_ratio:.1f}x"),
+            # 突破条件
             ("break_platform", len(prev) >= 5 and current > float(prev.max()) * 1.01, "突破平台上沿"),
-            ("volume_surge", vol_ratio > 1.5, f"量比{vol_ratio:.1f}x"),
-            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
-            ("narrow_range", range_pct < 0.08, f"平台振幅{range_pct:.1%}"),
-            ("momentum_5d", mom5 > 0.01, f"M5={mom5:.1%}"),
-            ("boll_upper", not np.isnan(boll01) and boll01 > 0.6, f"布林上沿{boll01:.2f}"),
+            ("ma5_above_ma20", ma5 > ma20 * 1.02, "MA5显著高于MA20"),
+            ("narrow_range", range_pct < 0.10, f"平台振幅{range_pct:.1%}"),
+            ("momentum_5d_strong", mom5 > 0.03, f"5日动量{mom5:.1%}"),
+            ("boll_upper_break", not np.isnan(boll01) and boll01 > 0.7, f"布林上沿突破{boll01:.2f}"),
         ]
+    else:  # balanced
+        checks = [
+            # 资金流基础条件
+            ("main_net_mf_not_negative", main_mf_amount > -20000, f"主力不净流出{main_mf_amount/10000:.1f}万"),
+            # 相对换手基础条件
+            ("relative_turnover_5d_not_low", relative_turnover_5d > 0.8, f"相对换手{relative_turnover_5d:.2f}x"),
+            # 技术基础条件
+            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
+            ("rsi_not_extreme", np.isnan(rsi) or rsi < 70, f"RSI不过热{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("volume_expand", vol_ratio > 1.0, f"放量{vol_ratio:.1f}x"),
+            ("momentum_5d_positive", mom5 > 0, f"5日动量{mom5:.1%}"),
+        ]
+    
     cfg = resonance_config or _resonance_config(scheme_id)
     enabled = set(cfg.buy_conditions or [])
     active = [item for item in checks if not enabled or item[0] in enabled]

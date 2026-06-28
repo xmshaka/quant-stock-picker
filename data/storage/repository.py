@@ -553,3 +553,200 @@ def backtest_repo() -> BacktestRepository:
     if _backtest_repo is None:
         _backtest_repo = BacktestRepository()
     return _backtest_repo
+
+
+# ── MoneyFlow 相关方法（添加到StockRepository） ──
+def add_moneyflow_methods_to_stock_repository():
+    """动态添加资金流数据方法到StockRepository"""
+    from .models import MoneyFlow
+    
+    def save_moneyflow(self, df: pd.DataFrame, source: str = "tushare", chunk_size: int = 2000) -> int:
+        """批量保存资金流数据（简化版本）
+        
+        Args:
+            df: 包含资金流数据的DataFrame
+            source: 数据来源
+            chunk_size: 分批大小
+        
+        Returns:
+            实际写入行数
+        """
+        if df is None or df.empty:
+            return 0
+        
+        # 准备数据
+        df_clean = df.copy()
+        
+        # 确保有symbol字段（从ts_code提取）
+        if "symbol" not in df_clean.columns and "ts_code" in df_clean.columns:
+            df_clean["symbol"] = df_clean["ts_code"].str.slice(0, 6)
+        
+        # 确保有source字段
+        df_clean["source"] = source
+        
+        # 选择需要的字段
+        table_cols = {c.name for c in MoneyFlow.__table__.columns} - {"id", "created_at", "updated_at"}
+        cols = [c for c in df_clean.columns if c in table_cols]
+        
+        if "symbol" not in cols or "trade_date" not in cols:
+            logger.warning("[Repo] save_moneyflow: 缺少 symbol/trade_date, 跳过")
+            return 0
+        
+        # 去重
+        df_clean = df_clean[cols].drop_duplicates(
+            subset=["symbol", "trade_date", "source"], 
+            keep="last"
+        ).where(pd.notna(df_clean[cols]), None)
+        
+        total = 0
+        
+        with self.session() as s:
+            # 分批插入
+            for i in range(0, len(df_clean), chunk_size):
+                chunk_df = df_clean.iloc[i:i+chunk_size]
+                
+                # 转换为字典列表
+                records = chunk_df.to_dict('records')
+                
+                # 批量插入
+                for record in records:
+                    try:
+                        # 检查是否已存在
+                        existing = s.query(MoneyFlow).filter(
+                            MoneyFlow.symbol == record.get('symbol'),
+                            MoneyFlow.trade_date == record.get('trade_date'),
+                            MoneyFlow.source == record.get('source', source)
+                        ).first()
+                        
+                        if existing:
+                            # 更新现有记录
+                            for key, value in record.items():
+                                if key not in ['symbol', 'trade_date', 'source'] and value is not None:
+                                    setattr(existing, key, value)
+                        else:
+                            # 创建新记录
+                            moneyflow = MoneyFlow(**record)
+                            s.add(moneyflow)
+                        
+                        total += 1
+                        
+                        # 每500条提交一次
+                        if total % 500 == 0:
+                            s.commit()
+                    
+                    except Exception as e:
+                        logger.warning(f"保存资金流记录失败: {e}")
+                        s.rollback()
+                
+                # 提交剩余记录
+                s.commit()
+        
+        logger.info(f"[Repo] 保存资金流 {total} 条 (source={source})")
+        return total
+    
+    def get_moneyflow_by_dates(self, trade_dates: List[str], symbols: Optional[List[str]] = None) -> pd.DataFrame:
+        """获取指定日期范围的资金流数据
+        
+        Args:
+            trade_dates: 交易日期列表 (YYYYMMDD格式)
+            symbols: 股票代码列表，None表示所有股票
+        
+        Returns:
+            资金流数据DataFrame
+        """
+        if not trade_dates:
+            return pd.DataFrame()
+        
+        with self.session() as s:
+            query = s.query(MoneyFlow).filter(MoneyFlow.trade_date.in_(trade_dates))
+            
+            if symbols:
+                query = query.filter(MoneyFlow.symbol.in_(symbols))
+            
+            results = query.all()
+            
+            if not results:
+                return pd.DataFrame()
+            
+            data = []
+            for r in results:
+                data.append({
+                    "ts_code": r.ts_code,
+                    "symbol": r.symbol,
+                    "trade_date": r.trade_date,
+                    "buy_sm_vol": r.buy_sm_vol,
+                    "buy_sm_amount": r.buy_sm_amount,
+                    "sell_sm_vol": r.sell_sm_vol,
+                    "sell_sm_amount": r.sell_sm_amount,
+                    "buy_md_vol": r.buy_md_vol,
+                    "buy_md_amount": r.buy_md_amount,
+                    "sell_md_vol": r.sell_md_vol,
+                    "sell_md_amount": r.sell_md_amount,
+                    "buy_lg_vol": r.buy_lg_vol,
+                    "buy_lg_amount": r.buy_lg_amount,
+                    "sell_lg_vol": r.sell_lg_vol,
+                    "sell_lg_amount": r.sell_lg_amount,
+                    "buy_elg_vol": r.buy_elg_vol,
+                    "buy_elg_amount": r.buy_elg_amount,
+                    "sell_elg_vol": r.sell_elg_vol,
+                    "sell_elg_amount": r.sell_elg_amount,
+                    "net_mf_vol": r.net_mf_vol,
+                    "net_mf_amount": r.net_mf_amount,
+                    "source": r.source,
+                })
+            
+            return pd.DataFrame(data)
+    
+    def get_moneyflow_by_symbol_date(self, symbol: str, trade_date: str) -> Optional[dict]:
+        """获取单只股票单日资金流数据"""
+        with self.session() as s:
+            result = s.query(MoneyFlow).filter(
+                MoneyFlow.symbol == symbol,
+                MoneyFlow.trade_date == trade_date
+            ).first()
+            
+            if result is None:
+                return None
+            
+            return {
+                "ts_code": result.ts_code,
+                "symbol": result.symbol,
+                "trade_date": result.trade_date,
+                "buy_sm_vol": result.buy_sm_vol,
+                "buy_sm_amount": result.buy_sm_amount,
+                "sell_sm_vol": result.sell_sm_vol,
+                "sell_sm_amount": result.sell_sm_amount,
+                "buy_md_vol": result.buy_md_vol,
+                "buy_md_amount": result.buy_md_amount,
+                "sell_md_vol": result.sell_md_vol,
+                "sell_md_amount": result.sell_md_amount,
+                "buy_lg_vol": result.buy_lg_vol,
+                "buy_lg_amount": result.buy_lg_amount,
+                "sell_lg_vol": result.sell_lg_vol,
+                "sell_lg_amount": result.sell_lg_amount,
+                "buy_elg_vol": result.buy_elg_vol,
+                "buy_elg_amount": result.buy_elg_amount,
+                "sell_elg_vol": result.sell_elg_vol,
+                "sell_elg_amount": result.sell_elg_amount,
+                "net_mf_vol": result.net_mf_vol,
+                "net_mf_amount": result.net_mf_amount,
+                "source": result.source,
+            }
+    
+    def count_moneyflow_by_date(self, trade_date: str) -> int:
+        """统计指定日期的资金流数据条数"""
+        with self.session() as s:
+            count = s.query(func.count(MoneyFlow.id)).filter(
+                MoneyFlow.trade_date == trade_date
+            ).scalar()
+            return count or 0
+    
+    # 动态添加到StockRepository类
+    StockRepository.save_moneyflow = save_moneyflow
+    StockRepository.get_moneyflow_by_dates = get_moneyflow_by_dates
+    StockRepository.get_moneyflow_by_symbol_date = get_moneyflow_by_symbol_date
+    StockRepository.count_moneyflow_by_date = count_moneyflow_by_date
+
+
+# 初始化时添加资金流方法
+add_moneyflow_methods_to_stock_repository()

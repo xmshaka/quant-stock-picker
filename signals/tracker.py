@@ -21,7 +21,7 @@ FACTOR_CN = {
     'max_dd_60d': '60日最大回撤',
     # 情绪因子
     'north_hold_change': '北向资金20日变化',
-    # 'margin_change': '融资融券20日变化',  # 数据缺失99.2%，已移除
+    # 'margin_change': '融资融券20日变化',  # 数据缺失99.2%，已移除  # [已移除 20260627_172424]
     'turnover_ratio': '换手率比率',
     'volume_ratio': '量比',
     # 估值因子

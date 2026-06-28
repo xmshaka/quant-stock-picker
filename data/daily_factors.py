@@ -51,15 +51,24 @@ def has_daily_factors(date_str: Optional[str] = None) -> bool:
 
 def latest_snapshot_date() -> Optional[str]:
     """返回最新一份全池快照的日期字符串 (YYYYMMDD)。不存在返回 None。"""
-    files = sorted(DAILY_FACTOR_DIR.glob("factors_*.parquet"))
-    if not files:
+    import re
+    # 只匹配标准格式: factors_YYYYMMDD.parquet
+    pattern = re.compile(r'^factors_(\d{8})\.parquet$')
+    
+    valid_files = []
+    for f in DAILY_FACTOR_DIR.glob("factors_*.parquet"):
+        match = pattern.match(f.name)
+        if match:
+            valid_files.append((match.group(1), f))
+    
+    if not valid_files:
         return None
-    # 取文件名中的 YYYYMMDD
-    name = files[-1].stem  # factors_20260526
-    try:
-        return name.split("_")[1]
-    except Exception:
-        return None
+    
+    # 按日期排序
+    valid_files.sort(key=lambda x: x[0], reverse=True)
+    
+    # 返回最新日期
+    return valid_files[0][0]
 
 
 def load_snapshot_meta(date_str: Optional[str] = None) -> Optional[dict]:
@@ -326,8 +335,10 @@ def enrich_short_term_factors(
     turnover_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """短线买卖点上下文因子增强入口。"""
-    enriched = add_relative_turnover_factors(factor_df, price_df, turnover_df)
-    enriched = add_moneyflow_factors(enriched, moneyflow_df, price_df)
+    # 先添加资金流因子（依赖_trade_date_norm）
+    enriched = add_moneyflow_factors(factor_df, moneyflow_df, price_df)
+    # 再添加相对换手率因子
+    enriched = add_relative_turnover_factors(enriched, price_df, turnover_df)
     return enriched
 
 
@@ -438,21 +449,68 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
         f"{len(price_df)} 条价格, 耗时 {elapsed:.1f}s"
     )
 
-    # 2.1 增强短线买卖点上下文因子：相对换手 + Tushare moneyflow。
+    # 2.1 增强短线买卖点上下文因子：相对换手 + 资金流。
     moneyflow_df = pd.DataFrame()
     turnover_df = pd.DataFrame()
-    latest_trade_date = ""
+    
+    # 获取所有唯一交易日
+    trade_dates = pd.to_datetime(factor_df["trade_date"], errors="coerce")
+    unique_dates = sorted({d.strftime("%Y%m%d") for d in trade_dates if pd.notna(d)})
+    
+    logger.info(f"[DailyFactors] 需要资金流数据的交易日: {len(unique_dates)} 天")
+    
+    # 方案1：优先从PG读取资金流数据
     try:
-        latest_trade_date = pd.to_datetime(factor_df["trade_date"], errors="coerce").max().strftime("%Y%m%d")
-        from data.fetchers.tushare_fetcher import TushareFetcher
-        moneyflow_df = TushareFetcher().get_money_flow(trade_date=latest_trade_date)
+        from data.storage.repository import StockRepository
+        repo = StockRepository()
+        
+        # 从PG读取资金流数据
+        moneyflow_df = repo.get_moneyflow_by_dates(unique_dates)
+        
         if moneyflow_df is not None and not moneyflow_df.empty:
-            logger.info(f"[DailyFactors] Tushare moneyflow {latest_trade_date}: {len(moneyflow_df)} 条")
+            logger.info(f"[DailyFactors] 从PG读取资金流数据: {len(moneyflow_df)} 条")
+            
+            # 验证数据质量
+            coverage = len(moneyflow_df) / (len(unique_dates) * len(symbols)) * 100
+            logger.info(f"[DailyFactors] 资金流数据覆盖率: {coverage:.1f}%")
         else:
-            logger.warning(f"[DailyFactors] Tushare moneyflow {latest_trade_date} 为空，资金流因子保留缺失")
+            logger.warning("[DailyFactors] PG中无资金流数据，尝试从API获取")
+            moneyflow_df = pd.DataFrame()
+            
     except Exception as e:
-        logger.warning(f"[DailyFactors] moneyflow 增强失败，跳过资金流因子: {e}")
+        logger.warning(f"[DailyFactors] 从PG读取资金流数据失败: {e}")
         moneyflow_df = pd.DataFrame()
+    
+    # 方案2：如果PG没有数据，尝试从API获取当天数据
+    if moneyflow_df.empty:
+        try:
+            from data.fetchers.tushare_fetcher import TushareFetcher
+            fetcher = TushareFetcher()
+            
+            # 只获取当天的资金流数据（避免API限制）
+            today_str = datetime.now().strftime("%Y%m%d")
+            if today_str in unique_dates:
+                today_df = fetcher.get_money_flow(trade_date=today_str)
+                if today_df is not None and not today_df.empty:
+                    moneyflow_df = today_df
+                    logger.info(f"[DailyFactors] 获取当天资金流数据: {len(moneyflow_df)} 条")
+                    
+                    # 保存到PG供后续使用
+                    try:
+                        from data.storage.repository import StockRepository
+                        repo = StockRepository()
+                        repo.save_moneyflow(today_df, source="tushare")
+                        logger.info(f"[DailyFactors] 当天资金流数据已保存到PG")
+                    except Exception as save_error:
+                        logger.warning(f"[DailyFactors] 保存到PG失败: {save_error}")
+                else:
+                    logger.warning("[DailyFactors] 当天资金流数据为空")
+            else:
+                logger.warning("[DailyFactors] 今天不在回测日期范围内，跳过API获取")
+                
+        except Exception as e:
+            logger.warning(f"[DailyFactors] API获取资金流数据失败: {e}")
+            moneyflow_df = pd.DataFrame()
     try:
         turnover_df = fetch_tushare_daily_basic_turnover_history(factor_df["trade_date"])
         if turnover_df is None or turnover_df.empty:
@@ -468,6 +526,14 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
     factor_df.to_parquet(_factor_path(today))
     price_df.to_parquet(_price_path(today))
 
+    # 计算资金流数据的最新日期
+    if moneyflow_df is not None and not moneyflow_df.empty:
+        if 'trade_date' in moneyflow_df.columns:
+            latest_trade_date = str(moneyflow_df['trade_date'].max())
+        else:
+            latest_trade_date = "unknown"
+    else:
+        latest_trade_date = "missing"
     meta = {
         "date": today,
         "data_source": "daily_factor_snapshot",

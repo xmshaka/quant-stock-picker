@@ -86,6 +86,7 @@ class MarginBalanceChange20D(Factor):
 
     融资余额增加代表杠杆资金流入，情绪升温。
     """
+# TODO: margin_change已废弃，考虑移除引用
     name = "margin_change_20d"
     group = "sentiment"
     direction = 1

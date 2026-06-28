@@ -16,9 +16,15 @@ def test_builtin_strategies_have_distinct_resonance_configs():
     assert all(cfg.min_confirmations == 3 for cfg in configs.values())
     assert configs["trend_momentum"].buy_conditions != configs["pullback"].buy_conditions
     assert configs["pullback"].buy_conditions != configs["breakout"].buy_conditions
-    assert "near_high" in configs["trend_momentum"].buy_conditions
-    assert "pullback_range" in configs["pullback"].buy_conditions
-    assert "break_platform" in configs["breakout"].buy_conditions
+    # trend_momentum 应有资金流和相对换手条件
+    assert any("mf_positive" in cond for cond in configs["trend_momentum"].buy_conditions)
+    assert any("turnover_5d_high" in cond for cond in configs["trend_momentum"].buy_conditions)
+    # pullback 应有回调相关的条件
+    assert any("rsi_oversold" in cond for cond in configs["pullback"].buy_conditions)
+    assert any("turnover_5d_low" in cond for cond in configs["pullback"].buy_conditions)
+    # breakout 应有突破相关的条件
+    assert any("break_platform" in cond for cond in configs["breakout"].buy_conditions)
+    assert any("volume_surge" in cond for cond in configs["breakout"].buy_conditions)
 
 
 def test_strategy_scheme_roundtrip_preserves_resonance_config():
@@ -87,6 +93,8 @@ def test_scanner_layer3_uses_resonance_config_condition_subset():
     latest = date(2026, 1, 1) + timedelta(days=49)
     closes = [10 + i * 0.15 for i in range(50)]
     bars = pd.DataFrame(_bars("000001", closes))
+    
+    # 创建包含资金流和相对换手因子的测试数据
     row = pd.Series(_factor_row(
         "000001", latest,
         momentum_5d=0.08,
@@ -94,16 +102,25 @@ def test_scanner_layer3_uses_resonance_config_condition_subset():
         volume_ratio=1.8,
         rsi14=65,
         boll_position=0.85,
+        # 添加资金流和相对换手因子
+        main_net_mf_amount=50000.0,
+        large_elg_net_mf_amount=80000.0,
+        main_net_mf_rank=0.85,
+        large_elg_net_mf_rank=0.80,
+        relative_turnover_5d=1.3,
+        amount_percentile_60d=0.75,
+        turnover_percentile_60d=0.60,
     ))
 
     full_count, full_reasons = _check_layer3(bars, row, "trend_momentum")
-    restricted = ResonanceConfig(min_confirmations=1, buy_conditions=["near_high"])
+    # 使用新的条件进行限制测试
+    restricted = ResonanceConfig(min_confirmations=1, buy_conditions=["large_elg_net_mf_positive"])
     restricted_count, restricted_reasons = _check_layer3(bars, row, "trend_momentum", restricted)
 
     assert full_count >= restricted_count
-    assert restricted_count == 1
+    assert restricted_count == 1  # 应该满足超大单净流入条件
     assert len(restricted_reasons) == 1
-    assert "高点" in restricted_reasons[0]
+    assert "超大单" in restricted_reasons[0]
 
 
 def test_scanner_resonance_config_helper_returns_builtin_config():

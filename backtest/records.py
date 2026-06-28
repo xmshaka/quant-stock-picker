@@ -801,6 +801,44 @@ def equity_curve_to_frame(equity_curve: Mapping[str, float], run_id: str) -> pd.
 
 def _write_frame(path: Path, df: pd.DataFrame) -> None:
     df = df.copy() if df is not None else pd.DataFrame()
+    
+    # BUG修复：确保空DataFrame包含正确的列结构
+    if df.empty:
+        # 根据文件名推断应该有的列结构
+        filename = path.stem
+        if filename == 'signals_executed' or filename == 'signals_raw':
+            # signals文件的标准列
+            from .records import trade_points_to_frame
+            # 创建一个空的但包含正确列结构的DataFrame
+            empty_signals_df = pd.DataFrame(columns=[
+                'symbol', 'date', 'action', 'signal_date', 'exec_date',
+                'signal_price', 'exec_price', 'price', 'shares', 'cash_after',
+                'position_after', 'avg_cost', 'stop_loss', 'take_profit',
+                'pnl', 'pnl_pct', 'holding_days', 'exit_type', 'exit_subtype',
+                'trigger_price', 'projected_pnl', 'reason', 'rule_name',
+                'confidence', 'confidence_bucket', 'confidence_action',
+                'confidence_weight', 'confidence_note', 'entry_model',
+                'main_trigger', 'confirmations', 'factor_evidence',
+                'market_context', 'fund_flow_context', 'technical_confirmations',
+                'veto_checks', 'risk_tags', 'missing_fields', 'source'
+            ])
+            df = empty_signals_df
+        elif filename == 'trades':
+            # trades文件的标准列
+            df = pd.DataFrame(columns=STANDARD_TRADE_COLUMNS)
+        elif filename == 'skipped_signals':
+            # skipped_signals文件的标准列
+            df = pd.DataFrame(columns=SKIPPED_SIGNAL_COLUMNS)
+        elif filename == 'equity':
+            # equity文件的标准列
+            df = pd.DataFrame(columns=['run_id', 'date', 'equity'])
+        elif filename == 'positions':
+            # positions文件的标准列（简化）
+            df = pd.DataFrame(columns=['run_id', 'date', 'symbol', 'shares', 'avg_cost'])
+        elif filename == 'factor_snapshot':
+            # factor_snapshot文件的标准列（简化）
+            df = pd.DataFrame(columns=['run_id', 'symbol', 'trade_date'])
+    
     try:
         df.to_parquet(path, index=False)
     except Exception:
@@ -811,10 +849,62 @@ def _read_frame(stem: Path) -> pd.DataFrame:
     """读取 parquet/csv，stem 可不带后缀。"""
     parquet_path = stem.with_suffix(".parquet")
     csv_path = stem.with_suffix(".csv")
+    
     if parquet_path.exists():
-        return pd.read_parquet(parquet_path)
+        df = pd.read_parquet(parquet_path)
+        # BUG修复：如果读取到空DataFrame，确保包含正确的列结构
+        if df.empty:
+            filename = stem.name
+            if filename == 'signals_executed' or filename == 'signals_raw':
+                # signals文件的标准列
+                df = pd.DataFrame(columns=[
+                    'symbol', 'date', 'action', 'signal_date', 'exec_date',
+                    'signal_price', 'exec_price', 'price', 'shares', 'cash_after',
+                    'position_after', 'avg_cost', 'stop_loss', 'take_profit',
+                    'pnl', 'pnl_pct', 'holding_days', 'exit_type', 'exit_subtype',
+                    'trigger_price', 'projected_pnl', 'reason', 'rule_name',
+                    'confidence', 'confidence_bucket', 'confidence_action',
+                    'confidence_weight', 'confidence_note', 'entry_model',
+                    'main_trigger', 'confirmations', 'factor_evidence',
+                    'market_context', 'fund_flow_context', 'technical_confirmations',
+                    'veto_checks', 'risk_tags', 'missing_fields', 'source'
+                ])
+            elif filename == 'trades':
+                # trades文件的标准列
+                df = pd.DataFrame(columns=STANDARD_TRADE_COLUMNS)
+            elif filename == 'skipped_signals':
+                # skipped_signals文件的标准列
+                df = pd.DataFrame(columns=SKIPPED_SIGNAL_COLUMNS)
+            elif filename == 'equity':
+                # equity文件的标准列
+                df = pd.DataFrame(columns=['run_id', 'date', 'equity'])
+            elif filename == 'positions':
+                # positions文件的标准列（简化）
+                df = pd.DataFrame(columns=['run_id', 'date', 'symbol', 'shares', 'avg_cost'])
+            elif filename == 'factor_snapshot':
+                # factor_snapshot文件的标准列（简化）
+                df = pd.DataFrame(columns=['run_id', 'symbol', 'trade_date'])
+        return df
+    
     if csv_path.exists():
-        return pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path)
+        # 同样的BUG修复
+        if df.empty:
+            filename = stem.name
+            if filename == 'signals_executed' or filename == 'signals_raw':
+                df = pd.DataFrame(columns=['symbol', 'date', 'action', 'signal_date', 'exec_date',
+                    'signal_price', 'exec_price', 'price', 'shares', 'cash_after',
+                    'position_after', 'avg_cost', 'stop_loss', 'take_profit',
+                    'pnl', 'pnl_pct', 'holding_days', 'exit_type', 'exit_subtype',
+                    'trigger_price', 'projected_pnl', 'reason', 'rule_name',
+                    'confidence', 'confidence_bucket', 'confidence_action',
+                    'confidence_weight', 'confidence_note', 'entry_model',
+                    'main_trigger', 'confirmations', 'factor_evidence',
+                    'market_context', 'fund_flow_context', 'technical_confirmations',
+                    'veto_checks', 'risk_tags', 'missing_fields', 'source'])
+        return df
+    
+    # 文件不存在时，返回空DataFrame
     return pd.DataFrame()
 
 

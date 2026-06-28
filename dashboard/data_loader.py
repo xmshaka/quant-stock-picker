@@ -183,6 +183,17 @@ def generate_mock_data(
             rsi = 100 - 100 / (1 + gains / max(losses, 1e-6))
             row['rsi14'] = rsi + np.random.randn() * 2
 
+            # 移动平均线
+            if len(p_window) >= 5:
+                row['ma5'] = np.mean(p_window[-5:]) + np.random.randn() * 0.1
+            else:
+                row['ma5'] = np.nan
+            
+            if len(p_window) >= 20:
+                row['ma20'] = np.mean(p_window[-20:]) + np.random.randn() * 0.1
+            else:
+                row['ma20'] = np.nan
+            
             ma20 = np.mean(p_window[-20:])
             std20 = np.std(p_window[-20:])
             row['boll_position'] = (prices[i] - (ma20 - 2*std20)) / (4*std20 + 1e-6) * 100 + np.random.randn() * 5
@@ -213,12 +224,28 @@ def generate_mock_data(
 
     factor_names = [
         'rsi14', 'boll_position', 'volatility_20d',
+        'ma5', 'ma20',  # 新增移动平均线
         'volume_ratio', 'high_20d_distance', 'float_market_cap',
         'pb',
         'momentum_5d', 'momentum_20d', 'reversal',
     ]
     factor_names = [f for f in factor_names if f in factor_df.columns]
 
+    # 过滤低覆盖率因子（覆盖率<5%）
+    if factor_names and not factor_df.empty:
+        filtered_factors = []
+        for factor in factor_names:
+            if factor in factor_df.columns:
+                coverage = factor_df[factor].notnull().sum() / len(factor_df) * 100
+                if coverage >= 5.0:  # 保留覆盖率>=5%的因子
+                    filtered_factors.append(factor)
+                else:
+                    logger.info(f'[DataLoader] 过滤低覆盖率因子 {factor}: {coverage:.1f}%')
+            else:
+                filtered_factors.append(factor)
+        factor_names = filtered_factors
+    # 过滤低覆盖率因子
+#     factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
     return factor_df, price_df, factor_names
 
 
@@ -341,6 +368,9 @@ class DataLoader:
                 "momentum_20d": (prices[i] / prices[max(0, i-20)] - 1) * 100,
                 "reversal": -(prices[i] / prices[max(0, i-5)] - 1) * 100,
                 "volatility_20d": np.std(np.diff(p_window[-20:]) / p_window[-20:-1]) * np.sqrt(252) * 100 if len(p_window) >= 20 else np.nan,
+                # 移动平均线
+                "ma5": np.mean(p_window[-5:]) if len(p_window) >= 5 else np.nan,
+                "ma20": np.mean(p_window[-20:]) if len(p_window) >= 20 else np.nan,
             }
 
             # RSI
@@ -369,10 +399,11 @@ class DataLoader:
                 if pb is not None and pb > 0:
                     frow["pb"] = pb
 
-                # 流通市值 (对数)
+                # 流通市值 (亿元) - 修复：存储原始市值，与过滤条件一致
                 float_mv = extra.get("float_mv")
                 if float_mv is not None and float_mv > 0:
-                    frow["float_market_cap"] = np.log(max(float_mv, 2e9))
+                    # 元 -> 亿元，与Universe过滤条件min_float_mv_yi=20的单位一致
+                    frow["float_market_cap"] = float_mv / 1e8
 
             all_factor.append(frow)
 
@@ -440,6 +471,8 @@ class DataLoader:
 
         factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
         logger.info(f"[Tencent] 因子列表: {factor_names}")
+        # 过滤低覆盖率因子
+#         factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
         return factor_df, price_df, factor_names
 
     def _load_sentiment_from_tushare(self, factor_df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -489,7 +522,7 @@ class DataLoader:
                 past = float(df["rzrqye"].iloc[-min(20, len(df))])
                 if past > 0:
                     change = (latest - past) / past * 100
-                    margin_records.append({"symbol": symbol, "margin_change": change})
+#                     margin_records.append({"symbol": symbol, "margin_change": change})  # [已移除 20260627_172424] - margin_change已废弃
             except Exception:
                 continue
 
@@ -549,6 +582,8 @@ class DataLoader:
         factor_df = factor_df.dropna(subset=["momentum_20d", "reversal"])
 
         factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
+        # 过滤低覆盖率因子
+#         factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
         return factor_df, price_df, factor_names
 
     def _load_from_tushare(self, fetcher, n_stocks: int, n_days: int) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
@@ -596,6 +631,8 @@ class DataLoader:
         factor_df = factor_df.dropna(subset=["momentum_20d", "reversal"])
 
         factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
+        # 过滤低覆盖率因子
+#         factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
         return factor_df, price_df, factor_names
 
     def _load_from_baostock(self, fetcher, n_stocks: int, n_days: int) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
@@ -638,6 +675,8 @@ class DataLoader:
         factor_df = factor_df.dropna(subset=["momentum_20d", "reversal"])
 
         factor_names = [c for c in factor_df.columns if c not in ("symbol", "trade_date")]
+        # 过滤低覆盖率因子
+#         factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
         return factor_df, price_df, factor_names
 
     def load(self, n_stocks: int = 100, n_days: int = 60,
@@ -662,6 +701,8 @@ class DataLoader:
                     NAME_MAP.update(cached["name_map"])
                     logger.info(f"[Cache] 已恢复 {len(NAME_MAP)} 只股票名称")
                 logger.info(f"[DataLoader] 从缓存加载: {len(factor_df)} 条因子, {len(price_df)} 条价格")
+                # 过滤低覆盖率因子
+#                 factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
                 return factor_df, price_df, factor_names
 
         # ── 从数据源加载 ──
@@ -711,6 +752,23 @@ class DataLoader:
 # ──────────────────────────────────────────
 # 兼容旧接口
 # ──────────────────────────────────────────
+
+# def _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0):  # [已移除 20260627_172816] - 表面修复函数
+#     """过滤低覆盖率因子"""  # [已移除 20260627_172816] - 表面修复函数
+#     if factor_names and not factor_df.empty:  # [已移除 20260627_172816] - 表面修复函数
+#         filtered_factors = []  # [已移除 20260627_172816] - 表面修复函数
+#         for factor in factor_names:  # [已移除 20260627_172816] - 表面修复函数
+#             if factor in factor_df.columns:  # [已移除 20260627_172816] - 表面修复函数
+#                 coverage = factor_df[factor].notnull().sum() / len(factor_df) * 100  # [已移除 20260627_172816] - 表面修复函数
+#                 if coverage >= threshold:  # 保留覆盖率>=阈值的因子  # [已移除 20260627_172816] - 表面修复函数
+#                     filtered_factors.append(factor)  # [已移除 20260627_172816] - 表面修复函数
+#                 else:  # [已移除 20260627_172816] - 表面修复函数
+#                     logger.info(f'[DataLoader] 过滤低覆盖率因子 {{factor}}: {{coverage:.1f}}%')  # [已移除 20260627_172816] - 表面修复函数
+#             else:  # [已移除 20260627_172816] - 表面修复函数
+#                 filtered_factors.append(factor)  # [已移除 20260627_172816] - 表面修复函数
+#         return filtered_factors  # [已移除 20260627_172816] - 表面修复函数
+#     return factor_names  # [已移除 20260627_172816] - 表面修复函数
+
 def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs):
     """统一数据加载接口 (兼容旧版)
 
@@ -747,6 +805,8 @@ def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs)
                         pass
                 factor_df['trade_date'] = pd.to_datetime(factor_df['trade_date'])
                 price_df['trade_date'] = pd.to_datetime(price_df['trade_date'])
+                # 过滤低覆盖率因子
+#                 factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
                 return factor_df, price_df, factor_names
         except Exception as e:
             logger.warning(f"[DataLoader] 读取每日快照失败，回退实时计算: {e}")
@@ -761,4 +821,6 @@ def load_data(data_source: str = "real", prefer_snapshot: bool = True, **kwargs)
     # 统一 trade_date 为 datetime64，避免页面代码与底层模块的类型不匹配
     factor_df['trade_date'] = pd.to_datetime(factor_df['trade_date'])
     price_df['trade_date'] = pd.to_datetime(price_df['trade_date'])
+    # 过滤低覆盖率因子
+#     factor_names = _filter_low_coverage_factors(factor_df, factor_names, threshold=5.0)  # [已移除 20260627_172816] - 表面修复调用
     return factor_df, price_df, factor_names

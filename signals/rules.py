@@ -60,6 +60,8 @@ class TradePoint:
     veto_checks: str = ""          # 否决项检查，JSON/分号文本
     risk_tags: str = ""            # 风险标签，JSON/分号文本
     missing_fields: str = ""       # 缺失数据字段，JSON/分号文本
+    # ── 信号强度（替代 confidence 硬过滤） ──
+    condition_count: int = 0        # 命中的独立条件数（用于后验分组统计）
 
 
 def confidence_audit(confidence: float, action: str = "BUY") -> Dict[str, object]:

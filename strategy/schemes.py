@@ -128,6 +128,8 @@ class StrategyScheme:
     signal_mode: str = "layered"       # "layered" 三层过滤 | "legacy" 旧规则
     # ── 大盘择时 ──
     enable_market_timing: bool = True   # 是否启用大盘择时仓位调制
+    # ── 开仓执行契约 ──
+    min_entry_condition_count: int = 3   # 最小condition_count才开仓（0=关闭entry_contract）
     # ── 资金管理 ──
     max_add_times: int = 2             # 最大加仓次数（0=不加仓，仅建仓）
     position_pct_per_entry: float = 0.30  # 每次建仓/加仓占可用资金比例
@@ -151,6 +153,7 @@ class StrategyScheme:
             "is_builtin": self.is_builtin,
             "signal_mode": self.signal_mode,
             "enable_market_timing": self.enable_market_timing,
+            "min_entry_condition_count": self.min_entry_condition_count,
             "max_add_times": self.max_add_times,
             "position_pct_per_entry": self.position_pct_per_entry,
             "max_single_pct": self.max_single_pct,
@@ -174,6 +177,7 @@ class StrategyScheme:
             is_builtin=d.get("is_builtin", False),
             signal_mode=d.get("signal_mode", "layered"),
             enable_market_timing=d.get("enable_market_timing", True),
+            min_entry_condition_count=int(d.get("min_entry_condition_count", 3)),
             max_add_times=d.get("max_add_times", 2),
             position_pct_per_entry=d.get("position_pct_per_entry", 0.30),
             max_single_pct=d.get("max_single_pct", 0.30),
@@ -210,6 +214,7 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.MACD_TREND, {"fast": 12, "slow": 26, "signal": 9}),
     ],
     regime_fit=["强势单边上涨"],
+    min_entry_condition_count=6,  # Stage 2后验: cc≥6胜率64.3%均利+4,311
     resonance_config=ResonanceConfig(
         min_confirmations=3,
         buy_conditions=[
@@ -258,6 +263,7 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
     ],
     regime_fit=["震荡整理", "弱势单边下跌"],
+    min_entry_condition_count=8,  # Stage 2后验: cc≥8胜率46.2%均利+3,141
     resonance_config=ResonanceConfig(
         min_confirmations=3,
         buy_conditions=[
@@ -306,22 +312,27 @@ _register(StrategyScheme(
         SignalRuleConfig(RuleType.BOLL_BREAK, {"period": 20, "std_dev": 2.0}),
     ],
     regime_fit=["震荡整理", "强势单边上涨"],
+    min_entry_condition_count=0,  # Stage 2后验: 全cc组亏损，暂停entry_contract
     resonance_config=ResonanceConfig(
-        min_confirmations=3,
+        min_confirmations=4,  # 提高门槛：从3→4，减少噪音突破
         buy_conditions=[
-            # 资金流条件
-            "large_elg_net_mf_positive_strong", # 超大单净流入强劲
-            "main_net_mf_positive_strong",      # 主力净流入强劲
-            # 相对换手条件
-            "relative_turnover_5d_high",        # 5日相对换手率高
-            "amount_percentile_60d_high",       # 60日成交额分位高
-            # 技术确认条件
-            "break_platform",                   # 突破平台
-            "volume_surge",                     # 成交量激增
-            "ma5_above_ma20",                   # 短期均线上穿
-            "narrow_range",                     # 横盘振幅收窄
-            "momentum_5d_strong",               # 5日动量强
-            "boll_upper_break",                 # 突破布林上轨
+            # 资金流条件（突破v2: 超高门槛）
+            "large_elg_net_mf_positive_strong", # 超大单>10万
+            "main_net_mf_positive_strong",      # 主力>5万
+            "mf_rank_elite",                    # 资金排名前20%
+            # 量能条件（突破v2: 量比>2x+实体阳线）
+            "volume_surge",                     # 量比>2x
+            "relative_turnover_5d_high",        # 换手活跃
+            "amount_percentile_60d_high",       # 成交额前25%
+            "bullish_body",                     # 实体阳线
+            # 价格结构条件（突破v2: 收盘确认+多bar验证）
+            "break_platform",                   # 收盘突破平台上沿
+            "narrow_range",                     # 平台振幅<8%
+            "buildup_signal",                   # 前日蓄势
+            "sustained_breakout",               # 连续站稳突破位
+            # 趋势背景
+            "ma5_above_ma20",                   # 均线多头
+            "boll_expanding",                   # 布林中上轨
         ],
         sell_conditions=[
             "main_net_mf_negative",             # 主力净流出
@@ -359,17 +370,7 @@ _register(StrategyScheme(
     regime_fit=["*"],
     resonance_config=ResonanceConfig(
         min_confirmations=3,
-        buy_conditions=[
-            # 资金流基础条件
-            "main_net_mf_not_negative",         # 主力不净流出
-            # 相对换手基础条件
-            "relative_turnover_5d_not_low",     # 5日相对换手率不低
-            # 技术基础条件（从各策略选通用项）
-            "ma5_above_ma20",                   # 短期均线上穿
-            "rsi_not_extreme",                  # RSI不过热
-            "volume_expand",                    # 放量
-            "momentum_5d_positive",             # 5日动量为正
-        ],
+        buy_conditions=[],  # balanced v2: 策略路由器，委托给子策略生成条件，不设 whitelist
         sell_conditions=[
             "main_net_mf_negative",             # 主力净流出
             "relative_turnover_5d_low",         # 5日相对换手率低
