@@ -69,3 +69,23 @@ Stage 2 执行：
 ### 禁止回退
 - 不允许删除 `_merge_factor_columns` 及其调用
 - 不允许恢复 condition_count → confidence 的 entry_contract 逻辑（等 Stage 3 后验数据）
+
+## 2026-06-28 23:32 Dashboard 参数统一重构
+
+### 一、Git 提交（已完成）
+- 20 files changed, +1505/-1836
+
+### 二、Dashboard 重构计划
+
+**目标**: 所有影响交易的参数所见即所得，一个页面完整控制
+
+**Phase 1 — 重构 8_策略回测.py**
+- 新增参数区：因子权重、L3共振条件、开仓契约(min_entry_condition_count)、ATR止盈止损、仓位管理、大盘择时
+
+**Phase 2 — 删除冗余页面** ✅ 已完成 (2026-06-28)
+- ✅ 删除 7_策略方案.py（signal_rules旧逻辑已废弃）
+- ✅ 删除 策略条件总览.py（内容并入8）
+- ✅ 10_参数网格.py 保留但标注 CLI-only
+
+### 三、关键发现
+- min_entry_condition_count 直接决定信号是否执行，当前在全部5个Dashboard页面中完全不可见

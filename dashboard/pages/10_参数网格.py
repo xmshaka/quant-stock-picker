@@ -16,6 +16,7 @@ st.set_page_config(page_title="参数网格", page_icon="🧪", layout="wide")
 inject_theme()
 
 section_header("参数网格结果")
+st.warning("⚠️ **CLI-Only**：参数网格优化仅通过 CLI 运行 `scripts/run_param_grid.py --audit-root data/grid_results`，本页面仅用于**只读浏览**历史结果，不可在线编辑或发起新实验。", icon="🧪")
 st.caption("读取 data/grid_results/*：grid_results/config/summary，用于参数稳定性审计。排序口径：低回撤优先，不按收益单独优化。")
 
 runs = list_grid_audit_runs()

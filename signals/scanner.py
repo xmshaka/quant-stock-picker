@@ -34,7 +34,8 @@ class ScanSignal:
     layer2_score: float
     layer3_confirmations: int
     total_score: float
-    entry_reason: str
+    layer3_score: float = 0.0
+    entry_reason: str = ""
     layer3_total: int = 0
     layer3_min_confirmations: int = 0
     layer3_condition_keys: List[str] = field(default_factory=list)
@@ -83,12 +84,15 @@ def scan_signals(
     market_score: Optional[float] = None,
     include_sell_symbols: Optional[Iterable[str]] = None,
     include_sell_context: Optional[Dict[str, Dict]] = None,
+    scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
 ) -> Tuple[List[ScanSignal], List[ScanSignal]]:
     """按 DAILY_START_PLAN 新方案扫描信号。
 
     - BUY：按 trend_momentum / pullback / breakout 独立扫描。
     - balanced：不直接造信号，只汇总三类子策略的最优结果。
     - SELL：仅对传入的持仓/关注股票做风险退出提示，避免对全市场生成无意义卖出榜。
+    - scheme_overrides：可选策略参数覆写（因子权重/L3条件/ATR/仓位等），
+      用于 Dashboard 参数面板实时调整扫描参数，不影响 BUILTIN_SCHEMES。
     """
     if factor_df.empty or "trade_date" not in factor_df.columns or "symbol" not in factor_df.columns:
         return [], []
@@ -106,9 +110,10 @@ def scan_signals(
 
     target_schemes = _target_schemes(scheme_id)
     buy_candidates: List[ScanSignal] = []
+    _overrides = scheme_overrides or {}
 
     for sid in target_schemes:
-        scheme = BUILTIN_SCHEMES[sid]
+        scheme = _overrides.get(sid) or BUILTIN_SCHEMES[sid]
         floor = STRATEGY_MARKET_FLOOR[sid]
         if market_score_val < floor:
             continue
@@ -131,18 +136,19 @@ def scan_signals(
             l2_ok, l2_score, l2_reason = _check_layer2(bars, latest_row, sid)
             if not l2_ok:
                 continue
-            resonance_cfg = _resonance_config(sid)
-            confirmations, l3_reasons = _check_layer3(bars, latest_row, sid, resonance_cfg)
+            resonance_cfg = _resonance_config(sid, _overrides)
+            confirmations, l3_score, l3_reasons = _check_layer3(bars, latest_row, sid, resonance_cfg)
             min_confirmations = int(resonance_cfg.min_confirmations or DEFAULT_MIN_CONFIRMATIONS)
             if confirmations < min_confirmations:
                 continue
 
             layer3_total = len(resonance_cfg.buy_conditions) or 6
+            l3_score_continuous = round(l3_score, 4)
             total_score = round(
-                factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + min(confirmations / max(layer3_total, 1), 1.0) * 100 * 0.20,
+                factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + l3_score_continuous * 0.20,
                 4,
             )
-            reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/{layer3_total}：{'、'.join(l3_reasons)}"
+            reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/{layer3_total}（强度{l3_score_continuous:.1f}）：{'、'.join(l3_reasons)}"
             risk_tags = _build_risk_tags(bars, latest_row, market_score_val, sid)
             risk_tags.extend([t for t in tradable_tags if t not in risk_tags])
             entry_audit = _build_entry_audit_context(
@@ -169,6 +175,7 @@ def scan_signals(
                 layer2_score=round(float(l2_score), 4),
                 layer3_confirmations=confirmations,
                 layer3_total=layer3_total,
+                layer3_score=l3_score_continuous,
                 layer3_min_confirmations=min_confirmations,
                 layer3_condition_keys=list(resonance_cfg.buy_conditions or []),
                 total_score=total_score,
@@ -193,6 +200,7 @@ def scan_signals(
     sell_signals = _scan_sell_signals(
         include_sell_symbols or [], price_map, day_data, latest_date,
         next_exec_date, market_score_val, bracket, include_sell_context or {},
+        scheme_overrides=_overrides,
     )
     return buy_candidates, sell_signals[:top_n]
 
@@ -206,6 +214,15 @@ def _target_schemes(scheme_id: str) -> List[str]:
 
 
 def _factor_scores(day_data: pd.DataFrame, weights: Dict[str, float], factor_names: set) -> pd.Series:
+    """因子截面评分：60% 全市场排名 + 40% Z-score 绝对值锚定。
+
+    纯排名无法区分"刚好比90%股票好"和"远超99%股票"。
+    Z-score 分量用 sigmoid 归一化到 0-1，捕捉因子值的绝对偏离程度。
+    """
+    def _sigmoid(x):
+        """sigmoid 映射: R → (0, 1), x=0 → 0.5"""
+        return 1.0 / (1.0 + np.exp(-x))
+
     symbols = day_data["symbol"].astype(str)
     score = pd.Series(0.0, index=symbols.values)
     weight_sum = 0.0
@@ -215,11 +232,21 @@ def _factor_scores(day_data: pd.DataFrame, weights: Dict[str, float], factor_nam
         if factor not in day_data.columns:
             continue
         vals = pd.to_numeric(day_data[factor], errors="coerce")
-        if vals.notna().sum() < 3:
+        valid = vals.notna()
+        if valid.sum() < 3:
             continue
-        pct = vals.rank(pct=True, method="average")
-        directional = pct if weight >= 0 else 1 - pct
-        score = score.add(pd.Series(directional.values * abs(weight) * 100, index=symbols.values), fill_value=0.0)
+        # 1) 截面排名分量 0-1
+        rank_pct = vals.rank(pct=True, method="average").values
+        # 2) Z-score 绝对值分量 (sigmoid 归一化到 0-1)
+        mean_val = vals.mean()
+        std_val = vals.std(ddof=0)
+        z = ((vals.values - mean_val) / max(std_val, 1e-9)).clip(-4, 4)
+        z_norm = _sigmoid(z)  # 0-1, z=0 → 0.5
+        # 方向调整：负权重因子反转
+        rank_dir = rank_pct if weight >= 0 else 1 - rank_pct
+        z_dir = z_norm if weight >= 0 else 1 - z_norm
+        combined = rank_dir * 0.6 + z_dir * 0.4  # 0-1
+        score = score.add(pd.Series(combined * abs(weight) * 100, index=symbols.values), fill_value=0.0)
         weight_sum += abs(weight)
     if weight_sum <= 0:
         return pd.Series(dtype=float)
@@ -246,6 +273,11 @@ def _build_price_map(price_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 def _check_layer1(bars: pd.DataFrame, scheme_id: str) -> Tuple[bool, float, str]:
+    """L1 趋势过滤：连续型评分，基于价格在关键均线间的归一化位置。
+
+    旧版离散阶梯（8种分数）无法区分 MA20 偏离 +0.1% vs +15% 的股票。
+    新版用连续映射替代 if-else 布尔判断。
+    """
     close = bars["close"].astype(float)
     if len(close) < 40:
         return False, 0.0, "L1数据不足"
@@ -254,22 +286,31 @@ def _check_layer1(bars: pd.DataFrame, scheme_id: str) -> Tuple[bool, float, str]
     current = close.iloc[-1]
     low20 = close.iloc[-20:].min()
 
+    def _clamp01(v: float, lo: float, hi: float) -> float:
+        """线性映射 [lo, hi] → [0, 1]，超出范围截断。"""
+        return max(0.0, min(1.0, (v - lo) / max(hi - lo, 1e-9)))
+
+    pos_ma20 = (current / ma20 - 1) if ma20 > 0 else 0.0
+    ma20_ma40_ratio = (ma20 / ma40 - 1) if ma40 > 0 else 0.0
+    above_low20_ratio = (current / low20 - 1) if low20 > 0 else 0.0
+
     if scheme_id == "pullback":
         ma20_series = close.rolling(20).mean().iloc[-10:]
         recent_close = close.iloc[-10:]
         had_uptrend = bool((recent_close.values > ma20_series.values).any())
         trend_ok = had_uptrend and ma20 >= ma40 * 0.995 and current > low20 * 1.03
-        score = 0.0
-        score += 35 if had_uptrend else 0
-        score += 30 if ma20 >= ma40 * 0.995 else 0
-        score += 35 if current > low20 * 1.03 else 0
+        s_uptrend = 35.0 if had_uptrend else 0.0
+        s_ma40 = 30.0 * _clamp01(ma20_ma40_ratio, -0.005, 0.03)
+        s_low20 = 35.0 * _clamp01(above_low20_ratio, 0.03, 0.12)
+        score = s_uptrend + s_ma40 + s_low20
         return trend_ok, score, "L1上升趋势回调未破位"
 
+    # trend_momentum / breakout / balanced
     trend_ok = current > ma20 and ma20 > ma40 and current > low20 * 1.03
-    score = 0.0
-    score += 40 if current > ma20 else 0
-    score += 35 if ma20 > ma40 else 0
-    score += 25 if current > low20 * 1.03 else 0
+    s_ma20 = 40.0 * _clamp01(pos_ma20, 0.0, 0.10)
+    s_ma40 = 35.0 * _clamp01(ma20_ma40_ratio, 0.0, 0.05)
+    s_low20 = 25.0 * _clamp01(above_low20_ratio, 0.03, 0.15)
+    score = s_ma20 + s_ma40 + s_low20
     return trend_ok, score, "L1价格在MA20上方且MA20高于MA40"
 
 
@@ -380,15 +421,22 @@ def _build_entry_audit_context(
     }
 
 
-def _resonance_config(scheme_id: str) -> ResonanceConfig:
-    scheme = BUILTIN_SCHEMES.get(str(scheme_id))
+def _resonance_config(scheme_id: str, overrides: Optional[Dict[str, StrategyScheme]] = None) -> ResonanceConfig:
+    scheme = (overrides or {}).get(str(scheme_id)) or BUILTIN_SCHEMES.get(str(scheme_id))
     cfg = getattr(scheme, "resonance_config", None) if scheme else None
     if cfg is None:
         return ResonanceConfig(min_confirmations=DEFAULT_MIN_CONFIRMATIONS)
     return cfg
 
 
-def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_config: Optional[ResonanceConfig] = None) -> Tuple[int, List[str]]:
+def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_config: Optional[ResonanceConfig] = None) -> Tuple[int, float, List[str]]:
+    """L3 共振确认：每个条件按满足强度贡献 0-1 分（非二值）。
+
+    Returns:
+        confirmations: 强度 > 0 的条件数（用于 min_confirmations 过滤）
+        l3_score: sum(condition_strengths) / layer3_total × 100（0-100 连续评分）
+        reasons: 人类可读原因列表
+    """
     close = bars["close"].astype(float)
     current = float(close.iloc[-1])
     ma5 = float(close.rolling(5).mean().iloc[-1])
@@ -397,13 +445,12 @@ def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_
     pb = (hh20 - current) / hh20 if hh20 > 0 else 0.0
     rsi = _num(row.get("rsi14"), np.nan)
     boll_pos = _num(row.get("boll_position"), np.nan)
-    # 快照中 boll_position 可能是百分制，也可能是 0-1，统一成 0-1。
     boll01 = boll_pos / 100.0 if boll_pos > 1 else boll_pos
     vol_ratio = _num(row.get("volume_ratio"), 1.0)
     mom5 = current / float(close.iloc[-6]) - 1 if len(close) >= 6 and close.iloc[-6] > 0 else 0.0
     mom20 = current / float(close.iloc[-21]) - 1 if len(close) >= 21 and close.iloc[-21] > 0 else 0.0
-    
-    # 获取资金流和相对换手因子
+    low20 = float(close.iloc[-20:].min())
+
     main_mf_amount = _num(row.get("main_net_mf_amount"), 0.0)
     large_elg_mf_amount = _num(row.get("large_elg_net_mf_amount"), 0.0)
     main_mf_rank = _num(row.get("main_net_mf_rank"), 0.0)
@@ -411,76 +458,81 @@ def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_
     relative_turnover_5d = _num(row.get("relative_turnover_5d"), 1.0)
     amount_percentile_60d = _num(row.get("amount_percentile_60d"), 0.0)
     turnover_percentile_60d = _num(row.get("turnover_percentile_60d"), 0.0)
-    
-    checks: List[Tuple[str, bool, str]]
+
+    def _linear_strength(v: float, lo: float, hi: float, reverse: bool = False) -> float:
+        """线性强度映射：[lo, hi] → [0, 1]，超出范围截断。reverse=True 时反向。"""
+        s = max(0.0, min(1.0, (v - lo) / max(hi - lo, 1e-9)))
+        return 1.0 - s if reverse else s
+
+    def _center_strength(v: float, lo: float, hi: float) -> float:
+        """中心加权：越接近 [lo, hi] 区间中心越高，偏离越远越低。"""
+        mid = (lo + hi) / 2.0
+        half = (hi - lo) / 2.0
+        if half <= 0:
+            return 0.0
+        return max(0.0, 1.0 - abs(v - mid) / half)
+
+    strengths: List[Tuple[str, float, str]] = []
     if scheme_id == "trend_momentum":
-        checks = [
-            # 资金流条件
-            ("large_elg_net_mf_positive", large_elg_mf_amount > 50000, f"超大单净流入{large_elg_mf_amount/10000:.1f}万"),
-            ("main_net_mf_positive", main_mf_amount > 10000, f"主力净流入{main_mf_amount/10000:.1f}万"),
-            ("large_elg_net_mf_rank_high", large_elg_mf_rank > 0.7, f"超大单流入排名{large_elg_mf_rank:.2f}"),
-            # 相对换手条件
-            ("relative_turnover_5d_high", 1.0 < relative_turnover_5d < 1.4, f"相对换手{relative_turnover_5d:.2f}x"),
-            ("amount_percentile_60d_high", 0.6 < amount_percentile_60d < 0.85, f"成交额分位{amount_percentile_60d:.2f}"),
-            ("volume_expand", 1.1 < vol_ratio < 1.6, f"温和放量{vol_ratio:.1f}x"),
-            # 趋势条件
-            ("momentum_5d_strong", mom5 > 0.025, f"5日动量{mom5:.1%}"),
-            ("momentum_20d_strong", mom20 > 0.04, f"20日动量{mom20:.1%}"),
-            ("ma5_above_ma20", ma5 > ma20 * 1.02, "MA5显著高于MA20"),
-            ("rsi_not_extreme", 55 < rsi < 68, f"RSI强势区间{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+        strengths = [
+            ("large_elg_net_mf_positive", _linear_strength(large_elg_mf_amount / 10000, 5, 500), f"超大单净流入{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive", _linear_strength(main_mf_amount / 10000, 1, 100), f"主力净流入{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_rank_high", _linear_strength(large_elg_mf_rank, 0.7, 0.95), f"超大单流入排名{large_elg_mf_rank:.2f}"),
+            ("relative_turnover_5d_high", _center_strength(relative_turnover_5d, 1.0, 1.4), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", _center_strength(amount_percentile_60d, 0.6, 0.85), f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_expand", _center_strength(vol_ratio, 1.1, 1.6), f"温和放量{vol_ratio:.1f}x"),
+            ("momentum_5d_strong", _linear_strength(mom5, 0.025, 0.12), f"5日动量{mom5:.1%}"),
+            ("momentum_20d_strong", _linear_strength(mom20, 0.04, 0.20), f"20日动量{mom20:.1%}"),
+            ("ma5_above_ma20", _linear_strength(ma5 / ma20 if ma20 > 0 else 0, 1.02, 1.08), "MA5显著高于MA20"),
+            ("rsi_not_extreme", _center_strength(rsi if not np.isnan(rsi) else 61.5, 55, 68), f"RSI强势区间{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
         ]
     elif scheme_id == "pullback":
-        checks = [
-            # 资金流条件
-            ("main_net_mf_negative_improving", main_mf_amount > -50000, f"主力净流出改善{main_mf_amount/10000:.1f}万"),
-            ("large_elg_net_mf_negative_improving", large_elg_mf_amount > -100000, f"超大单净流出改善{large_elg_mf_amount/10000:.1f}万"),
-            # 相对换手条件
-            ("relative_turnover_5d_low", relative_turnover_5d < 0.9, f"相对换手{relative_turnover_5d:.2f}x"),
-            ("turnover_percentile_60d_low", turnover_percentile_60d < 0.4, f"换手率分位{turnover_percentile_60d:.2f}"),
-            ("volume_calm", vol_ratio < 1.0, f"缩量{vol_ratio:.1f}x"),
-            # 技术条件
-            ("rsi_oversold", not np.isnan(rsi) and rsi < 45, f"RSI={rsi:.0f}"),
-            ("boll_lower", not np.isnan(boll01) and boll01 < 0.35, f"布林位置{boll01:.2f}"),
-            ("pullback_range", 0.05 <= pb <= 0.15, f"回撤{pb:.1%}"),
-            ("not_break_20d_low", current > close.iloc[-20:].min() * 1.03, "不破20日低点"),
-            ("near_support", current >= close.iloc[-1] * 0.98, "当日未明显破位"),
+        strengths = [
+            ("main_net_mf_negative_improving", _linear_strength(main_mf_amount / 10000, -50, 50), f"主力净流出改善{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_negative_improving", _linear_strength(large_elg_mf_amount / 10000, -100, 100), f"超大单净流出改善{large_elg_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_low", _linear_strength(relative_turnover_5d, 0.5, 0.9, reverse=True), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("turnover_percentile_60d_low", _linear_strength(turnover_percentile_60d, 0.1, 0.4, reverse=True), f"换手率分位{turnover_percentile_60d:.2f}"),
+            ("volume_calm", _linear_strength(vol_ratio, 0.5, 1.0, reverse=True), f"缩量{vol_ratio:.1f}x"),
+            ("rsi_oversold", _linear_strength(rsi if not np.isnan(rsi) else 45, 25, 45, reverse=True), f"RSI={rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("boll_lower", _linear_strength(boll01 if not np.isnan(boll01) else 0.5, 0.1, 0.35, reverse=True), f"布林位置{boll01:.2f}" if not np.isnan(boll01) else "布林缺失"),
+            ("pullback_range", _center_strength(pb, 0.05, 0.15), f"回撤{pb:.1%}"),
+            ("not_break_20d_low", _linear_strength(current / low20 if low20 > 0 else 1.0, 1.03, 1.10), "不破20日低点"),
+            ("near_support", _center_strength(current / close.iloc[-1] if close.iloc[-1] > 0 else 1.0, 0.98, 1.02), "当日未明显破位"),
         ]
     elif scheme_id == "breakout":
         prev = close.iloc[-15:-5]
         range_pct = (prev.max() - prev.min()) / prev.mean() if len(prev) >= 5 and prev.mean() > 0 else 1.0
-        checks = [
-            # 资金流条件
-            ("large_elg_net_mf_positive_strong", large_elg_mf_amount > 50000, f"超大单净流入强劲{large_elg_mf_amount/10000:.1f}万"),
-            ("main_net_mf_positive_strong", main_mf_amount > 30000, f"主力净流入强劲{main_mf_amount/10000:.1f}万"),
-            # 相对换手条件
-            ("relative_turnover_5d_high", relative_turnover_5d > 1.2, f"相对换手{relative_turnover_5d:.2f}x"),
-            ("amount_percentile_60d_high", amount_percentile_60d > 0.7, f"成交额分位{amount_percentile_60d:.2f}"),
-            ("volume_surge", vol_ratio > 1.4, f"量比{vol_ratio:.1f}x"),
-            # 突破条件
-            ("break_platform", len(prev) >= 5 and current > float(prev.max()) * 1.01, "突破平台上沿"),
-            ("ma5_above_ma20", ma5 > ma20 * 1.02, "MA5显著高于MA20"),
-            ("narrow_range", range_pct < 0.10, f"平台振幅{range_pct:.1%}"),
-            ("momentum_5d_strong", mom5 > 0.03, f"5日动量{mom5:.1%}"),
-            ("boll_upper_break", not np.isnan(boll01) and boll01 > 0.7, f"布林上沿突破{boll01:.2f}"),
+        break_ratio = current / float(prev.max()) if len(prev) >= 5 and float(prev.max()) > 0 else 1.0
+        strengths = [
+            ("large_elg_net_mf_positive_strong", _linear_strength(large_elg_mf_amount / 10000, 5, 500), f"超大单净流入强劲{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive_strong", _linear_strength(main_mf_amount / 10000, 3, 300), f"主力净流入强劲{main_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_high", _linear_strength(relative_turnover_5d, 1.2, 2.0), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", _linear_strength(amount_percentile_60d, 0.7, 0.95), f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_surge", _linear_strength(vol_ratio, 1.4, 3.0), f"量比{vol_ratio:.1f}x"),
+            ("break_platform", _linear_strength(break_ratio, 1.01, 1.05), "突破平台上沿"),
+            ("ma5_above_ma20", _linear_strength(ma5 / ma20 if ma20 > 0 else 0, 1.02, 1.08), "MA5显著高于MA20"),
+            ("narrow_range", _linear_strength(range_pct, 0.03, 0.08, reverse=True), f"平台振幅{range_pct:.1%}"),
+            ("momentum_5d_strong", _linear_strength(mom5, 0.03, 0.15), f"5日动量{mom5:.1%}"),
+            ("boll_upper_break", _linear_strength(boll01 if not np.isnan(boll01) else 0.5, 0.7, 0.95), f"布林上沿突破{boll01:.2f}" if not np.isnan(boll01) else "布林缺失"),
         ]
     else:  # balanced
-        checks = [
-            # 资金流基础条件
-            ("main_net_mf_not_negative", main_mf_amount > -20000, f"主力不净流出{main_mf_amount/10000:.1f}万"),
-            # 相对换手基础条件
-            ("relative_turnover_5d_not_low", relative_turnover_5d > 0.8, f"相对换手{relative_turnover_5d:.2f}x"),
-            # 技术基础条件
-            ("ma5_above_ma20", ma5 > ma20, "MA5高于MA20"),
-            ("rsi_not_extreme", np.isnan(rsi) or rsi < 70, f"RSI不过热{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
-            ("volume_expand", vol_ratio > 1.0, f"放量{vol_ratio:.1f}x"),
-            ("momentum_5d_positive", mom5 > 0, f"5日动量{mom5:.1%}"),
+        strengths = [
+            ("main_net_mf_not_negative", _linear_strength(main_mf_amount / 10000, -20, 50), f"主力不净流出{main_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_not_low", _linear_strength(relative_turnover_5d, 0.8, 1.5), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("ma5_above_ma20", _linear_strength(ma5 / ma20 if ma20 > 0 else 0, 1.0, 1.05), "MA5高于MA20"),
+            ("rsi_not_extreme", 1.0 - _linear_strength(rsi if not np.isnan(rsi) else 50, 70, 90) if not np.isnan(rsi) and rsi > 70 else _linear_strength(rsi if not np.isnan(rsi) else 50, 30, 70), f"RSI不过热{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("volume_expand", _linear_strength(vol_ratio, 1.0, 1.8), f"放量{vol_ratio:.1f}x"),
+            ("momentum_5d_positive", _linear_strength(mom5, 0.0, 0.10), f"5日动量{mom5:.1%}"),
         ]
-    
+
     cfg = resonance_config or _resonance_config(scheme_id)
     enabled = set(cfg.buy_conditions or [])
-    active = [item for item in checks if not enabled or item[0] in enabled]
-    reasons = [label for _, ok, label in active if ok]
-    return len(reasons), reasons
+    active = [(name, s, label) for name, s, label in strengths if not enabled or name in enabled]
+    confirmations = sum(1 for _, s, _ in active if s > 0)
+    layer3_total = len(active) or 1
+    l3_score = sum(s for _, s, _ in active) / layer3_total * 100.0
+    reasons = [label for _, s, label in active if s > 0]
+    return confirmations, l3_score, reasons
 
 
 def _check_l4_tradability(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[bool, str, List[str]]:
@@ -577,6 +629,7 @@ def _scan_sell_signals(
     market_score: float,
     bracket: PositionBracket,
     sell_context: Dict[str, Dict],
+    scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
 ) -> List[ScanSignal]:
     results = []
     symbol_set = [str(s) for s in symbols]
@@ -587,7 +640,8 @@ def _scan_sell_signals(
             continue
         context = sell_context.get(symbol, {}) or {}
         scheme_id = _infer_scheme_id(context)
-        exit_cfg = getattr(BUILTIN_SCHEMES.get(scheme_id), "exit_config", None)
+        scheme = (scheme_overrides or {}).get(scheme_id) or BUILTIN_SCHEMES.get(scheme_id)
+        exit_cfg = getattr(scheme, "exit_config", None) if scheme else None
         close = bars["close"].astype(float)
         current = float(close.iloc[-1])
         ma5 = float(close.rolling(5).mean().iloc[-1])

@@ -18,18 +18,19 @@ from data_loader import load_data, FACTOR_NAME_MAP, NAME_MAP
 from signals.engine import SignalEngine, SignalFormatter
 from signals.scanner import scan_signals
 from signals.portfolio import PortfolioManager, PoolItem
-from strategy.schemes import BUILTIN_SCHEMES
+from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme, ExitConfig, ResonanceConfig
+from market.timing import MarketTimingModel
 from theme import (
     inject_theme, metric_row, section_header, badge, badge_html,
     empty_state, signal_card, topbar, C,
 )
 
 
-def _scan_signals_compat(*, factor_df, price_df, factor_names, scheme_id, market_score, top_n, include_sell_symbols, include_sell_context):
+def _scan_signals_compat(*, factor_df, price_df, factor_names, scheme_id, market_score, top_n, include_sell_symbols, include_sell_context, scheme_overrides=None):
     """兼容 Streamlit 旧进程缓存的 signals.scanner.scan_signals 签名。
 
     线上 Streamlit 进程可能在模块更新前已启动，rerun 时会复用 sys.modules 中的旧函数，
-    旧函数不接受 include_sell_context。这里先避免页面直接 TypeError；进程重启后会走新版签名。
+    旧函数不接受 include_sell_context / scheme_overrides。这里先避免页面直接 TypeError；进程重启后会走新版签名。
     """
     kwargs = {
         "scheme_id": scheme_id,
@@ -37,11 +38,15 @@ def _scan_signals_compat(*, factor_df, price_df, factor_names, scheme_id, market
         "top_n": top_n,
         "include_sell_symbols": list(include_sell_symbols),
     }
+    sig_params = inspect.signature(scan_signals).parameters
     try:
-        if "include_sell_context" in inspect.signature(scan_signals).parameters:
+        if "include_sell_context" in sig_params:
             kwargs["include_sell_context"] = include_sell_context
+        if "scheme_overrides" in sig_params:
+            kwargs["scheme_overrides"] = scheme_overrides
     except (TypeError, ValueError):
         kwargs["include_sell_context"] = include_sell_context
+        kwargs["scheme_overrides"] = scheme_overrides
     return scan_signals(factor_df, price_df, factor_names, **kwargs)
 
 # ========== 页面配置 ==========
@@ -82,8 +87,9 @@ hotspot = st.session_state.hotspot
 
 # ── 信号缓存（避免每次 rerun 重算）──
 @st.cache_data(ttl=120, show_spinner=False)
-def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key, portfolio_context_key):
+def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key, portfolio_context_key, overrides_hash_key):
     """按新短线方案扫描信号；用 hashable key 触发缓存，实际数据从 session_state 取。"""
+    overrides = st.session_state.get("_signal_scan_overrides")
     buy, sell = _scan_signals_compat(
         factor_df=st.session_state._factor_df,
         price_df=st.session_state._price_df,
@@ -93,6 +99,7 @@ def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfol
         top_n=20,
         include_sell_symbols=list(portfolio_symbols_key),
         include_sell_context=st.session_state.get("_portfolio_signal_context", {}),
+        scheme_overrides=overrides,
     )
     return buy, sell
 
@@ -192,11 +199,137 @@ def _strategy_resonance_summary(scheme_id: str):
         })
     return rows
 
+def _strategy_factor_weights_summary(scheme_id: str):
+    """当前扫描策略的因子权重摘要。balanced 展示三个子策略。
+    
+    这些权重来自 BUILTIN_SCHEMES（择股内置默认），与回测页面可编辑的因子权重互不影响。
+    """
+    target_ids = ["trend_momentum", "pullback", "breakout"] if scheme_id == "balanced" else [scheme_id]
+    all_factors = set()
+    rows = []
+    for sid in target_ids:
+        scheme = BUILTIN_SCHEMES.get(sid)
+        if scheme is None:
+            continue
+        fw = getattr(scheme, "factor_weights", {})
+        all_factors.update(fw.keys())
+        # 按绝对值排序
+        sorted_fw = sorted(fw.items(), key=lambda x: abs(x[1]), reverse=True)
+        for f, w in sorted_fw:
+            cn = FACTOR_NAME_MAP.get(f, f)
+            rows.append({"策略": scheme.name, "因子": cn, "权重": w})
+    return rows
+
+
+def _build_scan_overrides(target_ids: list) -> None:
+    """从 session_state widget 值构造 scheme_overrides dict，存入 _signal_scan_overrides。"""
+    overrides = {}
+    from strategy.schemes import StrategyScheme, ExitConfig, ResonanceConfig
+    from copy import deepcopy
+    for sid in target_ids:
+        default_scheme = BUILTIN_SCHEMES.get(sid)
+        if default_scheme is None:
+            continue
+        scheme = StrategyScheme.from_dict(default_scheme.to_dict()) if hasattr(default_scheme, "to_dict") else deepcopy(default_scheme)
+        # 因子权重
+        fw = {}
+        for f in getattr(default_scheme, "factor_weights", {}):
+            fw[f] = float(st.session_state.get(f"scan_fw_{sid}_{f}", getattr(default_scheme, "factor_weights", {}).get(f, 0)))
+        scheme.factor_weights = fw
+        # L3 共振
+        rc = getattr(scheme, "resonance_config", ResonanceConfig())
+        if rc is not None:
+            rc.min_confirmations = int(st.session_state.get(f"scan_l3_min_{sid}", getattr(rc, "min_confirmations", 3)))
+            # 过滤启用条件
+            buy_enabled = [c for c in (getattr(rc, "buy_conditions", []) or []) if st.session_state.get(f"scan_buy_{sid}_{c}", True)]
+            sell_enabled = [c for c in (getattr(rc, "sell_conditions", []) or []) if st.session_state.get(f"scan_sell_{sid}_{c}", True)]
+            rc.buy_conditions = buy_enabled
+            rc.sell_conditions = sell_enabled
+            scheme.resonance_config = rc
+        # ATR
+        scheme.stop_loss_atr_mult = float(st.session_state.get(f"scan_sl_atr_{sid}", 2.0))
+        scheme.take_profit_atr_mult = float(st.session_state.get(f"scan_tp_atr_{sid}", 3.0))
+        scheme.trailing_atr_mult = float(st.session_state.get(f"scan_trail_atr_{sid}", 2.0))
+        scheme.atr_period = int(st.session_state.get(f"scan_atr_p_{sid}", 14))
+        # 仓位
+        scheme.position_pct_per_entry = float(st.session_state.get(f"scan_pos_pct_{sid}", 0.30))
+        scheme.max_add_times = int(st.session_state.get(f"scan_max_add_{sid}", 2))
+        scheme.max_single_pct = float(st.session_state.get(f"scan_max_single_{sid}", 30)) / 100.0
+        # 开仓契约
+        scheme.min_entry_condition_count = int(st.session_state.get(f"scan_entry_cc_{sid}", 3))
+        scheme.enable_market_timing = bool(st.session_state.get(f"scan_market_timing_{sid}", True))
+        # 退出规则
+        from dataclasses import fields
+        ec_fields = {f.name for f in fields(ExitConfig)}
+        ec_kwargs = {}
+        field_map = {
+            "enable_market_defense_exit": f"scan_exit_market_defense_{sid}",
+            "enable_strategy_failure_exit": f"scan_exit_strategy_failure_{sid}",
+            "enable_trailing_exit": f"scan_exit_trailing_{sid}",
+            "enable_time_stop": f"scan_exit_time_stop_{sid}",
+            "enable_max_holding_exit": f"scan_exit_max_holding_{sid}",
+            "max_holding_days": f"scan_exit_max_days_{sid}",
+            "time_stop_days": f"scan_exit_time_stop_days_{sid}",
+            "time_stop_min_profit_pct": f"scan_exit_time_stop_profit_{sid}",
+            "market_defense_score": f"scan_exit_defense_score_{sid}",
+            "failure_window_days": f"scan_exit_failure_window_{sid}",
+            "trailing_activation_pct": f"scan_trail_act_pct_{sid}",
+            "trailing_activation_atr_mult": f"scan_trail_act_atr_{sid}",
+        }
+        for field_name, ss_key in field_map.items():
+            if field_name in ec_fields and ss_key in st.session_state:
+                ec_kwargs[field_name] = st.session_state[ss_key]
+        scheme.exit_config = ExitConfig(**{k: v for k, v in ec_kwargs.items() if k in ec_fields})
+        overrides[sid] = scheme
+    st.session_state["_signal_scan_overrides"] = overrides
+
+
+def _compute_overrides_hash() -> str:
+    """计算当前覆写参数的 hash，用于缓存失效。"""
+    import hashlib
+    import json
+    overrides = st.session_state.get("_signal_scan_overrides", {})
+    data = {}
+    for sid, scheme in sorted(overrides.items()):
+        data[sid] = scheme.to_dict() if hasattr(scheme, "to_dict") else str(scheme)
+    raw = json.dumps(data, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+# ── 大盘择时（session_state 缓存，避免 pickle tushare 对象）──
+def _load_market_timing() -> dict:
+    """拉取近 90 日大盘择时评分。
+
+    注意：不使用 @st.cache_data 装饰器，因为 tushare DataApi 内部
+    使用了 functools.partial 作为 __getattr__ 返回值，pickle 反序列化
+    时会触发不兼容的 requests.post(timeout=partial(...)) 调用。
+    """
+    from datetime import date as dt_date, timedelta
+    try:
+        model = MarketTimingModel()
+        end = dt_date.today().strftime('%Y%m%d')
+        start = (dt_date.today() - timedelta(days=90)).strftime('%Y%m%d')
+        model.fetch_all(start, end)
+        df = model.to_dataframe()
+        latest_score = model.score_on(dt_date.today()) if not df.empty else 50.0
+        return {"df": df, "latest_score": latest_score, "loaded": True}
+    except Exception as e:
+        return {"df": None, "latest_score": 50.0, "loaded": False, "error": str(e)}
+
+def _get_market_score() -> float:
+    """从 session_state 获取大盘评分，10 分钟内只拉取一次。"""
+    import time as _time
+    now = _time.time()
+    last = st.session_state.get("_mt_last_fetch", 0)
+    if now - last > 600 or "_mt_cache" not in st.session_state:
+        st.session_state._mt_cache = _load_market_timing()
+        st.session_state._mt_last_fetch = now
+    return float(st.session_state._mt_cache.get("latest_score", 50.0))
+
+
 # ── 新方案默认状态 ──
 if "signal_scheme_id" not in st.session_state:
     st.session_state.signal_scheme_id = "balanced"
-if "market_score_override" not in st.session_state:
-    st.session_state.market_score_override = 50.0
 
 # ========== 顶部 ==========
 left_info = f"🎯 <strong>量化选股</strong>"
@@ -318,8 +451,17 @@ def show_factor_detail(symbol, factor_df, price_df, latest_date):
 # ========== 页面 0: 信号 ==========
 if page_idx == 0:
     # ── 新方案扫描控制 ──
-    with st.expander("⚙ 新方案信号扫描", expanded=True):
-        c1, c2 = st.columns([2, 1])
+    with st.expander("⚙ 择股扫描参数", expanded=True):
+        st.info(
+            "📌 **择股 vs 择时数据隔离**：本页扫描参数覆写 `BUILTIN_SCHEMES` 内置默认值，"
+            "与 `策略回测` 页可编辑参数完全独立。修改回测页参数不影响本页信号扫描结果。",
+            icon="🔒"
+        )
+        # 大盘择时懒加载（首次渲染时拉取，不会在模块级触发 import 错误）
+        _market_score = _get_market_score()  # 自动拉取 + 10 分钟缓存
+        _mt = st.session_state.get("_mt_cache", {"df": None, "loaded": False})
+
+        c1, c2, c3 = st.columns([3, 1, 1])
         with c1:
             scheme_options = {
                 "balanced": "全部策略/组合器",
@@ -334,21 +476,285 @@ if page_idx == 0:
                 index=list(scheme_options.keys()).index(st.session_state.signal_scheme_id),
             )
         with c2:
-            market_score_input = st.slider(
-                "大盘评分",
-                0.0, 100.0, float(st.session_state.market_score_override), 1.0,
-                help="临时使用手动评分；后续接入 market/timing.py 实时评分。",
+            if _mt["loaded"]:
+                score_color = "green" if _market_score >= 60 else "orange" if _market_score >= 40 else "red"
+                st.metric("大盘评分（实时）", f"{_market_score:.0f}", delta=None)
+                st.caption("来源: Tushare MarketTimingModel")
+            else:
+                st.metric("大盘评分", "50", delta="⚠️ 离线")
+                st.caption(f"不可用: {_mt.get('error', '未知')}")
+        with c3:
+            bracket_label = (
+                "满仓" if _market_score >= 80 else "高仓" if _market_score >= 60
+                else "中等" if _market_score >= 40 else "低仓" if _market_score >= 20 else "防御"
             )
+            st.metric("仓位档位", bracket_label)
+        # 大盘择时评分明细
+        if _mt["loaded"] and _mt["df"] is not None and not _mt["df"].empty:
+            with st.expander("📊 大盘择时评分明细", expanded=False):
+                latest_row = _mt["df"].iloc[-1]
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("趋势强度", f"{latest_row.get('trend', 0):.0f}/25")
+                d2.metric("北向资金", f"{latest_row.get('capital', 0):.0f}/25")
+                d3.metric("融资热度", f"{latest_row.get('leverage', 0):.0f}/25")
+                d4.metric("市场活跃度", f"{latest_row.get('activity', 0):.0f}/25")
+                recent = _mt["df"]["score"].tail(5).tolist()
+                st.caption(f"近 5 日评分: {recent}")
         st.caption("当前扫描路径：大盘评分 → 股票池过滤 → 三策略独立候选 → L1趋势过滤 → L2形态匹配 → L3共振确认。信号日为T日收盘，建议成交日为T+1。")
-        resonance_rows = _strategy_resonance_summary(selected_scheme)
-        if resonance_rows:
-            st.caption("策略共振配置（与信号卡 共振 x/y 口径一致）")
-            st.dataframe(pd.DataFrame(resonance_rows), width="stretch", hide_index=True)
-        if selected_scheme != st.session_state.signal_scheme_id or market_score_input != st.session_state.market_score_override:
+
+        # ── 参数持久化初始化 ──
+        target_ids = ["trend_momentum", "pullback", "breakout"] if selected_scheme == "balanced" else [selected_scheme]
+        for sid in target_ids:
+            default_scheme = BUILTIN_SCHEMES.get(sid)
+            if default_scheme is None:
+                continue
+            # 恢复默认值（切换策略或首次加载时）
+            if f"_scan_{sid}_loaded" not in st.session_state or st.session_state.get("_scan_loaded_scheme") != selected_scheme:
+                st.session_state[f"_scan_{sid}_loaded"] = True
+                for f, w in getattr(default_scheme, "factor_weights", {}).items():
+                    st.session_state[f"scan_fw_{sid}_{f}"] = float(w)
+                rc = getattr(default_scheme, "resonance_config", ResonanceConfig())
+                st.session_state[f"scan_l3_min_{sid}"] = int(getattr(rc, "min_confirmations", 3))
+                for cond in (getattr(rc, "buy_conditions", []) or []):
+                    st.session_state[f"scan_buy_{sid}_{cond}"] = True
+                for cond in (getattr(rc, "sell_conditions", []) or []):
+                    st.session_state[f"scan_sell_{sid}_{cond}"] = True
+                ec = getattr(default_scheme, "exit_config", ExitConfig())
+                st.session_state[f"scan_sl_atr_{sid}"] = float(getattr(default_scheme, "stop_loss_atr_mult", 2.0))
+                st.session_state[f"scan_tp_atr_{sid}"] = float(getattr(default_scheme, "take_profit_atr_mult", 3.0))
+                st.session_state[f"scan_trail_atr_{sid}"] = float(getattr(default_scheme, "trailing_atr_mult", 2.0))
+                st.session_state[f"scan_atr_p_{sid}"] = int(getattr(default_scheme, "atr_period", 14))
+                st.session_state[f"scan_pos_pct_{sid}"] = float(getattr(default_scheme, "position_pct_per_entry", 0.30))
+                st.session_state[f"scan_max_add_{sid}"] = int(getattr(default_scheme, "max_add_times", 2))
+                st.session_state[f"scan_max_single_{sid}"] = int(getattr(default_scheme, "max_single_pct", 0.30) * 100)
+                st.session_state[f"scan_entry_cc_{sid}"] = int(getattr(default_scheme, "min_entry_condition_count", 3))
+                st.session_state[f"scan_market_timing_{sid}"] = bool(getattr(default_scheme, "enable_market_timing", True))
+                # 退出规则
+                st.session_state[f"scan_exit_market_defense_{sid}"] = bool(getattr(ec, "enable_market_defense_exit", True))
+                st.session_state[f"scan_exit_strategy_failure_{sid}"] = bool(getattr(ec, "enable_strategy_failure_exit", True))
+                st.session_state[f"scan_exit_trailing_{sid}"] = bool(getattr(ec, "enable_trailing_exit", True))
+                st.session_state[f"scan_exit_time_stop_{sid}"] = bool(getattr(ec, "enable_time_stop", True))
+                st.session_state[f"scan_exit_max_holding_{sid}"] = bool(getattr(ec, "enable_max_holding_exit", True))
+                st.session_state[f"scan_exit_max_days_{sid}"] = int(getattr(ec, "max_holding_days", 20))
+                st.session_state[f"scan_exit_time_stop_days_{sid}"] = int(getattr(ec, "time_stop_days", 7))
+                st.session_state[f"scan_exit_time_stop_profit_{sid}"] = float(getattr(ec, "time_stop_min_profit_pct", 0.0))
+                st.session_state[f"scan_exit_defense_score_{sid}"] = float(getattr(ec, "market_defense_score", 20.0))
+                st.session_state[f"scan_exit_failure_window_{sid}"] = int(getattr(ec, "failure_window_days", 3))
+                st.session_state[f"scan_trail_act_pct_{sid}"] = float(getattr(ec, "trailing_activation_pct", 0.05))
+                st.session_state[f"scan_trail_act_atr_{sid}"] = float(getattr(ec, "trailing_activation_atr_mult", 1.0))
+        st.session_state["_scan_loaded_scheme"] = selected_scheme
+
+        # ── 检测参数变更 ──
+        if selected_scheme != st.session_state.signal_scheme_id:
             st.session_state.signal_scheme_id = selected_scheme
-            st.session_state.market_score_override = market_score_input
             compute_signals.clear()
             st.rerun()
+
+        # ── 各策略参数编辑器 ──
+        st.divider()
+        st.caption(f"📝 **编辑参数**（{len(target_ids)} 个策略，修改后需点「确认参数」→「重新扫描」生效）")
+
+        for sid in target_ids:
+            default_scheme = BUILTIN_SCHEMES.get(sid)
+            if default_scheme is None:
+                continue
+            with st.expander(f"🎯 {default_scheme.name} ({sid})", expanded=(len(target_ids) == 1)):
+                # ── 因子权重 ──
+                with st.expander("📊 因子权重", expanded=False):
+                    st.caption("各因子在截面打分中的权重。正数=多头偏好，负数=空头偏好。")
+                    fw = getattr(default_scheme, "factor_weights", {})
+                    sorted_factors = sorted(fw.items(), key=lambda x: abs(x[1]), reverse=True)
+                    wcols = st.columns(3)
+                    for idx, (f, w) in enumerate(sorted_factors):
+                        with wcols[idx % 3]:
+                            cn = FACTOR_NAME_MAP.get(f, f)
+                            st.slider(
+                                cn, -1.0, 1.0, float(st.session_state.get(f"scan_fw_{sid}_{f}", w)), 0.05,
+                                key=f"scan_fw_{sid}_{f}",
+                                help=f"{f}: 默认 {w:+.2f}"
+                            )
+
+                # ── L3 共振 ──
+                rc = getattr(default_scheme, "resonance_config", ResonanceConfig())
+                if rc is not None and hasattr(rc, "buy_conditions"):
+                    with st.expander("🎯 L3 共振条件", expanded=False):
+                        st.caption("三层过滤第三层：多个条件同时满足才触发信号。")
+                        st.slider(
+                            "最低确认数",
+                            1, max(1, len(rc.buy_conditions or [])),
+                            int(st.session_state.get(f"scan_l3_min_{sid}", getattr(rc, "min_confirmations", 3))),
+                            key=f"scan_l3_min_{sid}"
+                        )
+                        buy_labels = {
+                            "large_elg_net_mf_positive": "超大单净流入 > 5万",
+                            "main_net_mf_positive": "主力净流入 > 1万",
+                            "large_elg_net_mf_rank_high": "超大单流入排名 > 70%",
+                            "main_net_mf_negative_improving": "主力流出改善",
+                            "large_elg_net_mf_negative_improving": "超大单流出改善",
+                            "large_elg_net_mf_positive_strong": "超大单>10万(突破)",
+                            "main_net_mf_positive_strong": "主力>5万(突破)",
+                            "main_net_mf_not_negative": "主力不净流出",
+                            "relative_turnover_5d_high": "相对换手活跃 > 1.0x",
+                            "amount_percentile_60d_high": "成交额分位 > 60%",
+                            "relative_turnover_5d_low": "相对换手缩量 < 0.9x",
+                            "turnover_percentile_60d_low": "换手率分位 < 40%",
+                            "relative_turnover_5d_not_low": "相对换手 > 0.8x",
+                            "volume_expand": "温和放量",
+                            "ma5_above_ma20": "MA5高于MA20",
+                            "momentum_5d_strong": "5日动量强劲 > 2.5%",
+                            "momentum_20d_strong": "20日动量强劲 > 4%",
+                            "rsi_not_extreme": "RSI不过热 < 70",
+                            "rsi_oversold": "RSI超卖 < 45",
+                            "boll_lower": "布林下轨 < 0.35",
+                            "pullback_range": "回调幅度 5%-15%",
+                            "not_break_20d_low": "不破20日低点",
+                            "volume_calm": "成交量平稳 < 1.0x",
+                            "near_support": "接近均线支撑",
+                            "volume_surge": "量比>2x(突破)",
+                            "break_platform": "突破平台上沿",
+                            "narrow_range": "平台振幅<8%",
+                            "boll_upper_break": "突破布林上轨 > 0.7",
+                            "momentum_5d_positive": "5日动量为正",
+                        }
+                        bc1, bc2 = st.columns(2)
+                        with bc1:
+                            st.markdown("**买入条件**")
+                            for cond in list(rc.buy_conditions or []):
+                                label = buy_labels.get(cond, cond)
+                                default_val = True
+                                if f"scan_buy_{sid}_{cond}" not in st.session_state:
+                                    st.session_state[f"scan_buy_{sid}_{cond}"] = default_val
+                                st.checkbox(label, key=f"scan_buy_{sid}_{cond}")
+                        with bc2:
+                            st.markdown("**卖出条件**")
+                            sell_labels = {
+                                "main_net_mf_negative": "主力净流出",
+                                "large_elg_net_mf_negative": "超大单净流出",
+                                "main_net_mf_negative_worsening": "主力净流出恶化",
+                                "large_elg_net_mf_negative_worsening": "超大单净流出恶化",
+                                "relative_turnover_5d_low": "相对换手率低（缩量走弱）",
+                                "relative_turnover_5d_high": "相对换手率高（放量下跌）",
+                                "ma5_below_ma20": "MA5低于MA20",
+                                "macd_bearish": "MACD转弱",
+                                "volume_price_down": "放量下跌",
+                                "rsi_overbought": "RSI超买 > 70",
+                                "boll_upper": "布林上轨 > 0.7",
+                            }
+                            for cond in list(rc.sell_conditions or []):
+                                label = sell_labels.get(cond, cond)
+                                if f"scan_sell_{sid}_{cond}" not in st.session_state:
+                                    st.session_state[f"scan_sell_{sid}_{cond}"] = True
+                                st.checkbox(label, key=f"scan_sell_{sid}_{cond}")
+
+                # ── 开仓契约 ──
+                with st.expander("🛡️ 开仓执行契约", expanded=False):
+                    st.slider(
+                        "min_entry_condition_count",
+                        0, 12,
+                        int(st.session_state.get(f"scan_entry_cc_{sid}", getattr(default_scheme, "min_entry_condition_count", 3))),
+                        key=f"scan_entry_cc_{sid}",
+                        help="信号 condition_count < 此值 → 跳过不执行"
+                    )
+                    st.checkbox(
+                        "启用大盘择时仓位调制",
+                        value=bool(st.session_state.get(f"scan_market_timing_{sid}", getattr(default_scheme, "enable_market_timing", True))),
+                        key=f"scan_market_timing_{sid}"
+                    )
+
+                # ── ATR ──
+                with st.expander("💰 ATR 止盈止损", expanded=False):
+                    a1, a2, a3, a4 = st.columns(4)
+                    with a1:
+                        st.number_input("止损ATR倍数", 0.5, 5.0, float(st.session_state.get(f"scan_sl_atr_{sid}", 2.0)), 0.5, key=f"scan_sl_atr_{sid}")
+                    with a2:
+                        st.number_input("止盈ATR倍数", 0.5, 10.0, float(st.session_state.get(f"scan_tp_atr_{sid}", 3.0)), 0.5, key=f"scan_tp_atr_{sid}")
+                    with a3:
+                        st.number_input("跟踪止盈ATR倍数", 0.5, 5.0, float(st.session_state.get(f"scan_trail_atr_{sid}", 2.0)), 0.5, key=f"scan_trail_atr_{sid}")
+                    with a4:
+                        st.number_input("ATR计算周期", 5, 30, int(st.session_state.get(f"scan_atr_p_{sid}", 14)), 1, key=f"scan_atr_p_{sid}")
+
+                # ── 仓位 ──
+                with st.expander("📐 仓位管理", expanded=False):
+                    pm1, pm2, pm3 = st.columns(3)
+                    with pm1:
+                        st.slider("建仓比例", 0.05, 1.0, float(st.session_state.get(f"scan_pos_pct_{sid}", 0.30)), 0.05, key=f"scan_pos_pct_{sid}")
+                    with pm2:
+                        st.slider("最大加仓次数", 0, 5, int(st.session_state.get(f"scan_max_add_{sid}", 2)), 1, key=f"scan_max_add_{sid}")
+                    with pm3:
+                        st.slider("单票最大仓位%", 5, 30, int(st.session_state.get(f"scan_max_single_{sid}", 30)), 5, key=f"scan_max_single_{sid}")
+
+                # ── 退出规则 ──
+                with st.expander("⏱️ 短线退出规则", expanded=False):
+                    e1, e2, e3, e4, e5 = st.columns(5)
+                    with e1:
+                        st.checkbox("大盘防御减仓", key=f"scan_exit_market_defense_{sid}")
+                    with e2:
+                        st.checkbox("策略失败退出", key=f"scan_exit_strategy_failure_{sid}")
+                    with e3:
+                        st.checkbox("跟踪止盈/回撤", key=f"scan_exit_trailing_{sid}")
+                    with e4:
+                        st.checkbox("时间止损", key=f"scan_exit_time_stop_{sid}")
+                    with e5:
+                        st.checkbox("最长持仓退出", key=f"scan_exit_max_holding_{sid}")
+                    x1, x2, x3, x4 = st.columns(4)
+                    with x1:
+                        st.number_input("最长持仓天数", 1, 60, int(st.session_state.get(f"scan_exit_max_days_{sid}", 20)), 1, key=f"scan_exit_max_days_{sid}")
+                    with x2:
+                        st.number_input("时间止损天数", 1, 60, int(st.session_state.get(f"scan_exit_time_stop_days_{sid}", 7)), 1, key=f"scan_exit_time_stop_days_{sid}")
+                    with x3:
+                        st.number_input("时间止损最低收益%", -20.0, 50.0, float(st.session_state.get(f"scan_exit_time_stop_profit_{sid}", 0.0)) * 100, 0.5, key=f"scan_exit_time_stop_profit_{sid}_pct") / 100.0
+                    with x4:
+                        st.number_input("大盘防御分数", 0.0, 100.0, float(st.session_state.get(f"scan_exit_defense_score_{sid}", 20.0)), 1.0, key=f"scan_exit_defense_score_{sid}")
+                    y1, y2, y3 = st.columns(3)
+                    with y1:
+                        st.slider("策略失败观察窗口(日)", 0, 20, int(st.session_state.get(f"scan_exit_failure_window_{sid}", 3)), key=f"scan_exit_failure_window_{sid}")
+                    with y2:
+                        st.number_input("跟踪止盈激活浮盈%", 0.0, 50.0, float(st.session_state.get(f"scan_trail_act_pct_{sid}", 0.05)) * 100, 0.5, key=f"scan_trail_act_pct_{sid}_pct") / 100.0
+                    with y3:
+                        st.number_input("跟踪止盈激活ATR倍数", 0.0, 10.0, float(st.session_state.get(f"scan_trail_act_atr_{sid}", 1.0)), 0.1, key=f"scan_trail_act_atr_{sid}")
+
+        # ── 确认/恢复/重新扫描按钮 ──
+        btn1, btn2, btn3 = st.columns(3)
+        with btn1:
+            if st.button("✅ 确认参数", type="primary", width="stretch", key="scan_confirm_params",
+                         help="将当前参数写入持久存储，后续会话自动恢复"):
+                _build_scan_overrides(target_ids)
+                st.session_state["_signal_overrides_hash"] = _compute_overrides_hash()
+                st.session_state["_scan_params_confirmed"] = True
+                st.rerun()
+        with btn2:
+            if st.button("🔄 恢复默认", width="stretch", key="scan_restore_defaults",
+                         help="清空所有参数修改，恢复为内置默认值"):
+                for sid in target_ids:
+                    for k in list(st.session_state.keys()):
+                        if k.startswith(f"scan_fw_{sid}_") or k.startswith(f"scan_l3_min_{sid}") or \
+                           k.startswith(f"scan_buy_{sid}_") or k.startswith(f"scan_sell_{sid}_") or \
+                           k.startswith(f"scan_sl_atr_{sid}") or k.startswith(f"scan_tp_atr_{sid}") or \
+                           k.startswith(f"scan_trail_atr_{sid}") or k.startswith(f"scan_atr_p_{sid}") or \
+                           k.startswith(f"scan_pos_pct_{sid}") or k.startswith(f"scan_max_add_{sid}") or \
+                           k.startswith(f"scan_max_single_{sid}") or k.startswith(f"scan_entry_cc_{sid}") or \
+                           k.startswith(f"scan_market_timing_{sid}") or k.startswith(f"scan_exit_") or \
+                           k.startswith(f"scan_trail_act_") or k == f"_scan_{sid}_loaded":
+                            del st.session_state[k]
+                st.session_state["_scan_loaded_scheme"] = None
+                st.session_state["_signal_overrides_hash"] = "default"
+                st.session_state["_scan_params_confirmed"] = False
+                st.session_state["_signal_scan_overrides"] = None
+                compute_signals.clear()
+                st.rerun()
+        with btn3:
+            if st.button("🔍 重新扫描", width="stretch", key="scan_rescan",
+                         help="用当前参数重新执行信号扫描"):
+                _build_scan_overrides(target_ids)
+                st.session_state["_signal_overrides_hash"] = _compute_overrides_hash()
+                compute_signals.clear()
+                st.rerun()
+
+        # 状态提示
+        if not st.session_state.get("_scan_params_confirmed"):
+            st.warning("⚠️ 参数未确认，关闭页面后丢失。点击「确认参数」保存。")
+        else:
+            st.success("✅ 参数已确认")
 
     # ── 计算信号 ──
     portfolio_symbols = tuple(sorted({item.symbol for item in (pm.watch_list + pm.hold_list)}))
@@ -366,9 +772,10 @@ if page_idx == 0:
         data_key,
         tuple(factor_names),
         st.session_state.signal_scheme_id,
-        float(st.session_state.market_score_override),
+        _market_score,
         portfolio_symbols,
         portfolio_context_key,
+        st.session_state.get("_signal_overrides_hash", "default"),
     )
     if st.session_state.get("_latest_signal_cache_key") == signal_cache_key:
         buy_signals, sell_signals = st.session_state.get("_latest_signal_result", ([], []))
@@ -377,9 +784,10 @@ if page_idx == 0:
             data_key,
             tuple(factor_names),
             st.session_state.signal_scheme_id,
-            float(st.session_state.market_score_override),
+            _market_score,
             portfolio_symbols,
             portfolio_context_key,
+            st.session_state.get("_signal_overrides_hash", "default"),
         )
         st.session_state._latest_signal_cache_key = signal_cache_key
         st.session_state._latest_signal_result = (buy_signals, sell_signals)
@@ -387,7 +795,7 @@ if page_idx == 0:
 
     # ── 顶部指标 ──
     metric_row([
-        {"label": "大盘评分", "value": f"{st.session_state.market_score_override:.0f}"},
+        {"label": "大盘评分", "value": f"{_market_score:.0f}", "color": "green" if _market_score >= 60 else "orange" if _market_score >= 40 else "red"},
         {"label": "买入候选", "value": str(len(buy_signals)), "color": "green"},
         {"label": "风险退出", "value": str(len(sell_signals)), "color": "red" if sell_signals else ""},
         {"label": "扫描策略", "value": scheme_options.get(st.session_state.signal_scheme_id, st.session_state.signal_scheme_id)},

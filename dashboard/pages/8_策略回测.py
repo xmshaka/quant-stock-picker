@@ -54,6 +54,31 @@ _restore_widget_state("bt_pool_mode", "bt_pref_pool_mode", "全A")
 _restore_widget_state("bt_custom_codes", "bt_pref_custom_codes", "")
 
 
+def _persist_all_params():
+    """将当前所有 bt_* widget 值写入 bt_pref_* 持久键，并标记已确认。"""
+    for k in list(st.session_state.keys()):
+        if k.startswith("bt_") and not k.startswith("bt_pref_") and not k.startswith("bt_result") and not k.startswith("bt_compare") and not k.startswith("bt_run_") and not k.startswith("bt_last_") and not k.startswith("bt_market_"):
+            pref_key = k.replace("bt_", "bt_pref_", 1)
+            st.session_state[pref_key] = st.session_state[k]
+    st.session_state["bt_params_confirmed"] = True
+
+
+def _params_dirty():
+    """参数是否未确认。首载或任何 widget 值与已确认值不同时为 True。"""
+    if not st.session_state.get("bt_params_confirmed"):
+        return True
+    # 抽样比对：关键 widget 值 vs 对应 pref
+    check_keys = ["bt_scheme_name", "bt_top_n", "bt_lookback", "bt_capital_wan", "bt_pool_mode",
+                  "bt_enable_market_defense_exit", "bt_exit_max_holding_days_v3", "bt_sl_atr", "bt_pos_pct",
+                  "bt_entry_cc", "bt_market_timing"]
+    for k in check_keys:
+        pref_key = k.replace("bt_", "bt_pref_", 1)
+        if k in st.session_state and pref_key in st.session_state:
+            if st.session_state[k] != st.session_state[pref_key]:
+                return True
+    return False
+
+
 def _scheme_with_exit_overrides(base: StrategyScheme, exit_cfg: ExitConfig) -> StrategyScheme:
     """复制策略并应用页面上的退出规则覆盖，避免修改全局内置策略。"""
     cloned = StrategyScheme.from_dict(base.to_dict()) if hasattr(base, "to_dict") else deepcopy(base)
@@ -76,27 +101,193 @@ with c1:
         "策略方案", list(scheme_names.keys()),
         index=list(scheme_names.keys()).index(st.session_state.bt_scheme_name) if st.session_state.bt_scheme_name in scheme_names else 0,
         key="bt_scheme_name",
-        on_change=_save_widget_state,
-        args=("bt_scheme_name", "bt_pref_scheme_name"),
     )
     selected_scheme = scheme_names[selected_name]
 with c2:
-    top_n = st.slider("选股数量", 3, 30, key="bt_top_n", on_change=_save_widget_state, args=("bt_top_n", "bt_pref_top_n"))
+    top_n = st.slider("选股数量", 3, 30, key="bt_top_n")
 with c3:
-    lookback = st.slider("回测天数", 20, 120, key="bt_lookback", on_change=_save_widget_state, args=("bt_lookback", "bt_pref_lookback"))
+    lookback = st.slider("回测天数", 20, 120, key="bt_lookback")
 with c4:
-    capital = st.number_input("初始资金(万)", 10, 1000, step=10, key="bt_capital_wan", on_change=_save_widget_state, args=("bt_capital_wan", "bt_pref_capital_wan")) * 10000
+    capital = st.number_input("初始资金(万)", 10, 1000, step=10, key="bt_capital_wan") * 10000
 
-resonance_cfg = getattr(selected_scheme, "resonance_config", None)
-if resonance_cfg is not None:
-    with st.expander("策略共振配置", expanded=False):
-        st.caption("P1：不同策略使用独立 L3 条件集和最低确认数；该配置会随回测记录落盘，便于复盘审计。")
-        st.json(resonance_cfg.to_dict())
+# ── 创建运行时副本，避免修改全局内置策略 ──
+selected_scheme_runtime = StrategyScheme.from_dict(selected_scheme.to_dict()) if hasattr(selected_scheme, "to_dict") else deepcopy(selected_scheme)
 
-base_exit_cfg = getattr(selected_scheme, "exit_config", ExitConfig()) or ExitConfig()
+# ── 恢复默认 ──
+if st.button("🔄 恢复默认参数", key="bt_restore_defaults", help="将所有参数（因子权重、L3条件、ATR、退出规则等）重置为当前策略的内置默认值"):
+    # 清除所有 bt_ 开头的 widget session_state（保留 bt_pref_ 持久化偏好和 bt_result_ 等回测结果）
+    to_del = [k for k in list(st.session_state.keys())
+              if k.startswith("bt_") and not k.startswith("bt_pref_") and not k.startswith("bt_result")
+              and not k.startswith("bt_compare") and not k.startswith("bt_run_") and not k.startswith("bt_last_")
+              and not k.startswith("bt_market_")]
+    for k in to_del:
+        del st.session_state[k]
+    st.session_state.pop("_bt_exit_scheme_id", None)
+    st.session_state.pop("_bt_exit_defaults_version", None)
+    st.session_state["bt_params_confirmed"] = False
+    st.rerun()
+
+# ── 因子权重（可展开编辑）──
+with st.expander("📊 因子权重", expanded=False):
+    st.caption("各因子在截面打分中的权重。正数=多头偏好，负数=空头偏好。")
+    st.info("⚠️ 本页因子权重修改仅影响**回测**（择时策略打分），**不影响量化选股页面**（选股页面使用策略内置默认权重）。", icon="🔒")
+    fw = selected_scheme_runtime.factor_weights
+    sorted_factors = sorted(fw.items(), key=lambda x: abs(x[1]), reverse=True)
+    edited_weights = {}
+    wcols = st.columns(3)
+    for idx, (f, w) in enumerate(sorted_factors):
+        with wcols[idx % 3]:
+            cn = FACTOR_NAME_MAP.get(f, f)
+            edited_weights[f] = st.slider(
+                cn, -1.0, 1.0, float(w), 0.05,
+                key=f"bt_fw_{f}",
+                help=f"{f}: 当前 {w:+.2f}"
+            )
+    selected_scheme_runtime.factor_weights = edited_weights
+
+# ── L3 共振条件（可编辑）──
+rc = getattr(selected_scheme_runtime, "resonance_config", None)
+if rc is not None:
+    with st.expander("🎯 L3 共振条件", expanded=False):
+        st.caption("三层过滤第三层：多个条件同时满足才触发信号。调整最低确认数和条件列表。")
+        rc.min_confirmations = st.slider(
+            "最低确认数（至少N个买入条件满足才触发BUY）",
+            1, max(1, len(rc.buy_conditions)), int(rc.min_confirmations),
+            key="bt_l3_min_conf"
+        )
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.markdown("**买入条件**")
+            buy_labels = {
+                "large_elg_net_mf_positive": "超大单净流入 > 5万",
+                "main_net_mf_positive": "主力净流入 > 1万",
+                "large_elg_net_mf_rank_high": "超大单流入排名 > 70%",
+                "main_net_mf_negative_improving": "主力流出改善",
+                "large_elg_net_mf_negative_improving": "超大单流出改善",
+                "large_elg_net_mf_positive_strong": "超大单>10万(突破)",
+                "main_net_mf_positive_strong": "主力>5万(突破)",
+                "main_net_mf_not_negative": "主力不净流出",
+                "mf_rank_elite": "资金排名前20%",
+                "relative_turnover_5d_high": "相对换手活跃 > 1.0x",
+                "amount_percentile_60d_high": "成交额分位 > 60%",
+                "relative_turnover_5d_low": "相对换手缩量 < 0.9x",
+                "turnover_percentile_60d_low": "换手率分位 < 40%",
+                "relative_turnover_5d_not_low": "相对换手 > 0.8x",
+                "volume_expand": "温和放量",
+                "ma5_above_ma20": "MA5高于MA20",
+                "momentum_5d_strong": "5日动量强劲 > 2.5%",
+                "momentum_20d_strong": "20日动量强劲 > 4%",
+                "rsi_not_extreme": "RSI不过热 < 70",
+                "rsi_oversold": "RSI超卖 < 45",
+                "boll_lower": "布林下轨 < 0.35",
+                "pullback_range": "回调幅度 5%-15%",
+                "not_break_20d_low": "不破20日低点",
+                "volume_calm": "成交量平稳 < 1.0x",
+                "near_support": "接近均线支撑",
+                "volume_surge": "量比>2x(突破)",
+                "break_platform": "突破平台上沿",
+                "narrow_range": "平台振幅<8%",
+                "boll_upper_break": "突破布林上轨 > 0.7",
+                "bullish_body": "实体阳线(突破)",
+                "buildup_signal": "前日蓄势信号",
+                "sustained_breakout": "连续站稳突破位",
+                "boll_expanding": "布林中上轨",
+                "momentum_5d_positive": "5日动量为正",
+            }
+            for cond in list(rc.buy_conditions):
+                label = buy_labels.get(cond, cond)
+                enabled = st.checkbox(label, value=True, key=f"bt_buy_{cond}")
+                if not enabled:
+                    rc.buy_conditions.remove(cond)
+        with bc2:
+            st.markdown("**卖出条件**")
+            sell_labels = {
+                "main_net_mf_negative": "主力净流出",
+                "large_elg_net_mf_negative": "超大单净流出",
+                "main_net_mf_negative_worsening": "主力净流出恶化",
+                "large_elg_net_mf_negative_worsening": "超大单净流出恶化",
+                "relative_turnover_5d_low": "相对换手率低（缩量走弱）",
+                "relative_turnover_5d_high": "相对换手率高（放量下跌）",
+                "ma5_below_ma20": "MA5低于MA20",
+                "macd_bearish": "MACD转弱",
+                "volume_price_down": "放量下跌",
+                "rsi_overbought": "RSI超买 > 70",
+                "boll_upper": "布林上轨 > 0.7",
+            }
+            for cond in list(rc.sell_conditions):
+                label = sell_labels.get(cond, cond)
+                enabled = st.checkbox(label, value=True, key=f"bt_sell_{cond}")
+                if not enabled:
+                    rc.sell_conditions.remove(cond)
+
+# ── 开仓执行契约 ──
+with st.expander("🛡️ 开仓执行契约", expanded=False):
+    st.caption("信号必须满足≥N个L3条件才允许开仓。0=关闭契约（所有信号都执行）。")
+    min_entry_cc = st.slider(
+        "min_entry_condition_count（最小L3条件数）",
+        0, 12, int(getattr(selected_scheme_runtime, "min_entry_condition_count", 3) or 0),
+        key="bt_entry_cc",
+        help="信号 condition_count < 此值 → 跳过不执行。该参数直接决定信号是否执行。"
+    )
+    selected_scheme_runtime.min_entry_condition_count = min_entry_cc
+
+# ── 大盘择时开关 ──
+with st.expander("🌍 大盘择时", expanded=False):
+    st.caption("启用后根据市场评分动态调整仓位比例。评分来自北向资金/融资/量能/趋势四指标。")
+    enable_market_timing = st.checkbox(
+        "启用大盘择时仓位调制",
+        value=bool(getattr(selected_scheme_runtime, "enable_market_timing", True)),
+        key="bt_market_timing"
+    )
+    selected_scheme_runtime.enable_market_timing = enable_market_timing
+
+# ── ATR 止盈止损 ──
+with st.expander("💰 ATR 止盈止损", expanded=False):
+    st.caption("基于ATR的动态止盈止损。止损=买入价-N×ATR，止盈=买入价+N×ATR，跟踪止盈=最高价-N×ATR。")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        sl_atr = st.number_input("止损ATR倍数", 0.5, 5.0, float(getattr(selected_scheme_runtime, "stop_loss_atr_mult", 2.0)), 0.5, key="bt_sl_atr")
+        selected_scheme_runtime.stop_loss_atr_mult = sl_atr
+    with a2:
+        tp_atr = st.number_input("止盈ATR倍数", 0.5, 10.0, float(getattr(selected_scheme_runtime, "take_profit_atr_mult", 3.0)), 0.5, key="bt_tp_atr")
+        selected_scheme_runtime.take_profit_atr_mult = tp_atr
+    with a3:
+        trail_atr = st.number_input("跟踪止盈ATR倍数", 0.5, 5.0, float(getattr(selected_scheme_runtime, "trailing_atr_mult", 2.0)), 0.5, key="bt_trail_atr")
+        selected_scheme_runtime.trailing_atr_mult = trail_atr
+    with a4:
+        atr_p = st.number_input("ATR计算周期", 5, 30, int(getattr(selected_scheme_runtime, "atr_period", 14) or 14), 1, key="bt_atr_p")
+        selected_scheme_runtime.atr_period = atr_p
+
+# ── 仓位管理 ──
+with st.expander("📐 仓位管理", expanded=False):
+    st.caption("每次建仓/加仓占可用资金比例，加仓次数，单票最大仓位。")
+    pm1, pm2, pm3 = st.columns(3)
+    with pm1:
+        pos_pct = st.slider("每次建仓比例", 0.05, 1.0, float(getattr(selected_scheme_runtime, "position_pct_per_entry", 0.30)), 0.05, key="bt_pos_pct")
+        selected_scheme_runtime.position_pct_per_entry = pos_pct
+    with pm2:
+        max_add = st.slider("最大加仓次数", 0, 5, int(getattr(selected_scheme_runtime, "max_add_times", 2) or 0), 1, key="bt_max_add")
+        selected_scheme_runtime.max_add_times = max_add
+    with pm3:
+        max_single = st.slider("单票最大仓位%", 5, 30, int((getattr(selected_scheme_runtime, "max_single_pct", 0.30) or 0.30) * 100), 5, key="bt_max_single")
+        selected_scheme_runtime.max_single_pct = max_single / 100
+
+# ── 策略失败退出规则说明 ──
+strategy_failure_rules = {
+    "trend_momentum": "动量失效退出：开盘价跌破 MA20 → 强制卖出",
+    "pullback": "回调破位退出：开盘价跌破 20日最低价 → 强制卖出",
+    "breakout": "突破失败退出：开盘价跌破 建仓时平台上沿 → 强制卖出",
+    "balanced": "无专属策略失败退出（走共振层卖出条件）",
+}
+with st.expander("🚨 策略失败退出", expanded=False):
+    st.caption("开仓后 N 天内跌破关键位则强制退出。与L3共振卖出条件互补。")
+    st.info(strategy_failure_rules.get(selected_scheme_runtime.scheme_id, "无"))
+
+# ── 短线退出规则（保持现有控件）──
+base_exit_cfg = getattr(selected_scheme_runtime, "exit_config", ExitConfig()) or ExitConfig()
 exit_defaults_version = "20260620_exit_defaults_v3"
 if (
-    st.session_state.get("_bt_exit_scheme_id") != selected_scheme.scheme_id
+    st.session_state.get("_bt_exit_scheme_id") != selected_scheme_runtime.scheme_id
     or st.session_state.get("_bt_exit_defaults_version") != exit_defaults_version
 ):
     st.session_state["bt_enable_market_defense_exit"] = bool(getattr(base_exit_cfg, "enable_market_defense_exit", True))
@@ -111,10 +302,10 @@ if (
     st.session_state["bt_exit_failure_window_days_v3"] = int(getattr(base_exit_cfg, "failure_window_days", 3) or 3)
     st.session_state["bt_trailing_activation_pct_v3"] = float(getattr(base_exit_cfg, "trailing_activation_pct", 0.05) or 0.0) * 100
     st.session_state["bt_trailing_activation_atr_mult_v3"] = float(getattr(base_exit_cfg, "trailing_activation_atr_mult", 1.0) or 1.0)
-    st.session_state["_bt_exit_scheme_id"] = selected_scheme.scheme_id
+    st.session_state["_bt_exit_scheme_id"] = selected_scheme_runtime.scheme_id
     st.session_state["_bt_exit_defaults_version"] = exit_defaults_version
-with st.expander("短线退出规则", expanded=False):
-    st.caption("P2：新增短线退出体系。可在这里关闭某类退出，或调整阈值；本次设置会随回测记录落盘。")
+with st.expander("⏱️ 短线退出规则", expanded=False):
+    st.caption("五种退出机制的开关和阈值。调整后立即生效。")
     e1, e2, e3, e4, e5 = st.columns(5)
     with e1:
         enable_market_defense_exit = st.checkbox("大盘防御减仓", value=bool(getattr(base_exit_cfg, "enable_market_defense_exit", True)), key="bt_enable_market_defense_exit")
@@ -145,7 +336,7 @@ with st.expander("短线退出规则", expanded=False):
     with f3:
         trailing_activation_atr_mult = st.number_input("跟踪止盈激活ATR倍数", min_value=0.0, max_value=10.0, value=float(getattr(base_exit_cfg, "trailing_activation_atr_mult", 1.0) or 1.0), step=0.1, key="bt_trailing_activation_atr_mult_v3")
 
-exit_cfg_override = _make_exit_config(
+selected_scheme_runtime.exit_config = _make_exit_config(
     enable_market_defense_exit=enable_market_defense_exit,
     enable_strategy_failure_exit=enable_strategy_failure_exit,
     enable_trailing_exit=enable_trailing_exit,
@@ -159,19 +350,16 @@ exit_cfg_override = _make_exit_config(
     trailing_activation_pct=float(trailing_activation_pct),
     trailing_activation_atr_mult=float(trailing_activation_atr_mult),
 )
-selected_scheme_runtime = _scheme_with_exit_overrides(selected_scheme, exit_cfg_override)
 
 # 股票池选择
 pool_mode = st.radio(
     "股票池", ["全A", "自定义代码", "观察池", "持仓池"],
     horizontal=True, key="bt_pool_mode",
-    on_change=_save_widget_state, args=("bt_pool_mode", "bt_pref_pool_mode"),
 )
 custom_symbols = None
 if pool_mode == "自定义代码":
     code_input = st.text_input(
         "股票代码（逗号分隔）", placeholder="600519,000001,002594", key="bt_custom_codes",
-        on_change=_save_widget_state, args=("bt_custom_codes", "bt_pref_custom_codes"),
     )
     if code_input:
         custom_symbols = [s.strip() for s in code_input.split(",") if s.strip()]
@@ -192,8 +380,34 @@ current_context_signature = backtest_context_signature(pool_mode, custom_symbols
 # FIX: 保持签名为 dict。此前把 dict 转为 tuple 后，方案对比区仍按
 # current_context_signature["symbols"] 读取，触发
 # TypeError: tuple indices must be integers or slices, not str。
-current_context_signature["exit_config"] = tuple(sorted(exit_cfg_override.to_dict().items()))
+current_context_signature["exit_config"] = tuple(sorted(selected_scheme_runtime.exit_config.to_dict().items()))
 clear_stale_compare(st.session_state, current_context_signature)
+
+# ========== 确认/恢复参数 ==========
+confirm_col, restore_col, status_col = st.columns([1, 1, 3])
+with confirm_col:
+    if st.button("✅ 确认参数", type="primary", width="stretch", key="bt_confirm_params",
+                 help="将当前所有参数写入持久存储，后续会话自动恢复"):
+        _persist_all_params()
+        st.rerun()
+with restore_col:
+    if st.button("🔄 恢复默认", width="stretch", key="bt_restore_all",
+                 help="清空所有参数修改，恢复为当前策略的内置默认值"):
+        to_del = [k for k in list(st.session_state.keys())
+                  if k.startswith("bt_") and not k.startswith("bt_pref_") and not k.startswith("bt_result")
+                  and not k.startswith("bt_compare") and not k.startswith("bt_run_") and not k.startswith("bt_last_")
+                  and not k.startswith("bt_market_")]
+        for k in to_del:
+            del st.session_state[k]
+        st.session_state.pop("_bt_exit_scheme_id", None)
+        st.session_state.pop("_bt_exit_defaults_version", None)
+        st.session_state["bt_params_confirmed"] = False
+        st.rerun()
+with status_col:
+    if _params_dirty():
+        st.warning("⚠️ 参数已修改，点击「确认参数」保存，否则刷新后丢失")
+    else:
+        st.success("✅ 参数已确认")
 
 # ========== 执行回测 ==========
 if st.button("▶ 运行回测", type="primary", width="stretch"):
