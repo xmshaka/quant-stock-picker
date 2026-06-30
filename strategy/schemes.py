@@ -27,16 +27,19 @@ class RuleType(Enum):
 class ResonanceConfig:
     """策略专属共振配置。
 
-    min_confirmations：最低确认数；
+    min_confirmations：买入最低确认数；
+    sell_min_confirmations：卖出最低确认数（独立于买入，默认同 min_confirmations）；
     buy_conditions/sell_conditions：该策略启用的 L3 条件名称，空列表表示使用默认全集。
     """
     min_confirmations: int = 2
+    sell_min_confirmations: int = 2
     buy_conditions: List[str] = field(default_factory=list)
     sell_conditions: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
             "min_confirmations": self.min_confirmations,
+            "sell_min_confirmations": self.sell_min_confirmations,
             "buy_conditions": list(self.buy_conditions),
             "sell_conditions": list(self.sell_conditions),
         }
@@ -45,6 +48,7 @@ class ResonanceConfig:
     def from_dict(cls, d: Dict) -> "ResonanceConfig":
         return cls(
             min_confirmations=int(d.get("min_confirmations", 2)),
+            sell_min_confirmations=int(d.get("sell_min_confirmations", d.get("min_confirmations", 2))),
             buy_conditions=list(d.get("buy_conditions", []) or []),
             sell_conditions=list(d.get("sell_conditions", []) or []),
         )
@@ -217,6 +221,7 @@ _register(StrategyScheme(
     min_entry_condition_count=6,  # Stage 2后验: cc≥6胜率64.3%均利+4,311
     resonance_config=ResonanceConfig(
         min_confirmations=3,
+        sell_min_confirmations=2,
         buy_conditions=[
             # 资金流条件
             "large_elg_net_mf_positive",        # 超大单净流入
@@ -266,6 +271,7 @@ _register(StrategyScheme(
     min_entry_condition_count=8,  # Stage 2后验: cc≥8胜率46.2%均利+3,141
     resonance_config=ResonanceConfig(
         min_confirmations=3,
+        sell_min_confirmations=2,
         buy_conditions=[
             # 资金流条件
             "main_net_mf_negative_improving",   # 主力净流出但改善
@@ -315,6 +321,7 @@ _register(StrategyScheme(
     min_entry_condition_count=0,  # Stage 2后验: 全cc组亏损，暂停entry_contract
     resonance_config=ResonanceConfig(
         min_confirmations=4,  # 提高门槛：从3→4，减少噪音突破
+        sell_min_confirmations=2,
         buy_conditions=[
             # 资金流条件（突破v2: 超高门槛）
             "large_elg_net_mf_positive_strong", # 超大单>10万
@@ -370,6 +377,7 @@ _register(StrategyScheme(
     regime_fit=["*"],
     resonance_config=ResonanceConfig(
         min_confirmations=3,
+        sell_min_confirmations=2,
         buy_conditions=[],  # balanced v2: 策略路由器，委托给子策略生成条件，不设 whitelist
         sell_conditions=[
             "main_net_mf_negative",             # 主力净流出

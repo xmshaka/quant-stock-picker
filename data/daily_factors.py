@@ -481,36 +481,44 @@ def compute_daily_factors(max_workers: int = 4) -> Tuple[pd.DataFrame, pd.DataFr
         logger.warning(f"[DailyFactors] 从PG读取资金流数据失败: {e}")
         moneyflow_df = pd.DataFrame()
     
-    # 方案2：如果PG没有数据，尝试从API获取当天数据
-    if moneyflow_df.empty:
+    # 方案2：检测 PG 中缺失的交易日，从 Tushare API 补拉
+    # 不限于"今天"——PG 可能因 T+1 延迟缺少最近 1-2 个交易日
+    if moneyflow_df is not None and not moneyflow_df.empty:
+        # 已经有 PG 数据，但可能缺少最近 1-2 天（Tushare T+1 延迟）
+        pg_dates = set(str(d).replace("-", "")[:8] for d in moneyflow_df["trade_date"].unique())
+        missing_dates = [d for d in unique_dates if d not in pg_dates and d >= "20260620"]
+    else:
+        missing_dates = unique_dates  # PG 完全没数据
+
+    if missing_dates:
         try:
             from data.fetchers.tushare_fetcher import TushareFetcher
             fetcher = TushareFetcher()
-            
-            # 只获取当天的资金流数据（避免API限制）
-            today_str = datetime.now().strftime("%Y%m%d")
-            if today_str in unique_dates:
-                today_df = fetcher.get_money_flow(trade_date=today_str)
-                if today_df is not None and not today_df.empty:
-                    moneyflow_df = today_df
-                    logger.info(f"[DailyFactors] 获取当天资金流数据: {len(moneyflow_df)} 条")
-                    
-                    # 保存到PG供后续使用
-                    try:
-                        from data.storage.repository import StockRepository
-                        repo = StockRepository()
-                        repo.save_moneyflow(today_df, source="tushare")
-                        logger.info(f"[DailyFactors] 当天资金流数据已保存到PG")
-                    except Exception as save_error:
-                        logger.warning(f"[DailyFactors] 保存到PG失败: {save_error}")
+            new_dfs = []
+            fetched_any = False
+            for md in sorted(missing_dates)[-3:]:  # 最多补最近 3 天，避免触发 API 频率限制
+                logger.info(f"[DailyFactors] Tushare API 补拉缺失日资金流: {md}")
+                md_df = fetcher.get_money_flow(trade_date=md)
+                if md_df is not None and not md_df.empty:
+                    new_dfs.append(md_df)
+                    fetched_any = True
+                    logger.info(f"[DailyFactors] 补拉成功: {md} ({len(md_df)} 条)")
                 else:
-                    logger.warning("[DailyFactors] 当天资金流数据为空")
-            else:
-                logger.warning("[DailyFactors] 今天不在回测日期范围内，跳过API获取")
-                
+                    logger.warning(f"[DailyFactors] Tushare {md} 资金流为空（可能 T+1 延迟）")
+            if fetched_any:
+                new_mf = pd.concat(new_dfs, ignore_index=True)
+                # 保存到 PG 供后续使用
+                try:
+                    repo.save_moneyflow(new_mf, source="tushare")
+                    logger.info(f"[DailyFactors] 已保存 {len(new_mf)} 条资金流到 PG")
+                except Exception as save_error:
+                    logger.warning(f"[DailyFactors] 保存到PG失败: {save_error}")
+                if moneyflow_df is None or moneyflow_df.empty:
+                    moneyflow_df = new_mf
+                else:
+                    moneyflow_df = pd.concat([moneyflow_df, new_mf], ignore_index=True)
         except Exception as e:
-            logger.warning(f"[DailyFactors] API获取资金流数据失败: {e}")
-            moneyflow_df = pd.DataFrame()
+            logger.warning(f"[DailyFactors] API补拉资金流失败: {e}")
     try:
         turnover_df = fetch_tushare_daily_basic_turnover_history(factor_df["trade_date"])
         if turnover_df is None or turnover_df.empty:

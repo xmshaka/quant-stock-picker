@@ -14,6 +14,8 @@ import pandas as pd
 
 from market.timing import POSITION_BRACKETS, PositionBracket
 from strategy.schemes import BUILTIN_SCHEMES, StrategyScheme, ResonanceConfig
+from signals.layers import check_overheat as _check_overheat_core
+from signals.layers import ResonanceChecker
 
 
 @dataclass
@@ -74,6 +76,82 @@ STRATEGY_MARKET_FLOOR = {
 
 DEFAULT_MIN_CONFIRMATIONS = 3
 
+# ── 数据完整性红线检查 ──
+# 阻断级：核心技术/动量/估值因子缺失 → 信号不可信，必须阻断
+BLOCKING_FACTOR_FIELDS = [
+    "volume_ratio",
+    "rsi14", "boll_position", "volatility_20d",
+    "momentum_5d", "momentum_20d",
+    "pb", "float_market_cap",
+]
+# 警告级：资金流/相对换手因子 Tushare T+1 延迟，最新日常见 NaN
+# 缺失时仅降级警告不阻断信号，L3 共振条件自动回退到纯技术模式
+WARNING_FACTOR_FIELDS = [
+    "main_net_mf_amount", "large_elg_net_mf_amount",
+    "relative_turnover_5d",
+]
+
+
+def check_data_integrity(factor_df: pd.DataFrame) -> Dict[str, Any]:
+    """红线检查：返回最新日关键字段空值率和阻断状态。
+
+    阻断规则：核心技术/动量/估值因子 >20% NaN → 阻断
+    警告规则：资金流/换手因子 >20% NaN → 仅警告，不阻断（T+1 延迟属正常）
+
+    Returns:
+        { "ok": bool, "latest_date": str, "alerts": [...], "blocked": bool,
+          "moneyflow_missing": bool, "moneyflow_warning": str }
+    """
+    from datetime import date as _date
+    if factor_df.empty or "trade_date" not in factor_df.columns:
+        return {"ok": False, "latest_date": "", "alerts": ["factor_df 为空或无 trade_date 列"], "blocked": True, "moneyflow_missing": False, "moneyflow_warning": ""}
+    latest = _to_date(factor_df["trade_date"].max())
+    latest_str = latest.isoformat() if isinstance(latest, _date) else str(latest)[:10]
+    latest_df = factor_df[factor_df["trade_date"].map(_to_date) == latest]
+    if latest_df.empty:
+        return {"ok": False, "latest_date": latest_str, "alerts": ["最新日无数据行"], "blocked": True, "moneyflow_missing": False, "moneyflow_warning": ""}
+
+    alerts = []
+    blocked = False
+
+    # 阻断级检查
+    for col in BLOCKING_FACTOR_FIELDS:
+        if col not in factor_df.columns:
+            alerts.append(f"{col}: 列不存在")
+            blocked = True
+            continue
+        null_pct = round(latest_df[col].isna().mean() * 100, 1)
+        if null_pct > 20:
+            alerts.append(f"{col}: 空值率 {null_pct}% (>20% 红线，阻断)")
+            blocked = True
+        elif null_pct > 5:
+            alerts.append(f"{col}: 空值率 {null_pct}% (>5% 注意)")
+
+    # 警告级检查（资金流/换手 T+1 延迟不阻断）
+    moneyflow_missing = False
+    moneyflow_warning = ""
+    for col in WARNING_FACTOR_FIELDS:
+        if col not in factor_df.columns:
+            alerts.append(f"{col}: 列不存在（资金流/换手不可用）")
+            moneyflow_missing = True
+            continue
+        null_pct = round(latest_df[col].isna().mean() * 100, 1)
+        if null_pct > 80:
+            alerts.append(f"{col}: 空值率 {null_pct}%（T+1 延迟，资金流/换手未就绪，L3 已自动回退纯技术模式）")
+            moneyflow_missing = True
+            moneyflow_warning = f"资金流数据 T+1 延迟（最新日 {latest_str}），L3 共振已自动回退到纯技术模式"
+        elif null_pct > 20:
+            alerts.append(f"{col}: 空值率 {null_pct}%（资金流部分缺失）")
+
+    return {
+        "ok": not blocked,
+        "latest_date": latest_str,
+        "alerts": alerts,
+        "blocked": blocked,
+        "moneyflow_missing": moneyflow_missing,
+        "moneyflow_warning": moneyflow_warning,
+    }
+
 
 def scan_signals(
     factor_df: pd.DataFrame,
@@ -84,13 +162,15 @@ def scan_signals(
     market_score: Optional[float] = None,
     include_sell_symbols: Optional[Iterable[str]] = None,
     include_sell_context: Optional[Dict[str, Dict]] = None,
+    include_add_context: Optional[Dict[str, Dict]] = None,
     scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
-) -> Tuple[List[ScanSignal], List[ScanSignal]]:
+) -> Tuple[List[ScanSignal], List[ScanSignal], List[ScanSignal]]:
     """按 DAILY_START_PLAN 新方案扫描信号。
 
     - BUY：按 trend_momentum / pullback / breakout 独立扫描。
     - balanced：不直接造信号，只汇总三类子策略的最优结果。
     - SELL：仅对传入的持仓/关注股票做风险退出提示，避免对全市场生成无意义卖出榜。
+    - ADD：对持仓池股票检查加仓条件（盈利+同路径再确认+高置信度）。
     - scheme_overrides：可选策略参数覆写（因子权重/L3条件/ATR/仓位等），
       用于 Dashboard 参数面板实时调整扫描参数，不影响 BUILTIN_SCHEMES。
     """
@@ -144,13 +224,20 @@ def scan_signals(
 
             layer3_total = len(resonance_cfg.buy_conditions) or 6
             l3_score_continuous = round(l3_score, 4)
+
+            # ── 过热检测：动量/天量/连板 ──
+            overheat_coeff, overheat_tags = _check_overheat(bars, latest_row)
+
             total_score = round(
-                factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + l3_score_continuous * 0.20,
+                (factor_score * 0.35 + l1_score * 0.20 + l2_score * 0.25 + l3_score_continuous * 0.20) * overheat_coeff,
                 4,
             )
             reason = f"{l2_reason}；{l1_reason}；共振{confirmations}/{layer3_total}（强度{l3_score_continuous:.1f}）：{'、'.join(l3_reasons)}"
             risk_tags = _build_risk_tags(bars, latest_row, market_score_val, sid)
             risk_tags.extend([t for t in tradable_tags if t not in risk_tags])
+            if overheat_tags:
+                risk_tags.extend(overheat_tags)
+                reason += f"；⚠️ 过热: {'、'.join(overheat_tags)}"
             entry_audit = _build_entry_audit_context(
                 latest_row,
                 scheme_id=sid,
@@ -195,14 +282,22 @@ def scan_signals(
         buy_candidates = list(best_by_symbol.values())
 
     buy_candidates.sort(key=lambda s: s.total_score, reverse=True)
-    buy_candidates = buy_candidates[:top_n]
+    # 不在此截断 top_n：返回全量结果，Dashboard 自行截断显示
+    # 观察池/持仓池股票可能排名靠后，截断后会导致池内股票信号丢失
 
     sell_signals = _scan_sell_signals(
         include_sell_symbols or [], price_map, day_data, latest_date,
         next_exec_date, market_score_val, bracket, include_sell_context or {},
         scheme_overrides=_overrides,
     )
-    return buy_candidates, sell_signals[:top_n]
+
+    add_signals = _scan_add_signals(
+        include_add_context or {}, price_map, day_data, latest_date,
+        next_exec_date, market_score_val, bracket,
+        scheme_overrides=_overrides,
+    )
+
+    return buy_candidates, sell_signals, add_signals
 
 
 def _target_schemes(scheme_id: str) -> List[str]:
@@ -375,7 +470,7 @@ def _build_entry_audit_context(
             return None
         value = _num(row.get(field), np.nan)
         if np.isnan(value):
-            missing.append(field)
+            # 列存在但值为 NaN：T+1 正常延迟，不报缺失，返回 None 跳过
             return None
         return float(value)
 
@@ -535,6 +630,11 @@ def _check_layer3(bars: pd.DataFrame, row: pd.Series, scheme_id: str, resonance_
     return confirmations, l3_score, reasons
 
 
+def _check_overheat(bars: pd.DataFrame, row: pd.Series) -> Tuple[float, List[str]]:
+    """动量/量能/连板/资金背离过热检测 → 统一委托 signals.layers.check_overheat。"""
+    return _check_overheat_core(bars, len(bars) - 1, row=row)
+
+
 def _check_l4_tradability(bars: pd.DataFrame, row: pd.Series, scheme_id: str) -> Tuple[bool, str, List[str]]:
     """Layer 4：风险可交易性检查。
 
@@ -631,13 +731,21 @@ def _scan_sell_signals(
     sell_context: Dict[str, Dict],
     scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
 ) -> List[ScanSignal]:
+    """持仓池卖出信号扫描。
+
+    优先走 L3 ResonanceChecker.check_sell（资金流/换手/技术 12 条件），
+    ExitConfig 规则（最长持仓/时间止损/大盘防御/策略失败退出）作为补充合并。
+    """
     results = []
     symbol_set = [str(s) for s in symbols]
+    FACTOR_SELL_COLS = ['main_net_mf_amount', 'large_elg_net_mf_amount', 'relative_turnover_5d']
+
     for symbol in symbol_set:
         bars = price_map.get(symbol)
         row = day_data[day_data["symbol"] == symbol]
         if bars is None or len(bars) < 20:
             continue
+
         context = sell_context.get(symbol, {}) or {}
         scheme_id = _infer_scheme_id(context)
         scheme = (scheme_overrides or {}).get(scheme_id) or BUILTIN_SCHEMES.get(scheme_id)
@@ -648,56 +756,103 @@ def _scan_sell_signals(
         ma20 = float(close.rolling(20).mean().iloc[-1])
         ma40 = float(close.rolling(40).mean().iloc[-1]) if len(close) >= 40 else ma20
         low20 = float(close.iloc[-20:].min())
-        rsi = _num(row.iloc[0].get("rsi14"), np.nan) if not row.empty else np.nan
-        reasons = []
-        exit_reason_keys = []
-        market_floor = float(getattr(exit_cfg, "market_defense_score", 20.0) or 20.0)
-        if bool(getattr(exit_cfg, "enable_market_defense_exit", True)) and market_score < market_floor:
-            reasons.append("大盘防御减仓")
-            exit_reason_keys.append("market_defense")
 
+        reasons: List[str] = []
+        exit_reason_keys: List[str] = []
+
+        # ── 注入因子列到 bars（L3 check_sell 从 bars.columns 读取）──
+        if not row.empty:
+            row_vals = row.iloc[0]
+            for col in FACTOR_SELL_COLS:
+                if col in row_vals.index:
+                    val = row_vals[col]
+                    if col not in bars.columns:
+                        bars[col] = np.nan
+                    bars.loc[bars.index[-1], col] = val if pd.notna(val) else np.nan
+
+        # ── 主路径：L3 ResonanceChecker.check_sell ──
+        l3_ok = False
+        if scheme_id and scheme:
+            rc = ResonanceChecker.from_strategy(scheme_id)
+            l3_ok, sell_conds = rc.check_sell(bars, len(bars) - 1)
+            if l3_ok:
+                sell_met = [c for c in sell_conds if c.met]
+                reasons = [c.audit_text() for c in sell_met]
+                exit_reason_keys = [c.key for c in sell_met]
+
+        # ── L3 降级回退：资金流数据缺失时，用简单技术指标兜底 ──
+        if not l3_ok and not reasons:
+            if ma5 < ma20:
+                reasons.append("MA5死叉MA20")
+                exit_reason_keys.append("ma5_below_ma20")
+            if current < ma40:
+                reasons.append("跌破MA40")
+                exit_reason_keys.append("below_ma40")
+            rsi_val = _num(row.iloc[0].get("rsi14"), np.nan) if not row.empty else np.nan
+            if not np.isnan(rsi_val) and rsi_val > 70:
+                reasons.append(f"RSI超买{rsi_val:.0f}")
+                exit_reason_keys.append("rsi_overbought")
+            boll_pos = _boll_position(bars, len(bars) - 1, 20, 2.0)
+            if boll_pos > 0.85:
+                reasons.append(f"布林上轨{boll_pos:.1%}")
+                exit_reason_keys.append("boll_upper")
+
+        # ── ExitConfig 补充规则（与 L3 结果合并）──
         entry_date = _context_date(context.get("entry_date") or context.get("add_date") or context.get("signal_date"))
         entry_price = _context_float(context.get("entry_price") or context.get("avg_cost"))
+        market_floor = float(getattr(exit_cfg, "market_defense_score", 20.0) or 20.0)
+
         if entry_date is not None:
             holding_days = _trading_days_between(bars, entry_date, latest_date)
             if entry_price <= 0:
                 entry_price = _entry_close_from_bars(bars, entry_date)
             pnl_pct = current / entry_price - 1 if entry_price > 0 else 0.0
+
+            # 最长持仓退出
             max_holding_days = int(getattr(exit_cfg, "max_holding_days", 20) or 20)
+            if bool(getattr(exit_cfg, "enable_max_holding_exit", True)) and holding_days >= max_holding_days:
+                msg = f"最长持仓退出{holding_days}日"
+                if msg not in reasons:
+                    reasons.append(msg)
+                if "max_holding_days" not in exit_reason_keys:
+                    exit_reason_keys.append("max_holding_days")
+
+            # 时间止损
             time_stop_days = int(getattr(exit_cfg, "time_stop_days", 7) or 7)
             min_profit = float(getattr(exit_cfg, "time_stop_min_profit_pct", 0.0) or 0.0)
-            if bool(getattr(exit_cfg, "enable_max_holding_exit", True)) and holding_days >= max_holding_days:
-                reasons.append(f"最长持仓退出{holding_days}日")
-                exit_reason_keys.append("max_holding_days")
-            elif bool(getattr(exit_cfg, "enable_time_stop", True)) and holding_days >= time_stop_days and pnl_pct < min_profit:
-                reasons.append(f"时间止损{holding_days}日收益{pnl_pct:.1%}")
-                exit_reason_keys.append("time_stop")
+            if bool(getattr(exit_cfg, "enable_time_stop", True)) and holding_days >= time_stop_days and pnl_pct < min_profit:
+                msg = f"时间止损{holding_days}日收益{pnl_pct:.1%}"
+                if msg not in reasons:
+                    reasons.append(msg)
+                if "time_stop" not in exit_reason_keys:
+                    exit_reason_keys.append("time_stop")
 
-        failure_window = int(getattr(exit_cfg, "failure_window_days", 3) or 3)
-        in_failure_window = True
-        if entry_date is not None:
-            in_failure_window = _trading_days_between(bars, entry_date, latest_date) <= failure_window
-        if bool(getattr(exit_cfg, "enable_strategy_failure_exit", True)) and in_failure_window:
-            if scheme_id == "trend_momentum" and current < ma20:
-                reasons.append("动量失效退出跌破MA20")
-                exit_reason_keys.append("trend_momentum_failed")
-            elif scheme_id == "pullback" and current < low20 * 1.01:
-                reasons.append("回调破位退出接近20日低点")
-                exit_reason_keys.append("pullback_breakdown")
-            elif scheme_id == "breakout":
-                platform_high = _breakout_platform_high(bars, entry_date)
-                if platform_high > 0 and current < platform_high:
-                    reasons.append("突破失败退出跌回平台")
-                    exit_reason_keys.append("breakout_failed")
+            # 策略失败退出（仅开仓后 failure_window 天内）
+            failure_window = int(getattr(exit_cfg, "failure_window_days", 3) or 3)
+            if holding_days <= failure_window and bool(getattr(exit_cfg, "enable_strategy_failure_exit", True)):
+                if scheme_id == "trend_momentum" and current < ma20:
+                    reasons.append("动量失效退出跌破MA20")
+                    exit_reason_keys.append("trend_momentum_failed")
+                elif scheme_id == "pullback" and current < low20 * 1.01:
+                    reasons.append("回调破位退出接近20日低点")
+                    exit_reason_keys.append("pullback_breakdown")
+                elif scheme_id == "breakout":
+                    platform_high = _breakout_platform_high(bars, entry_date)
+                    if platform_high > 0 and current < platform_high:
+                        reasons.append("突破失败退出跌回平台")
+                        exit_reason_keys.append("breakout_failed")
 
-        if ma5 < ma20:
-            reasons.append("MA5低于MA20")
-        if current < ma40:
-            reasons.append("跌破MA40")
-        if not np.isnan(rsi) and rsi > 70:
-            reasons.append(f"RSI超买{rsi:.0f}")
+        # 大盘防御（始终检查）
+        if bool(getattr(exit_cfg, "enable_market_defense_exit", True)) and market_score < market_floor:
+            msg = "大盘防御减仓"
+            if msg not in reasons:
+                reasons.append(msg)
+            if "market_defense" not in exit_reason_keys:
+                exit_reason_keys.append("market_defense")
+
         if not reasons:
             continue
+
         total = min(100.0, 45 + len(reasons) * 15)
         results.append(ScanSignal(
             symbol=symbol,
@@ -761,6 +916,100 @@ def _entry_close_from_bars(bars: pd.DataFrame, entry_date: date) -> float:
     return float(matched.iloc[-1]["close"])
 
 
+def _scan_add_signals(
+    add_context: Dict[str, Dict],
+    price_map: Dict[str, pd.DataFrame],
+    day_data: pd.DataFrame,
+    latest_date: date,
+    next_exec_date: Optional[date],
+    market_score: float,
+    bracket: PositionBracket,
+    scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
+) -> List[ScanSignal]:
+    """对持仓池股票检查加仓条件。
+
+    加仓契约（对齐回测 ADD 逻辑）：
+    1. 当前 BUY 信号仍有效（L1+L2+L3 通过）
+    2. 扣成本后盈利（>0.3%）
+    3. 置信度 >= 0.75
+    """
+    results = []
+    for symbol, context in (add_context or {}).items():
+        bars = price_map.get(str(symbol))
+        row = day_data[day_data["symbol"] == symbol]
+        if bars is None or len(bars) < 20 or row.empty:
+            continue
+
+        scheme_id = str(context.get("scheme_id") or _infer_scheme_id(context))
+        scheme = (scheme_overrides or {}).get(scheme_id) or BUILTIN_SCHEMES.get(scheme_id)
+        if not scheme:
+            continue
+
+        entry_price = _context_float(context.get("entry_price") or context.get("avg_cost"))
+        if entry_price <= 0:
+            continue
+
+        close_series = bars["close"].astype(float)
+        current = float(close_series.iloc[-1])
+        pnl_pct = current / entry_price - 1
+        cost = 0.003
+        if pnl_pct <= cost:
+            continue
+
+        # L1+L2+L3 检查
+        l1_ok, l1_score, _ = _check_layer1(bars, scheme_id)
+        if not l1_ok:
+            continue
+        latest_row = row.iloc[0]
+        l2_ok, l2_score, _ = _check_layer2(bars, latest_row, scheme_id)
+        if not l2_ok:
+            continue
+        resonance_cfg = _resonance_config(scheme_id, scheme_overrides or {})
+        confirmations, l3_score, l3_reasons = _check_layer3(bars, latest_row, scheme_id, resonance_cfg)
+        min_c = int(resonance_cfg.min_confirmations or 2)
+        if confirmations < min_c:
+            continue
+
+        # 因子评分
+        weights = scheme.factor_weights
+        fn_set = set(weights.keys()) & set(day_data.columns)
+        scores = _factor_scores(day_data, weights, fn_set)
+        factor_score = float(scores.get(symbol, 0))
+
+        # 置信度
+        composite = (factor_score * 0.20 + l1_score * 0.20 + l2_score * 0.30 + l3_score * 0.30) / 100.0
+        if composite < 0.70:
+            continue
+
+        overheat_coeff, overheat_tags = _check_overheat(bars, latest_row)
+        composite *= overheat_coeff
+
+        results.append(ScanSignal(
+            symbol=symbol,
+            signal_type="ADD",
+            scheme_id=scheme_id,
+            strategy_name=f"{scheme.name}加仓",
+            signal_date=latest_date,
+            suggested_exec_date=next_exec_date,
+            market_score=market_score,
+            market_bracket=bracket.label,
+            market_position_pct=bracket.position_pct,
+            factor_score=round(factor_score, 2),
+            layer1_score=round(l1_score, 2),
+            layer2_score=round(l2_score, 2),
+            layer3_confirmations=confirmations,
+            layer3_total=len(resonance_cfg.buy_conditions) or 6,
+            layer3_score=round(l3_score, 2),
+            total_score=round(composite * 100, 2),
+            entry_reason=f"加仓信号（盈利{pnl_pct*100:+.1f}%）| {'、'.join(l3_reasons)}",
+            risk_tags=overheat_tags if overheat_tags else [],
+            suggested_position_pct=bracket.position_pct * 0.25,
+        ))
+
+    results.sort(key=lambda s: s.total_score, reverse=True)
+    return results
+
+
 def _trading_days_between(bars: pd.DataFrame, start_date: date, end_date: date) -> int:
     """按K线交易日计算持仓天数，买入执行日为第0天。"""
     if bars.empty or start_date is None or end_date is None:
@@ -799,6 +1048,241 @@ def _build_risk_tags(bars: pd.DataFrame, row: pd.Series, market_score: float, sc
     return tags
 
 
+@dataclass
+class SignalDiagnosis:
+    """单只股票信号诊断结果：逐层输出每层的通过/失败状态及原因。"""
+    symbol: str
+    scheme_id: str
+    scheme_name: str
+    trade_date: str
+    factor_score: float = 0.0
+    factor_rank_pct: float = 0.0
+    factor_details: Dict[str, float] = field(default_factory=dict)
+    l4_ok: bool = False
+    l4_reason: str = ""
+    l4_tags: List[str] = field(default_factory=list)
+    l1_ok: bool = False
+    l1_score: float = 0.0
+    l1_reason: str = ""
+    l2_ok: bool = False
+    l2_score: float = 0.0
+    l2_reason: str = ""
+    l3_confirmations: int = 0
+    l3_total: int = 0
+    l3_score: float = 0.0
+    l3_conditions: List[Dict[str, object]] = field(default_factory=list)  # [{name, strength, label, met}]
+    l3_reasons: List[str] = field(default_factory=list)
+    overheat_coeff: float = 1.0
+    overheat_tags: List[str] = field(default_factory=list)
+    total_score: float = 0.0
+    blocked_by: str = ""  # 空字符串=通过了
+
+    @property
+    def passed(self) -> bool:
+        return not self.blocked_by
+
+    @property
+    def stage(self) -> str:
+        """当前通过到哪一层。"""
+        if not self.l4_ok:
+            return "L4可交易性"
+        if not self.l1_ok:
+            return "L1趋势过滤"
+        if not self.l2_ok:
+            return "L2策略匹配"
+        if self.l3_confirmations < self.l3_total or self.overheat_coeff < 0.5:
+            return "L3共振确认"
+        return "通过"
+
+
+def diagnose_symbol(
+    symbol: str,
+    factor_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    factor_names: Iterable[str],
+    scheme_id: str,
+    market_score: float = 50.0,
+    scheme_overrides: Optional[Dict[str, StrategyScheme]] = None,
+) -> SignalDiagnosis:
+    """诊断单只股票为何通过/未通过信号扫描。
+
+    对持仓/观察池股票逐层输出 L4→L1→L2→L3 各层状态，
+    方便用户理解为什么某只股票出现在（或没出现在）信号列表中。
+    """
+    from strategy.schemes import BUILTIN_SCHEMES
+    _overrides = scheme_overrides or {}
+    scheme = _overrides.get(scheme_id) or BUILTIN_SCHEMES.get(scheme_id)
+    if scheme is None:
+        return SignalDiagnosis(symbol=symbol, scheme_id=scheme_id, scheme_name="未知", trade_date="", blocked_by="策略不存在")
+
+    latest_date = _to_date(factor_df["trade_date"].max())
+    day_data = factor_df[factor_df["trade_date"].map(_to_date) == latest_date]
+    row = day_data[day_data["symbol"] == symbol]
+    if row.empty:
+        return SignalDiagnosis(symbol=symbol, scheme_id=scheme_id, scheme_name=scheme.name,
+                               trade_date=str(latest_date), blocked_by="当日无数据")
+
+    price_map = _build_price_map(price_df)
+    bars = price_map.get(symbol)
+    if bars is None or bars.empty:
+        return SignalDiagnosis(symbol=symbol, scheme_id=scheme_id, scheme_name=scheme.name,
+                               trade_date=str(latest_date), blocked_by="行情数据缺失")
+    if len(bars) < 40:
+        return SignalDiagnosis(symbol=symbol, scheme_id=scheme_id, scheme_name=scheme.name,
+                               trade_date=str(latest_date), blocked_by=f"K线不足(需40,仅{len(bars)})")
+
+    latest_row = row.iloc[0]
+
+    # ── 因子评分 ──
+    factor_names_set = set(factor_names or [])
+    scored = _factor_scores(day_data, scheme.factor_weights, factor_names_set)
+    factor_score = float(scored.get(symbol, 0.0))
+    rank_pct = 1.0 - (scored.rank(pct=True).get(symbol, 1.0)) if len(scored) > 0 else 0.0
+
+    # ── 因子明细 ──
+    factor_details: Dict[str, float] = {}
+    for f, w in scheme.factor_weights.items():
+        if f in latest_row.index:
+            val = _num(latest_row.get(f), np.nan)
+            if not np.isnan(val):
+                factor_details[f] = float(val)
+
+    # ── L4 可交易性 ──
+    l4_ok, l4_reason, l4_tags = _check_l4_tradability(bars, latest_row, scheme_id)
+
+    # ── L1 趋势过滤 ──
+    l1_ok, l1_score, l1_reason = _check_layer1(bars, scheme_id)
+
+    # ── L2 策略匹配 ──
+    l2_ok, l2_score, l2_reason = _check_layer2(bars, latest_row, scheme_id)
+
+    # ── L3 共振确认 ──
+    resonance_cfg = _resonance_config(scheme_id, _overrides)
+    confirmations, l3_score, l3_reasons = _check_layer3(bars, latest_row, scheme_id, resonance_cfg)
+    min_conf = int(resonance_cfg.min_confirmations or DEFAULT_MIN_CONFIRMATIONS)
+
+    # ── L3 条件明细（逐条输出）──
+    l3_conditions: List[Dict[str, object]] = []
+    # Re-run _check_layer3 logic to get per-condition detail
+    close = bars["close"].astype(float)
+    current = float(close.iloc[-1])
+    ma5 = float(close.rolling(5).mean().iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    hh20 = float(close.iloc[-20:].max())
+    pb = (hh20 - current) / hh20 if hh20 > 0 else 0.0
+    rsi = _num(latest_row.get("rsi14"), np.nan)
+    boll_pos = _num(latest_row.get("boll_position"), np.nan)
+    boll01 = boll_pos / 100.0 if boll_pos > 1 else boll_pos
+    vol_ratio = _num(latest_row.get("volume_ratio"), 1.0)
+    mom5 = current / float(close.iloc[-6]) - 1 if len(close) >= 6 and close.iloc[-6] > 0 else 0.0
+    mom20 = current / float(close.iloc[-21]) - 1 if len(close) >= 21 and close.iloc[-21] > 0 else 0.0
+    low20 = float(close.iloc[-20:].min())
+    main_mf_amount = _num(latest_row.get("main_net_mf_amount"), 0.0)
+    large_elg_mf_amount = _num(latest_row.get("large_elg_net_mf_amount"), 0.0)
+    main_mf_rank = _num(latest_row.get("main_net_mf_rank"), 0.0)
+    large_elg_mf_rank = _num(latest_row.get("large_elg_net_mf_rank"), 0.0)
+    relative_turnover_5d = _num(latest_row.get("relative_turnover_5d"), 1.0)
+    amount_percentile_60d = _num(latest_row.get("amount_percentile_60d"), 0.0)
+    turnover_percentile_60d = _num(latest_row.get("turnover_percentile_60d"), 0.0)
+
+    def _ls(v, lo, hi, rev=False):
+        s = max(0.0, min(1.0, (v - lo) / max(hi - lo, 1e-9)))
+        return 1.0 - s if rev else s
+    def _cs(v, lo, hi):
+        mid = (lo + hi) / 2.0; half = (hi - lo) / 2.0
+        return max(0.0, 1.0 - abs(v - mid) / half) if half > 0 else 0.0
+
+    cond_specs = {
+        "trend_momentum": [
+            ("large_elg_net_mf_positive", _ls(large_elg_mf_amount/10000, 5, 500), f"超大单净流入{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive", _ls(main_mf_amount/10000, 1, 100), f"主力净流入{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_rank_high", _ls(large_elg_mf_rank, 0.7, 0.95), f"超大单流入排名{large_elg_mf_rank:.2f}"),
+            ("relative_turnover_5d_high", _cs(relative_turnover_5d, 1.0, 1.4), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", _cs(amount_percentile_60d, 0.6, 0.85), f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_expand", _cs(vol_ratio, 1.1, 1.6), f"温和放量{vol_ratio:.1f}x"),
+            ("momentum_5d_strong", _ls(mom5, 0.025, 0.12), f"5日动量{mom5:.1%}"),
+            ("momentum_20d_strong", _ls(mom20, 0.04, 0.20), f"20日动量{mom20:.1%}"),
+            ("ma5_above_ma20", _ls(ma5/ma20 if ma20>0 else 0, 1.02, 1.08), "MA5显著高于MA20"),
+            ("rsi_not_extreme", _cs(rsi if not np.isnan(rsi) else 61.5, 55, 68), f"RSI强势区间{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+        ],
+        "pullback": [
+            ("main_net_mf_negative_improving", _ls(main_mf_amount/10000, -50, 50), f"主力净流出改善{main_mf_amount/10000:.1f}万"),
+            ("large_elg_net_mf_negative_improving", _ls(large_elg_mf_amount/10000, -100, 100), f"超大单净流出改善{large_elg_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_low", _ls(relative_turnover_5d, 0.5, 0.9, rev=True), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("turnover_percentile_60d_low", _ls(turnover_percentile_60d, 0.1, 0.4, rev=True), f"换手率分位{turnover_percentile_60d:.2f}"),
+            ("volume_calm", _ls(vol_ratio, 0.5, 1.0, rev=True), f"缩量{vol_ratio:.1f}x"),
+            ("rsi_oversold", _ls(rsi if not np.isnan(rsi) else 45, 25, 45, rev=True), f"RSI={rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("boll_lower", _ls(boll01 if not np.isnan(boll01) else 0.5, 0.1, 0.35, rev=True), f"布林位置{boll01:.2f}" if not np.isnan(boll01) else "布林缺失"),
+            ("pullback_range", _cs(pb, 0.05, 0.15), f"回撤{pb:.1%}"),
+            ("not_break_20d_low", _ls(current/low20 if low20>0 else 1.0, 1.03, 1.10), "不破20日低点"),
+            ("near_support", _cs(current/close.iloc[-1] if close.iloc[-1]>0 else 1.0, 0.98, 1.02), "当日未明显破位"),
+        ],
+        "breakout": [
+            ("large_elg_net_mf_positive_strong", _ls(large_elg_mf_amount/10000, 5, 500), f"超大单净流入强劲{large_elg_mf_amount/10000:.1f}万"),
+            ("main_net_mf_positive_strong", _ls(main_mf_amount/10000, 3, 300), f"主力净流入强劲{main_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_high", _ls(relative_turnover_5d, 1.2, 2.0), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("amount_percentile_60d_high", _ls(amount_percentile_60d, 0.7, 0.95), f"成交额分位{amount_percentile_60d:.2f}"),
+            ("volume_surge", _ls(vol_ratio, 1.4, 3.0), f"量比{vol_ratio:.1f}x"),
+            ("break_platform", _ls(current/float(close.iloc[-15:-5].max()) if len(close)>=15 and close.iloc[-15:-5].max()>0 else 1.0, 1.01, 1.05), "突破平台上沿"),
+            ("ma5_above_ma20", _ls(ma5/ma20 if ma20>0 else 0, 1.02, 1.08), "MA5显著高于MA20"),
+            ("narrow_range", _ls((close.iloc[-15:-5].max()-close.iloc[-15:-5].min())/close.iloc[-15:-5].mean() if len(close)>=15 and close.iloc[-15:-5].mean()>0 else 1.0, 0.03, 0.08, rev=True), "平台振幅"),
+            ("momentum_5d_strong", _ls(mom5, 0.03, 0.15), f"5日动量{mom5:.1%}"),
+            ("boll_upper_break", _ls(boll01 if not np.isnan(boll01) else 0.5, 0.7, 0.95), f"布林上沿突破{boll01:.2f}" if not np.isnan(boll01) else "布林缺失"),
+        ],
+        "balanced": [
+            ("main_net_mf_not_negative", _ls(main_mf_amount/10000, -20, 50), f"主力不净流出{main_mf_amount/10000:.1f}万"),
+            ("relative_turnover_5d_not_low", _ls(relative_turnover_5d, 0.8, 1.5), f"相对换手{relative_turnover_5d:.2f}x"),
+            ("ma5_above_ma20", _ls(ma5/ma20 if ma20>0 else 0, 1.0, 1.05), "MA5高于MA20"),
+            ("rsi_not_extreme", 1.0-_ls(rsi if not np.isnan(rsi) else 50, 70, 90) if not np.isnan(rsi) and rsi>70 else _ls(rsi if not np.isnan(rsi) else 50, 30, 70), f"RSI不过热{rsi:.0f}" if not np.isnan(rsi) else "RSI缺失"),
+            ("volume_expand", _ls(vol_ratio, 1.0, 1.8), f"放量{vol_ratio:.1f}x"),
+            ("momentum_5d_positive", _ls(mom5, 0.0, 0.10), f"5日动量{mom5:.1%}"),
+        ],
+    }
+    spec = cond_specs.get(scheme_id, cond_specs["balanced"])
+    cfg = resonance_cfg
+    enabled = set(cfg.buy_conditions or [])
+    for name, strength, label in spec:
+        if enabled and name not in enabled:
+            continue
+        l3_conditions.append({
+            "name": name,
+            "strength": round(float(strength), 3),
+            "label": label,
+            "met": strength > 0,
+        })
+
+    # ── 过热检测 ──
+    overheat_coeff, overheat_tags = _check_overheat(bars, latest_row)
+
+    # ── 综合评分 ──
+    total_score = round((factor_score*0.35 + l1_score*0.20 + l2_score*0.25 + l3_score*0.20)*overheat_coeff, 4)
+
+    # ── 判定阻断层 ──
+    blocked_by = ""
+    if not l4_ok:
+        blocked_by = f"L4可交易性: {l4_reason}"
+    elif not l1_ok:
+        blocked_by = f"L1趋势过滤: {l1_reason}"
+    elif not l2_ok:
+        blocked_by = f"L2策略匹配: {l2_reason}"
+    elif confirmations < min_conf:
+        blocked_by = f"L3共振确认: {confirmations}/{l3_total}条件(需≥{min_conf})"
+
+    return SignalDiagnosis(
+        symbol=symbol, scheme_id=scheme_id, scheme_name=scheme.name,
+        trade_date=str(latest_date),
+        factor_score=factor_score, factor_rank_pct=round(float(rank_pct)*100, 1),
+        factor_details=factor_details,
+        l4_ok=l4_ok, l4_reason=l4_reason, l4_tags=l4_tags,
+        l1_ok=l1_ok, l1_score=l1_score, l1_reason=l1_reason,
+        l2_ok=l2_ok, l2_score=l2_score, l2_reason=l2_reason,
+        l3_confirmations=confirmations, l3_total=len(l3_conditions),
+        l3_score=l3_score, l3_conditions=l3_conditions, l3_reasons=l3_reasons,
+        overheat_coeff=overheat_coeff, overheat_tags=overheat_tags,
+        total_score=total_score, blocked_by=blocked_by,
+    )
+
+
 def _market_bracket(score: float) -> PositionBracket:
     score = max(0.0, min(100.0, float(score)))
     for bracket in POSITION_BRACKETS:
@@ -830,3 +1314,18 @@ def _num(value, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _boll_position(bars: pd.DataFrame, idx: int, period: int = 20, mult: float = 2.0) -> float:
+    """布林带位置 0-1，1=上轨，0=下轨。"""
+    close = bars["close"].astype(float).iloc[max(0, idx - period + 1):idx + 1]
+    if len(close) < period:
+        return 0.5
+    ma = close.mean()
+    std = close.std(ddof=0)
+    if std < 1e-9:
+        return 0.5
+    upper = ma + mult * std
+    lower = ma - mult * std
+    band_range = upper - lower
+    return (float(close.iloc[-1]) - lower) / band_range if band_range > 0 else 0.5

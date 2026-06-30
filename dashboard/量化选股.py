@@ -47,7 +47,48 @@ def _scan_signals_compat(*, factor_df, price_df, factor_names, scheme_id, market
     except (TypeError, ValueError):
         kwargs["include_sell_context"] = include_sell_context
         kwargs["scheme_overrides"] = scheme_overrides
-    return scan_signals(factor_df, price_df, factor_names, **kwargs)
+    result = scan_signals(factor_df, price_df, factor_names, **kwargs)
+    # scan_signals 返回 (buy, sell, add) 三元组
+    if len(result) == 2:
+        return result[0], result[1], []
+    return result[0], result[1], result[2]
+
+
+def _sync_to_backtest(target_ids: list) -> None:
+    """将当前扫描参数持久化到 data/synced_scan_params.json，供回测页加载。"""
+    import json, os
+    from loguru import logger
+    data = {}
+    for sid in target_ids:
+        fw = {}
+        for k, v in st.session_state.items():
+            if k.startswith(f"scan_fw_{sid}_"):
+                fw[k.replace(f"scan_fw_{sid}_", "")] = float(v)
+        data[sid] = {
+            "factor_weights": fw,
+            "resonance_config": {
+                "min_confirmations": int(st.session_state.get(f"scan_l3_min_{sid}", 3)),
+            },
+            "stop_loss_atr_mult": float(st.session_state.get(f"scan_sl_atr_{sid}", 2.0)),
+            "take_profit_atr_mult": float(st.session_state.get(f"scan_tp_atr_{sid}", 3.0)),
+            "trailing_atr_mult": float(st.session_state.get(f"scan_trail_atr_{sid}", 2.0)),
+            "atr_period": int(st.session_state.get(f"scan_atr_p_{sid}", 14)),
+            "position_pct_per_entry": float(st.session_state.get(f"scan_pos_pct_{sid}", 0.30)),
+            "max_add_times": int(st.session_state.get(f"scan_max_add_{sid}", 2)),
+            "max_single_pct": float(st.session_state.get(f"scan_max_single_{sid}", 30)) / 100.0,
+            "min_entry_condition_count": int(st.session_state.get(f"scan_entry_cc_{sid}", 3)),
+            "enable_market_timing": bool(st.session_state.get(f"scan_market_timing_{sid}", True)),
+        }
+    data["_meta"] = {
+        "synced_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "synced_from": "量化选股页",
+    }
+    path = "data/synced_scan_params.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    logger.info(f"同步扫描参数到 {path}")
+
 
 # ========== 页面配置 ==========
 st.set_page_config(page_title="量化选股", page_icon="🎯", layout="centered", initial_sidebar_state="collapsed")
@@ -90,7 +131,7 @@ hotspot = st.session_state.hotspot
 def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfolio_symbols_key, portfolio_context_key, overrides_hash_key):
     """按新短线方案扫描信号；用 hashable key 触发缓存，实际数据从 session_state 取。"""
     overrides = st.session_state.get("_signal_scan_overrides")
-    buy, sell = _scan_signals_compat(
+    buy, sell, add_signals = _scan_signals_compat(
         factor_df=st.session_state._factor_df,
         price_df=st.session_state._price_df,
         factor_names=st.session_state._factor_names,
@@ -101,7 +142,7 @@ def compute_signals(data_key, factor_names_key, scheme_id, market_score, portfol
         include_sell_context=st.session_state.get("_portfolio_signal_context", {}),
         scheme_overrides=overrides,
     )
-    return buy, sell
+    return buy, sell, add_signals
 
 # ── 加载主数据 ──
 _portfolio_syms = sorted({item.symbol for item in (pm.watch_list + pm.hold_list)})
@@ -126,6 +167,22 @@ st.session_state._price_df = price_df
 st.session_state._factor_names = factor_names
 
 latest_date = pd.to_datetime(factor_df['trade_date'].max()).strftime('%Y-%m-%d')
+
+# ── 红线：数据完整性检查 ──
+from signals.scanner import check_data_integrity
+integrity = check_data_integrity(factor_df)
+if integrity["blocked"]:
+    st.error(f"🚫 数据完整性红线触发（{integrity['latest_date']}）：阻断级字段空值率超 20%，信号/回测结果不可信。")
+    for a in integrity["alerts"]:
+        st.warning(a)
+    st.stop()
+elif integrity["alerts"]:
+    if integrity.get("moneyflow_missing") and not integrity.get("blocked"):
+        msg = integrity.get("moneyflow_warning", f"资金流数据 T+1 延迟，最新日 {integrity['latest_date']} 资金流字段暂未就绪")
+        st.info(f"ℹ️ {msg}。信号扫描正常进行。")
+    else:
+        for a in integrity["alerts"]:
+            st.warning(f"⚠️ 数据注意（{integrity['latest_date']}）：{a}")
 
 def _date_key(value) -> str:
     """统一日期比较口径，避免 date/Timestamp/字符串混用导致详情为空。"""
@@ -448,17 +505,19 @@ def show_factor_detail(symbol, factor_df, price_df, latest_date):
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
                              column_config={"判断": st.column_config.TextColumn()})
 
+# 大盘择时懒加载 — 全局可用，所有页面共用
+_market_score = _get_market_score()  # 自动拉取 + 10 分钟缓存
+
 # ========== 页面 0: 信号 ==========
 if page_idx == 0:
     # ── 新方案扫描控制 ──
     with st.expander("⚙ 择股扫描参数", expanded=True):
         st.info(
-            "📌 **择股 vs 择时数据隔离**：本页扫描参数覆写 `BUILTIN_SCHEMES` 内置默认值，"
-            "与 `策略回测` 页可编辑参数完全独立。修改回测页参数不影响本页信号扫描结果。",
-            icon="🔒"
+            "📌 **参数双向同步**：本页扫描参数与 `策略回测` 页应保持一致。"
+            "修改参数后点击「同步到回测」→ 回测验证 → 确认有效 → 次日扫描。"
+            "回测页也可「从选股同步」加载本页已确认参数。",
+            icon="🔄"
         )
-        # 大盘择时懒加载（首次渲染时拉取，不会在模块级触发 import 错误）
-        _market_score = _get_market_score()  # 自动拉取 + 10 分钟缓存
         _mt = st.session_state.get("_mt_cache", {"df": None, "loaded": False})
 
         c1, c2, c3 = st.columns([3, 1, 1])
@@ -713,8 +772,8 @@ if page_idx == 0:
                     with y3:
                         st.number_input("跟踪止盈激活ATR倍数", 0.0, 10.0, float(st.session_state.get(f"scan_trail_act_atr_{sid}", 1.0)), 0.1, key=f"scan_trail_act_atr_{sid}")
 
-        # ── 确认/恢复/重新扫描按钮 ──
-        btn1, btn2, btn3 = st.columns(3)
+        # ── 确认/恢复/重新扫描/同步按钮 ──
+        btn1, btn2, btn3, btn4 = st.columns(4)
         with btn1:
             if st.button("✅ 确认参数", type="primary", width="stretch", key="scan_confirm_params",
                          help="将当前参数写入持久存储，后续会话自动恢复"):
@@ -749,6 +808,12 @@ if page_idx == 0:
                 st.session_state["_signal_overrides_hash"] = _compute_overrides_hash()
                 compute_signals.clear()
                 st.rerun()
+        with btn4:
+            if st.button("📤 同步到回测", width="stretch", key="scan_sync_to_bt",
+                         help="将当前选股参数持久化，回测页可一键加载"):
+                _build_scan_overrides(target_ids)
+                _sync_to_backtest(target_ids)
+                st.toast("✅ 参数已同步到回测页", icon="📤")
 
         # 状态提示
         if not st.session_state.get("_scan_params_confirmed"):
@@ -778,9 +843,9 @@ if page_idx == 0:
         st.session_state.get("_signal_overrides_hash", "default"),
     )
     if st.session_state.get("_latest_signal_cache_key") == signal_cache_key:
-        buy_signals, sell_signals = st.session_state.get("_latest_signal_result", ([], []))
+        buy_signals, sell_signals, _add_signals = st.session_state.get("_latest_signal_result", ([], [], []))
     else:
-        buy_signals, sell_signals = compute_signals(
+        buy_signals, sell_signals, _add_signals = compute_signals(
             data_key,
             tuple(factor_names),
             st.session_state.signal_scheme_id,
@@ -790,8 +855,8 @@ if page_idx == 0:
             st.session_state.get("_signal_overrides_hash", "default"),
         )
         st.session_state._latest_signal_cache_key = signal_cache_key
-        st.session_state._latest_signal_result = (buy_signals, sell_signals)
-        st.session_state._latest_signal_map = {s.symbol: s for s in (buy_signals + sell_signals)}
+        st.session_state._latest_signal_result = (buy_signals, sell_signals, _add_signals)
+        st.session_state._latest_signal_map = {s.symbol: s for s in (buy_signals + sell_signals + _add_signals)}
 
     # ── 顶部指标 ──
     metric_row([
@@ -943,6 +1008,47 @@ elif page_idx == 1:
     else:
         empty_state("👁", "观察池为空 — 在信号页添加股票")
 
+    # ── 观察池信号诊断 ──
+    if pm.watch_list:
+        with st.expander("🔍 信号诊断（逐层检查每只观察池股票为何通过/未通过）", expanded=False):
+            st.caption("对每只观察池股票逐层检查 L4可交易性 → L1趋势过滤 → L2策略匹配 → L3共振确认")
+            scheme_id = st.session_state.signal_scheme_id
+            for item in pm.watch_list:
+                from signals.scanner import diagnose_symbol
+                d = diagnose_symbol(item.symbol, factor_df, price_df, factor_names, scheme_id, market_score=_market_score)
+                passed = d.passed
+                status_icon = "✅" if passed else "❌"
+                st.markdown(f"**{status_icon} {fmt_name(item.symbol)}** — {d.stage}")
+                if not d.passed:
+                    st.caption(f"阻断: {d.blocked_by}")
+                    cols_detail = st.columns(4)
+                    cols_detail[0].metric("因子评分", f"{d.factor_score:.1f}", f"排名前{d.factor_rank_pct:.0f}%")
+                    cols_detail[1].metric("L1趋势", f"{d.l1_score:.1f}", "✅" if d.l1_ok else "❌")
+                    cols_detail[2].metric("L2匹配", f"{d.l2_score:.1f}", "✅" if d.l2_ok else "❌")
+                    cols_detail[3].metric("L3共振", f"{d.l3_confirmations}/{d.l3_total}", "✅" if d.l3_confirmations >= 3 else "❌")
+                    # L3 条件明细
+                    if d.l3_conditions:
+                        with st.expander(f"L3 条件明细", expanded=False):
+                            for cond in d.l3_conditions:
+                                icon = "✅" if cond["met"] else "❌"
+                                bar_w = min(100, int(cond["strength"] * 100))
+                                st.markdown(
+                                    f'<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:0.72rem;">'
+                                    f'<span style="width:14px;">{icon}</span>'
+                                    f'<span style="min-width:200px;">{cond["label"]}</span>'
+                                    f'<span style="width:40px;text-align:right;">{cond["strength"]:.2f}</span>'
+                                    f'<div style="flex:1;height:4px;background:{C["border"]};border-radius:2px;"><div style="width:{bar_w}%;height:4px;background:{C["accent"] if cond["met"] else C["text2"]};border-radius:2px;"></div></div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                else:
+                    cols_detail = st.columns(4)
+                    cols_detail[0].metric("总分", f"{d.total_score:.2f}")
+                    cols_detail[1].metric("因子评分", f"{d.factor_score:.1f}")
+                    cols_detail[2].metric("L3共振", f"{d.l3_confirmations}/{d.l3_total}")
+                    cols_detail[3].metric("过热系数", f"{d.overheat_coeff:.2f}")
+                st.divider()
+
 # ========== 页面 2: 持仓池 ==========
 elif page_idx == 2:
     section_header("持仓池", f"({len(pm.hold_list)})")
@@ -1003,6 +1109,31 @@ elif page_idx == 2:
             st.divider()
     else:
         empty_state("💼", "持仓池为空 — 在观察池点击买入")
+
+
+    # ── 持仓池信号诊断 ──
+    if pm.hold_list:
+        with st.expander("🔍 卖出信号诊断（逐层检查每只持仓股票卖出条件）", expanded=False):
+            st.caption("对每只持仓股票检查 L3 卖出条件是否触发（≥2/6）及 ExitConfig 退出规则")
+            for item in pm.hold_list:
+                sell_sig = st.session_state.get("_latest_signal_map", {}).get(item.symbol)
+                if sell_sig and getattr(sell_sig, 'signal_type', '') == "SELL":
+                    st.markdown(f"🔴 **{fmt_name(item.symbol)}** — 触发卖出: {sell_sig.entry_reason}")
+                else:
+                    st.markdown(f"🟢 **{fmt_name(item.symbol)}** — 未触发卖出")
+                    buy_sig = st.session_state.get("_latest_signal_map", {}).get(item.symbol)
+                    if buy_sig and getattr(buy_sig, 'signal_type', '') == "BUY":
+                        st.caption(f"当前在BUY列表: {buy_sig.strategy_name} · 总分{buy_sig.total_score:.2f}")
+                    else:
+                        from signals.scanner import diagnose_symbol
+                        d = diagnose_symbol(item.symbol, factor_df, price_df, factor_names, st.session_state.signal_scheme_id, market_score=_market_score)
+                        st.caption(f"诊断: {d.stage} — {d.blocked_by}")
+                        cols_d = st.columns(4)
+                        cols_d[0].metric("因子评分", f"{d.factor_score:.1f}")
+                        cols_d[1].metric("L1趋势", f"{d.l1_score:.1f}", "✅" if d.l1_ok else "❌")
+                        cols_d[2].metric("L2匹配", f"{d.l2_score:.1f}", "✅" if d.l2_ok else "❌")
+                        cols_d[3].metric("L3共振", f"{d.l3_confirmations}/{d.l3_total}", "✅" if d.l3_confirmations >= 3 else "❌")
+                st.divider()
 
 # ========== 页面 3: 热点 ==========
 elif page_idx == 3:

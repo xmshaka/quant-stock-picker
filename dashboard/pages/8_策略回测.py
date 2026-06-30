@@ -48,6 +48,90 @@ def _save_widget_state(widget_key: str, durable_key: str):
 default_scheme_name = next((name for name, scheme in scheme_names.items() if scheme.scheme_id == "balanced"), list(scheme_names.keys())[0])
 _restore_widget_state("bt_scheme_name", "bt_pref_scheme_name", default_scheme_name)
 _restore_widget_state("bt_top_n", "bt_pref_top_n", 10)
+
+
+def _sync_to_scan() -> None:
+    """将当前回测参数持久化到文件，量化选股页可一键加载。"""
+    import json, os
+    sid = selected_scheme_runtime.scheme_id
+
+    # 从 widget 读取当前所有回测参数
+    fw = {}
+    for k, v in st.session_state.items():
+        if k.startswith("bt_fw_"):
+            fw[k[6:]] = float(v)
+    data = {
+        sid: {
+            "factor_weights": fw,
+            "resonance_config": {
+                "min_confirmations": int(st.session_state.get("bt_l3_min", 3)),
+            },
+            "stop_loss_atr_mult": float(st.session_state.get("bt_sl_atr", 2.0)),
+            "take_profit_atr_mult": float(st.session_state.get("bt_tp_atr", 3.0)),
+            "trailing_atr_mult": float(st.session_state.get("bt_trail_atr", 2.0)),
+            "atr_period": int(st.session_state.get("bt_atr_p", 14)),
+            "position_pct_per_entry": float(st.session_state.get("bt_pos_pct", 0.30)),
+            "max_add_times": int(st.session_state.get("bt_max_add", 2)),
+            "max_single_pct": float(st.session_state.get("bt_max_single", 30)) / 100.0,
+            "min_entry_condition_count": int(st.session_state.get("bt_entry_cc", 3)),
+            "enable_market_timing": bool(st.session_state.get("bt_market_timing", True)),
+        },
+        "_meta": {
+            "synced_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "synced_from": "策略回测页",
+        },
+    }
+
+    path = "data/synced_backtest_params.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    logger.info(f"同步 {sid} 参数到 {path}")
+
+
+def _load_from_scan() -> None:
+    """从量化选股页同步的参数文件中加载，应用到当前回测 widget。"""
+    import json, os
+    path = "data/synced_scan_params.json"
+    if not os.path.exists(path):
+        st.toast("⚠️ 暂无选股页同步数据，请先在量化选股页点击「同步到回测」", icon="⚠️")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    sid = selected_scheme_runtime.scheme_id
+    if sid not in data:
+        st.toast(f"⚠️ 同步文件中无 {sid} 策略参数", icon="⚠️")
+        return
+    params = data[sid]
+    # 因子权重
+    for f, w in params.get("factor_weights", {}).items():
+        st.session_state[f"bt_fw_{f}"] = float(w)
+    # L3 共振
+    rc = params.get("resonance_config", {})
+    if "min_confirmations" in rc:
+        st.session_state["bt_l3_min"] = int(rc["min_confirmations"])
+    # ATR
+    if "stop_loss_atr_mult" in params:
+        st.session_state["bt_sl_atr"] = float(params["stop_loss_atr_mult"])
+    if "take_profit_atr_mult" in params:
+        st.session_state["bt_tp_atr"] = float(params["take_profit_atr_mult"])
+    if "trailing_atr_mult" in params:
+        st.session_state["bt_trail_atr"] = float(params["trailing_atr_mult"])
+    if "atr_period" in params:
+        st.session_state["bt_atr_p"] = int(params["atr_period"])
+    # 仓位
+    if "position_pct_per_entry" in params:
+        st.session_state["bt_pos_pct"] = float(params["position_pct_per_entry"])
+    if "max_add_times" in params:
+        st.session_state["bt_max_add"] = int(params["max_add_times"])
+    if "max_single_pct" in params:
+        st.session_state["bt_max_single"] = int(float(params["max_single_pct"]) * 100)
+    if "min_entry_condition_count" in params:
+        st.session_state["bt_entry_cc"] = int(params["min_entry_condition_count"])
+    if "enable_market_timing" in params:
+        st.session_state["bt_market_timing"] = bool(params["enable_market_timing"])
+    meta = data.get("_meta", {})
+    st.toast(f"✅ 已从选股页同步参数（{meta.get('synced_at', '未知时间')}）", icon="📥")
 _restore_widget_state("bt_lookback", "bt_pref_lookback", 60)
 _restore_widget_state("bt_capital_wan", "bt_pref_capital_wan", 100)
 _restore_widget_state("bt_pool_mode", "bt_pref_pool_mode", "全A")
@@ -113,19 +197,27 @@ with c4:
 # ── 创建运行时副本，避免修改全局内置策略 ──
 selected_scheme_runtime = StrategyScheme.from_dict(selected_scheme.to_dict()) if hasattr(selected_scheme, "to_dict") else deepcopy(selected_scheme)
 
-# ── 恢复默认 ──
-if st.button("🔄 恢复默认参数", key="bt_restore_defaults", help="将所有参数（因子权重、L3条件、ATR、退出规则等）重置为当前策略的内置默认值"):
-    # 清除所有 bt_ 开头的 widget session_state（保留 bt_pref_ 持久化偏好和 bt_result_ 等回测结果）
-    to_del = [k for k in list(st.session_state.keys())
-              if k.startswith("bt_") and not k.startswith("bt_pref_") and not k.startswith("bt_result")
-              and not k.startswith("bt_compare") and not k.startswith("bt_run_") and not k.startswith("bt_last_")
-              and not k.startswith("bt_market_")]
-    for k in to_del:
-        del st.session_state[k]
-    st.session_state.pop("_bt_exit_scheme_id", None)
-    st.session_state.pop("_bt_exit_defaults_version", None)
-    st.session_state["bt_params_confirmed"] = False
-    st.rerun()
+# ── 恢复默认 / 同步参数 ──
+b1, b2, b3 = st.columns(3)
+with b1:
+    if st.button("🔄 恢复默认参数", key="bt_restore_defaults", help="将所有参数（因子权重、L3条件、ATR、退出规则等）重置为当前策略的内置默认值"):
+        to_del = [k for k in list(st.session_state.keys())
+                  if k.startswith("bt_") and not k.startswith("bt_pref_") and not k.startswith("bt_result")
+                  and not k.startswith("bt_compare") and not k.startswith("bt_run_") and not k.startswith("bt_last_")
+                  and not k.startswith("bt_market_")]
+        for k in to_del:
+            del st.session_state[k]
+        st.session_state.pop("_bt_exit_scheme_id", None)
+        st.session_state.pop("_bt_exit_defaults_version", None)
+        st.session_state["bt_params_confirmed"] = False
+        st.rerun()
+with b2:
+    if st.button("🔄 同步到选股", key="bt_sync_to_scan", help="将当前回测参数持久化，量化选股页可一键加载"):
+        _sync_to_scan()
+with b3:
+    if st.button("📥 从选股同步", key="bt_load_from_scan", help="从量化选股页加载已同步的参数"):
+        _load_from_scan()
+        st.rerun()
 
 # ── 因子权重（可展开编辑）──
 with st.expander("📊 因子权重", expanded=False):

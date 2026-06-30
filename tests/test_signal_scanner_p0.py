@@ -57,8 +57,8 @@ def test_trend_momentum_requires_market_score_floor():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    low_buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=59, top_n=10)
-    high_buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    low_buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=59, top_n=10)
+    high_buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     assert low_buy == []
     assert any(s.symbol == "000001" for s in high_buy)
@@ -84,7 +84,7 @@ def test_pullback_rejects_broken_down_stock():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="pullback", market_score=45, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="pullback", market_score=45, top_n=10)
     symbols = {s.symbol for s in buy}
 
     assert "000011" not in symbols
@@ -103,7 +103,7 @@ def test_balanced_is_combiner_not_direct_scheme():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="balanced", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="balanced", market_score=60, top_n=10)
 
     assert buy
     assert all(s.scheme_id in {"trend_momentum", "pullback", "breakout"} for s in buy)
@@ -122,7 +122,7 @@ def test_sell_scan_only_for_portfolio_symbols():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    _, sell = scan_signals(
+    _, sell, _ = scan_signals(
         factor_df, price_df, factor_names,
         scheme_id="balanced", market_score=15, top_n=10,
         include_sell_symbols=["000031"],
@@ -142,7 +142,7 @@ def test_sell_scan_uses_exit_config_for_time_stop_context():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    _, sell = scan_signals(
+    _, sell, _ = scan_signals(
         factor_df, price_df, factor_names,
         scheme_id="balanced", market_score=60, top_n=10,
         include_sell_symbols=["000071"],
@@ -187,7 +187,7 @@ def test_sell_scan_time_stop_uses_trading_days_not_calendar_days(monkeypatch):
     factor_df = pd.DataFrame([_factor_row("000074", latest, rsi14=50)])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    _, sell = scan_signals(
+    _, sell, _ = scan_signals(
         factor_df, price_df, factor_names,
         scheme_id="balanced", market_score=60, top_n=10,
         include_sell_symbols=["000074"],
@@ -216,7 +216,7 @@ def test_sell_scan_respects_disabled_time_stop(monkeypatch):
         ExitConfig(enable_time_stop=False, max_holding_days=99, time_stop_days=2, time_stop_min_profit_pct=0.02),
     )
 
-    _, sell = scan_signals(
+    _, sell, _ = scan_signals(
         factor_df, price_df, factor_names,
         scheme_id="balanced", market_score=60, top_n=10,
         include_sell_symbols=["000073"],
@@ -239,7 +239,7 @@ def test_sell_scan_strategy_failure_breakout_context():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    _, sell = scan_signals(
+    _, sell, _ = scan_signals(
         factor_df, price_df, factor_names,
         scheme_id="balanced", market_score=60, top_n=10,
         include_sell_symbols=["000072"],
@@ -269,7 +269,7 @@ def test_scan_reason_uses_html_safe_text_without_angle_brackets():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     assert buy
     assert all("<" not in s.entry_reason and ">" not in s.entry_reason for s in buy)
@@ -291,7 +291,7 @@ def test_scan_signal_carries_resonance_config_metadata_for_ui():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     assert buy
     sig = buy[0]
@@ -329,7 +329,7 @@ def test_scan_signal_carries_moneyflow_and_turnover_entry_audit_context():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     sig = next(s for s in buy if s.symbol == "000091")
     assert sig.entry_model == "trend_continuation"
@@ -349,7 +349,7 @@ def test_layered_signal_reasons_use_html_safe_text_without_angle_brackets():
     closes = [10 + i * 0.08 for i in range(55)] + [14.0, 13.7, 13.5, 13.3, 13.1]
     bars = pd.DataFrame(_bars("000051", closes, start=latest - timedelta(days=59)))
 
-    passed, reason, score = TrendFilter(strategy_type="pullback").check(bars, len(bars) - 1)
+    passed, score, reason = TrendFilter(strategy_type="pullback").check(bars, len(bars) - 1)
 
     assert reason
     assert "<" not in reason and ">" not in reason
@@ -375,7 +375,7 @@ def test_scan_l4_rejects_sealed_limit_up_candidate():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     symbols = {s.symbol for s in buy}
     assert "000081" in symbols
@@ -403,6 +403,6 @@ def test_scan_l4_rejects_low_turnover_trend_candidate():
     ])
     factor_names = [c for c in factor_df.columns if c not in {"symbol", "trade_date"}]
 
-    buy, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
+    buy, _, _ = scan_signals(factor_df, price_df, factor_names, scheme_id="trend_momentum", market_score=60, top_n=10)
 
     assert buy == []

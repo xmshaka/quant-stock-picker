@@ -21,13 +21,23 @@ class PoolItem:
     signal_strength: float  # 信号强度
     signal_score: float     # 综合得分
     note: str = ""          # 备注
+    entry_price: float = 0.0   # 买入价格（移入持仓池时记录）
+    avg_cost: float = 0.0      # 平均成本（多次加仓后更新）
+    scheme_id: str = ""        # 策略ID
     
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # 只持久化非零/非空字段，避免 JSON 膨胀
+        if not self.entry_price and not self.avg_cost:
+            d.pop("entry_price", None)
+            d.pop("avg_cost", None)
+        if not self.scheme_id:
+            d.pop("scheme_id", None)
+        return d
     
     @classmethod
     def from_dict(cls, d: dict) -> "PoolItem":
-        return cls(**d)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 class PortfolioManager:

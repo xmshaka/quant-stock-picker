@@ -69,7 +69,7 @@ class Settings(BaseSettings):
 
     # ── 每日全池因子预计算 (数据扫描后运行) ──
     daily_factor_enabled: bool = True
-    daily_factor_hour: int = 17
+    daily_factor_hour: int = 19
     daily_factor_minute: int = 30
     daily_factor_max_workers: int = 4
     daily_factor_keep_days: int = 7

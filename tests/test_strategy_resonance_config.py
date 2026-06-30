@@ -13,7 +13,8 @@ def test_builtin_strategies_have_distinct_resonance_configs():
     configs = {sid: BUILTIN_SCHEMES[sid].resonance_config for sid in ["trend_momentum", "pullback", "breakout"]}
 
     assert all(isinstance(cfg, ResonanceConfig) for cfg in configs.values())
-    assert all(cfg.min_confirmations == 3 for cfg in configs.values())
+    # breakout: min_confirmations=4（提升门槛减少噪音突破）
+    assert all(cfg.min_confirmations >= 3 for cfg in configs.values())
     assert configs["trend_momentum"].buy_conditions != configs["pullback"].buy_conditions
     assert configs["pullback"].buy_conditions != configs["breakout"].buy_conditions
     # trend_momentum 应有资金流和相对换手条件
@@ -84,7 +85,8 @@ def test_exit_config_serializes_rule_switches():
 def test_layers_resonance_checker_loads_strategy_config():
     rc = ResonanceChecker.from_strategy("breakout")
 
-    assert rc.min_confirmations == 3
+    # breakout: min_confirmations=4（提升门槛减少噪音突破）
+    assert rc.min_confirmations == 4
     assert rc.buy_conditions == set(BUILTIN_SCHEMES["breakout"].resonance_config.buy_conditions)
     assert "break_platform" in rc.buy_conditions
 
@@ -112,10 +114,10 @@ def test_scanner_layer3_uses_resonance_config_condition_subset():
         turnover_percentile_60d=0.60,
     ))
 
-    full_count, full_reasons = _check_layer3(bars, row, "trend_momentum")
+    full_count, _, full_reasons = _check_layer3(bars, row, "trend_momentum")
     # 使用新的条件进行限制测试
     restricted = ResonanceConfig(min_confirmations=1, buy_conditions=["large_elg_net_mf_positive"])
-    restricted_count, restricted_reasons = _check_layer3(bars, row, "trend_momentum", restricted)
+    restricted_count, _, restricted_reasons = _check_layer3(bars, row, "trend_momentum", restricted)
 
     assert full_count >= restricted_count
     assert restricted_count == 1  # 应该满足超大单净流入条件
